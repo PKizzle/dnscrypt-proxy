@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	AppVersion            = "2.1.4"
+	AppVersion            = "2.1.5"
 	DefaultConfigFileName = "dnscrypt-proxy.toml"
 )
 
@@ -27,13 +27,18 @@ type App struct {
 }
 
 func main() {
-	TimezoneSetup()
+	tzErr := TimezoneSetup()
 	dlog.Init("dnscrypt-proxy", dlog.SeverityNotice, "DAEMON")
+	if tzErr != nil {
+		dlog.Warnf("Timezone setup failed: [%v]", tzErr)
+	}
 	runtime.MemProfileRate = 0
 
 	seed := make([]byte, 8)
-	crypto_rand.Read(seed)
-	rand.Seed(int64(binary.LittleEndian.Uint64(seed[:])))
+	if _, err := crypto_rand.Read(seed); err != nil {
+		dlog.Fatal(err)
+	}
+	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
 
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -46,6 +51,7 @@ func main() {
 	flags.Resolve = flag.String("resolve", "", "resolve a DNS name (string can be <name> or <name>,<resolver address>)")
 	flags.List = flag.Bool("list", false, "print the list of available resolvers for the enabled filters")
 	flags.ListAll = flag.Bool("list-all", false, "print the complete list of available resolvers, ignoring filters")
+	flags.IncludeRelays = flag.Bool("include-relays", false, "include the list of available relays in the output of -list and -list-all")
 	flags.JSONOutput = flag.Bool("json", false, "output list as JSON")
 	flags.Check = flag.Bool("check", false, "check the configuration file and exit")
 	flags.ConfigFile = flag.String("config", DefaultConfigFileName, "Path to the configuration file")
@@ -124,7 +130,7 @@ func (app *App) AppMain() {
 		dlog.Fatal(err)
 	}
 	if err := PidFileCreate(); err != nil {
-		dlog.Criticalf("Unable to create the PID file: %v", err)
+		dlog.Errorf("Unable to create the PID file: [%v]", err)
 	}
 	if err := app.proxy.InitPluginsGlobals(); err != nil {
 		dlog.Fatal(err)
@@ -139,7 +145,9 @@ func (app *App) AppMain() {
 }
 
 func (app *App) Stop(service service.Service) error {
-	PidFileRemove()
+	if err := PidFileRemove(); err != nil {
+		dlog.Warnf("Failed to remove the PID file: [%v]", err)
+	}
 	dlog.Notice("Stopped.")
 	return nil
 }

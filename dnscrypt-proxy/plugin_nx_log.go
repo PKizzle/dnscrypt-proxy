@@ -43,16 +43,15 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	if msg.Rcode != dns.RcodeNameError {
 		return nil
 	}
-	question := msg.Question[0]
-	qType, ok := dns.TypeToString[question.Qtype]
-	if !ok {
-		qType = string(qType)
-	}
 	var clientIPStr string
-	if pluginsState.clientProto == "udp" {
+	switch pluginsState.clientProto {
+	case "udp":
 		clientIPStr = (*pluginsState.clientAddr).(*net.UDPAddr).IP.String()
-	} else {
+	case "tcp", "local_doh":
 		clientIPStr = (*pluginsState.clientAddr).(*net.TCPAddr).IP.String()
+	default:
+		// Ignore internal flow.
+		return nil
 	}
 	if clientIPStr == "127.0.0.1" || clientIPStr == "::1" {
 		if edns0 := pluginsState.questionMsg.IsEdns0(); edns0 != nil {
@@ -63,6 +62,11 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 				}
 			}
 		}
+	}
+	question := msg.Question[0]
+	qType, ok := dns.TypeToString[question.Qtype]
+	if !ok {
+		qType = string(qType)
 	}
 	qName := pluginsState.qName
 
