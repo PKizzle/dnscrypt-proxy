@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go:1.20.3 as build
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go as build
 
 WORKDIR /src
 
@@ -26,7 +26,7 @@ RUN cp -a /src/dnscrypt-proxy/example-* ./
 COPY dnscrypt-proxy.toml ./
 
 # ----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go:1.20.3 as probe
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go as probe
 
 WORKDIR /src/dnsprobe
 
@@ -42,7 +42,7 @@ RUN GOARM="${TARGETVARIANT//v}" go build -o /usr/local/bin/dnsprobe .
 
 # ----------------------------------------------------------------------------
 # hadolint ignore=DL3007
-FROM cgr.dev/chainguard/static:latest
+FROM cgr.dev/chainguard/static
 
 COPY --from=build /src/dnscrypt-proxy/dnscrypt-proxy /usr/local/bin/
 COPY --from=probe /usr/local/bin/dnsprobe /usr/local/bin/
