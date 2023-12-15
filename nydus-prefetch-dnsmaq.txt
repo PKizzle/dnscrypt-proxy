@@ -1,0 +1,4 @@
+/usr/local/sbin/dnsmasq
+/lib/ld-musl-aarch64.so.1
+/etc/passwd
+/etc/group

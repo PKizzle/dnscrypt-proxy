@@ -1,0 +1,5 @@
+/usr/local/bin/dnscrypt-proxy
+/etc/inittab
+/etc/ssl/certs/ca-certificates.crt
+/etc/passwd
+/etc/group
