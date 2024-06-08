@@ -25,7 +25,7 @@ import (
 )
 
 type unpacker interface {
-	UnpackLongHeader(hdr *wire.Header, rcvTime time.Time, data []byte, v protocol.VersionNumber) (*unpackedPacket, error)
+	UnpackLongHeader(hdr *wire.Header, rcvTime time.Time, data []byte, v protocol.Version) (*unpackedPacket, error)
 	UnpackShortHeader(rcvTime time.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)
 }
 
@@ -93,7 +93,7 @@ type connRunner interface {
 	GetStatelessResetToken(protocol.ConnectionID) protocol.StatelessResetToken
 	Retire(protocol.ConnectionID)
 	Remove(protocol.ConnectionID)
-	ReplaceWithClosed([]protocol.ConnectionID, protocol.Perspective, []byte)
+	ReplaceWithClosed([]protocol.ConnectionID, []byte)
 	AddResetToken(protocol.StatelessResetToken, packetHandler)
 	RemoveResetToken(protocol.StatelessResetToken)
 }
@@ -106,15 +106,15 @@ type closeError struct {
 
 type errCloseForRecreating struct {
 	nextPacketNumber protocol.PacketNumber
-	nextVersion      protocol.VersionNumber
+	nextVersion      protocol.Version
 }
 
 func (e *errCloseForRecreating) Error() string {
 	return "closing connection in order to recreate it"
 }
 
-var connTracingID uint64        // to be accessed atomically
-func nextConnTracingID() uint64 { return atomic.AddUint64(&connTracingID, 1) }
+var connTracingID atomic.Uint64              // to be accessed atomically
+func nextConnTracingID() ConnectionTracingID { return ConnectionTracingID(connTracingID.Add(1)) }
 
 // A Connection is a QUIC connection
 type connection struct {
@@ -128,7 +128,7 @@ type connection struct {
 	srcConnIDLen int
 
 	perspective protocol.Perspective
-	version     protocol.VersionNumber
+	version     protocol.Version
 	config      *Config
 
 	conn      sendConn
@@ -153,7 +153,9 @@ type connection struct {
 	unpacker      unpacker
 	frameParser   wire.FrameParser
 	packer        packer
-	mtuDiscoverer mtuDiscoverer // initialized when the handshake completes
+	mtuDiscoverer mtuDiscoverer // initialized when the transport parameters are received
+
+	maxPayloadSizeEstimate atomic.Uint32
 
 	initialStream       cryptoStream
 	handshakeStream     cryptoStream
@@ -177,6 +179,7 @@ type connection struct {
 
 	earlyConnReadyChan chan struct{}
 	sentFirstPacket    bool
+	droppedInitialKeys bool
 	handshakeComplete  bool
 	handshakeConfirmed bool
 
@@ -233,9 +236,9 @@ var newConnection = func(
 	tokenGenerator *handshake.TokenGenerator,
 	clientAddressValidated bool,
 	tracer *logging.ConnectionTracer,
-	tracingID uint64,
+	tracingID ConnectionTracingID,
 	logger utils.Logger,
-	v protocol.VersionNumber,
+	v protocol.Version,
 ) quicConn {
 	s := &connection{
 		conn:                conn,
@@ -271,11 +274,11 @@ var newConnection = func(
 		s.queueControlFrame,
 		connIDGenerator,
 	)
-	s.preSetup()
 	s.ctx, s.ctxCancel = context.WithCancelCause(context.WithValue(context.Background(), ConnectionTracingKey, tracingID))
+	s.preSetup()
 	s.sentPacketHandler, s.receivedPacketHandler = ackhandler.NewAckHandler(
 		0,
-		getMaxPacketSize(s.conn.RemoteAddr()),
+		protocol.ByteCount(s.config.InitialPacketSize),
 		s.rttStats,
 		clientAddressValidated,
 		s.conn.capabilities().ECN,
@@ -283,7 +286,7 @@ var newConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.mtuDiscoverer = newMTUDiscoverer(s.rttStats, getMaxPacketSize(s.conn.RemoteAddr()), s.sentPacketHandler.SetMaxDatagramSize)
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiLocal:   protocol.ByteCount(s.config.InitialStreamReceiveWindow),
 		InitialMaxStreamDataBidiRemote:  protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -294,6 +297,7 @@ var newConnection = func(
 		MaxUniStreamNum:                 protocol.StreamNum(s.config.MaxIncomingUniStreams),
 		MaxAckDelay:                     protocol.MaxAckDelayInclGranularity,
 		AckDelayExponent:                protocol.AckDelayExponent,
+		MaxUDPPayloadSize:               protocol.MaxPacketBufferSize,
 		DisableActiveMigration:          true,
 		StatelessResetToken:             &statelessResetToken,
 		OriginalDestinationConnectionID: origDestConnID,
@@ -346,9 +350,9 @@ var newClientConnection = func(
 	enable0RTT bool,
 	hasNegotiatedVersion bool,
 	tracer *logging.ConnectionTracer,
-	tracingID uint64,
+	tracingID ConnectionTracingID,
 	logger utils.Logger,
-	v protocol.VersionNumber,
+	v protocol.Version,
 ) quicConn {
 	s := &connection{
 		conn:                conn,
@@ -380,11 +384,11 @@ var newClientConnection = func(
 		s.queueControlFrame,
 		connIDGenerator,
 	)
-	s.preSetup()
 	s.ctx, s.ctxCancel = context.WithCancelCause(context.WithValue(context.Background(), ConnectionTracingKey, tracingID))
+	s.preSetup()
 	s.sentPacketHandler, s.receivedPacketHandler = ackhandler.NewAckHandler(
 		initialPacketNumber,
-		getMaxPacketSize(s.conn.RemoteAddr()),
+		protocol.ByteCount(s.config.InitialPacketSize),
 		s.rttStats,
 		false, // has no effect
 		s.conn.capabilities().ECN,
@@ -392,7 +396,7 @@ var newClientConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.mtuDiscoverer = newMTUDiscoverer(s.rttStats, getMaxPacketSize(s.conn.RemoteAddr()), s.sentPacketHandler.SetMaxDatagramSize)
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -403,6 +407,7 @@ var newClientConnection = func(
 		MaxBidiStreamNum:               protocol.StreamNum(s.config.MaxIncomingStreams),
 		MaxUniStreamNum:                protocol.StreamNum(s.config.MaxIncomingUniStreams),
 		MaxAckDelay:                    protocol.MaxAckDelayInclGranularity,
+		MaxUDPPayloadSize:              protocol.MaxPacketBufferSize,
 		AckDelayExponent:               protocol.AckDelayExponent,
 		DisableActiveMigration:         true,
 		// For interoperability with quic-go versions before May 2023, this value must be set to a value
@@ -453,7 +458,7 @@ func (s *connection) preSetup() {
 	s.handshakeStream = newCryptoStream()
 	s.sendQueue = newSendQueue(s.conn)
 	s.retransmissionQueue = newRetransmissionQueue()
-	s.frameParser = wire.NewFrameParser(s.config.EnableDatagrams)
+	s.frameParser = *wire.NewFrameParser(s.config.EnableDatagrams)
 	s.rttStats = &utils.RTTStats{}
 	s.connFlowController = flowcontrol.NewConnectionFlowController(
 		protocol.ByteCount(s.config.InitialConnectionReceiveWindow),
@@ -470,6 +475,7 @@ func (s *connection) preSetup() {
 	)
 	s.earlyConnReadyChan = make(chan struct{})
 	s.streamsMap = newStreamsMap(
+		s.ctx,
 		s,
 		s.newFlowController,
 		uint64(s.config.MaxIncomingStreams),
@@ -520,6 +526,9 @@ func (s *connection) run() error {
 
 runLoop:
 	for {
+		if s.framer.QueuedTooManyControlFrames() {
+			s.closeLocal(&qerr.TransportError{ErrorCode: InternalError})
+		}
 		// Close immediately if requested
 		select {
 		case closeErr = <-s.closeChan:
@@ -776,11 +785,7 @@ func (s *connection) handleHandshakeConfirmed() error {
 	s.cryptoStreamHandler.SetHandshakeConfirmed()
 
 	if !s.config.DisablePathMTUDiscovery && s.conn.capabilities().DF {
-		maxPacketSize := s.peerParams.MaxUDPPayloadSize
-		if maxPacketSize == 0 {
-			maxPacketSize = protocol.MaxByteCount
-		}
-		s.mtuDiscoverer.Start(min(maxPacketSize, protocol.MaxPacketBufferSize))
+		s.mtuDiscoverer.Start()
 	}
 	return nil
 }
@@ -1148,7 +1153,7 @@ func (s *connection) handleUnpackedLongHeaderPacket(
 	if !s.receivedFirstPacket {
 		s.receivedFirstPacket = true
 		if !s.versionNegotiated && s.tracer != nil && s.tracer.NegotiatedVersion != nil {
-			var clientVersions, serverVersions []protocol.VersionNumber
+			var clientVersions, serverVersions []protocol.Version
 			switch s.perspective {
 			case protocol.PerspectiveClient:
 				clientVersions = s.config.Versions
@@ -1185,7 +1190,8 @@ func (s *connection) handleUnpackedLongHeaderPacket(
 		}
 	}
 
-	if s.perspective == protocol.PerspectiveServer && packet.encryptionLevel == protocol.EncryptionHandshake {
+	if s.perspective == protocol.PerspectiveServer && packet.encryptionLevel == protocol.EncryptionHandshake &&
+		!s.droppedInitialKeys {
 		// On the server side, Initial keys are dropped as soon as the first Handshake packet is received.
 		// See Section 4.9.1 of RFC 9001.
 		if err := s.dropEncryptionLevel(protocol.EncryptionInitial); err != nil {
@@ -1572,13 +1578,6 @@ func (s *connection) closeRemote(e error) {
 	})
 }
 
-// Close the connection. It sends a NO_ERROR application error.
-// It waits until the run loop has stopped before returning
-func (s *connection) shutdown() {
-	s.closeLocal(nil)
-	<-s.ctx.Done()
-}
-
 func (s *connection) CloseWithError(code ApplicationErrorCode, desc string) error {
 	s.closeLocal(&qerr.ApplicationError{
 		ErrorCode:    code,
@@ -1586,6 +1585,11 @@ func (s *connection) CloseWithError(code ApplicationErrorCode, desc string) erro
 	})
 	<-s.ctx.Done()
 	return nil
+}
+
+func (s *connection) closeWithTransportError(code TransportErrorCode) {
+	s.closeLocal(&qerr.TransportError{ErrorCode: code})
+	<-s.ctx.Done()
 }
 
 func (s *connection) handleCloseError(closeErr *closeError) {
@@ -1632,7 +1636,7 @@ func (s *connection) handleCloseError(closeErr *closeError) {
 
 	// If this is a remote close we're done here
 	if closeErr.remote {
-		s.connIDGenerator.ReplaceWithClosed(s.perspective, nil)
+		s.connIDGenerator.ReplaceWithClosed(nil)
 		return
 	}
 	if closeErr.immediate {
@@ -1649,7 +1653,7 @@ func (s *connection) handleCloseError(closeErr *closeError) {
 	if err != nil {
 		s.logger.Debugf("Error sending CONNECTION_CLOSE: %s", err)
 	}
-	s.connIDGenerator.ReplaceWithClosed(s.perspective, connClosePacket)
+	s.connIDGenerator.ReplaceWithClosed(connClosePacket)
 }
 
 func (s *connection) dropEncryptionLevel(encLevel protocol.EncryptionLevel) error {
@@ -1661,6 +1665,7 @@ func (s *connection) dropEncryptionLevel(encLevel protocol.EncryptionLevel) erro
 	//nolint:exhaustive // only Initial and 0-RTT need special treatment
 	switch encLevel {
 	case protocol.EncryptionInitial:
+		s.droppedInitialKeys = true
 		s.cryptoStreamHandler.DiscardInitialKeys()
 	case protocol.Encryption0RTT:
 		s.streamsMap.ResetFor0RTT()
@@ -1769,6 +1774,17 @@ func (s *connection) applyTransportParameters() {
 		// Retire the connection ID.
 		s.connIDManager.AddFromPreferredAddress(params.PreferredAddress.ConnectionID, params.PreferredAddress.StatelessResetToken)
 	}
+	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+	if params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
+		maxPacketSize = params.MaxUDPPayloadSize
+	}
+	s.mtuDiscoverer = newMTUDiscoverer(
+		s.rttStats,
+		protocol.ByteCount(s.config.InitialPacketSize),
+		maxPacketSize,
+		s.onMTUIncreased,
+		s.tracer,
+	)
 }
 
 func (s *connection) triggerSending(now time.Time) error {
@@ -1857,7 +1873,7 @@ func (s *connection) sendPackets(now time.Time) error {
 	}
 
 	if !s.handshakeConfirmed {
-		packet, err := s.packer.PackCoalescedPacket(false, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err := s.packer.PackCoalescedPacket(false, s.maxPacketSize(), s.version)
 		if err != nil || packet == nil {
 			return err
 		}
@@ -1884,7 +1900,7 @@ func (s *connection) sendPacketsWithoutGSO(now time.Time) error {
 	for {
 		buf := getPacketBuffer()
 		ecn := s.sentPacketHandler.ECNMode(true)
-		if _, err := s.appendOneShortHeaderPacket(buf, s.mtuDiscoverer.CurrentSize(), ecn, now); err != nil {
+		if _, err := s.appendOneShortHeaderPacket(buf, s.maxPacketSize(), ecn, now); err != nil {
 			if err == errNothingToPack {
 				buf.Release()
 				return nil
@@ -1915,7 +1931,7 @@ func (s *connection) sendPacketsWithoutGSO(now time.Time) error {
 
 func (s *connection) sendPacketsWithGSO(now time.Time) error {
 	buf := getLargePacketBuffer()
-	maxSize := s.mtuDiscoverer.CurrentSize()
+	maxSize := s.maxPacketSize()
 
 	ecn := s.sentPacketHandler.ECNMode(true)
 	for {
@@ -1984,7 +2000,7 @@ func (s *connection) resetPacingDeadline() {
 func (s *connection) maybeSendAckOnlyPacket(now time.Time) error {
 	if !s.handshakeConfirmed {
 		ecn := s.sentPacketHandler.ECNMode(false)
-		packet, err := s.packer.PackCoalescedPacket(true, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err := s.packer.PackCoalescedPacket(true, s.maxPacketSize(), s.version)
 		if err != nil {
 			return err
 		}
@@ -1995,7 +2011,7 @@ func (s *connection) maybeSendAckOnlyPacket(now time.Time) error {
 	}
 
 	ecn := s.sentPacketHandler.ECNMode(true)
-	p, buf, err := s.packer.PackAckOnlyPacket(s.mtuDiscoverer.CurrentSize(), s.version)
+	p, buf, err := s.packer.PackAckOnlyPacket(s.maxPacketSize(), s.version)
 	if err != nil {
 		if err == errNothingToPack {
 			return nil
@@ -2017,7 +2033,7 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel, now time
 			break
 		}
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), s.version)
 		if err != nil {
 			return err
 		}
@@ -2028,7 +2044,7 @@ func (s *connection) sendProbePacket(encLevel protocol.EncryptionLevel, now time
 	if packet == nil {
 		s.retransmissionQueue.AddPing(encLevel)
 		var err error
-		packet, err = s.packer.MaybePackProbePacket(encLevel, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err = s.packer.MaybePackProbePacket(encLevel, s.maxPacketSize(), s.version)
 		if err != nil {
 			return err
 		}
@@ -2077,7 +2093,8 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 			largestAcked = p.ack.LargestAcked()
 		}
 		s.sentPacketHandler.SentPacket(now, p.header.PacketNumber, largestAcked, p.streamFrames, p.frames, p.EncryptionLevel(), ecn, p.length, false)
-		if s.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake {
+		if s.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
+			!s.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
 			// See Section 4.9.1 of RFC 9001.
 			if err := s.dropEncryptionLevel(protocol.EncryptionInitial); err != nil {
@@ -2106,14 +2123,14 @@ func (s *connection) sendConnectionClose(e error) ([]byte, error) {
 	var transportErr *qerr.TransportError
 	var applicationErr *qerr.ApplicationError
 	if errors.As(e, &transportErr) {
-		packet, err = s.packer.PackConnectionClose(transportErr, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err = s.packer.PackConnectionClose(transportErr, s.maxPacketSize(), s.version)
 	} else if errors.As(e, &applicationErr) {
-		packet, err = s.packer.PackApplicationClose(applicationErr, s.mtuDiscoverer.CurrentSize(), s.version)
+		packet, err = s.packer.PackApplicationClose(applicationErr, s.maxPacketSize(), s.version)
 	} else {
 		packet, err = s.packer.PackConnectionClose(&qerr.TransportError{
 			ErrorCode:    qerr.InternalError,
 			ErrorMessage: fmt.Sprintf("connection BUG: unspecified error type (msg: %s)", e.Error()),
-		}, s.mtuDiscoverer.CurrentSize(), s.version)
+		}, s.maxPacketSize(), s.version)
 	}
 	if err != nil {
 		return nil, err
@@ -2121,6 +2138,24 @@ func (s *connection) sendConnectionClose(e error) ([]byte, error) {
 	ecn := s.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket())
 	s.logCoalescedPacket(packet, ecn)
 	return packet.buffer.Data, s.conn.Write(packet.buffer.Data, 0, ecn)
+}
+
+func (s *connection) maxPacketSize() protocol.ByteCount {
+	if s.mtuDiscoverer == nil {
+		// Use the configured packet size on the client side.
+		// If the server sends a max_udp_payload_size that's smaller than this size, we can ignore this:
+		// Apparently the server still processed the (fully padded) Initial packet anyway.
+		if s.perspective == protocol.PerspectiveClient {
+			return protocol.ByteCount(s.config.InitialPacketSize)
+		}
+		// On the server side, there's no downside to using 1200 bytes until we received the client's transport
+		// parameters:
+		// * If the first packet didn't contain the entire ClientHello, all we can do is ACK that packet. We don't
+		//   need a lot of bytes for that.
+		// * If it did, we will have processed the transport parameters and initialized the MTU discoverer.
+		return protocol.MinInitialPacketSize
+	}
+	return s.mtuDiscoverer.CurrentSize()
 }
 
 func (s *connection) logLongHeaderPacket(p *longHeaderPacket, ecn protocol.ECN) {
@@ -2346,16 +2381,25 @@ func (s *connection) onStreamCompleted(id protocol.StreamID) {
 	}
 }
 
+func (s *connection) onMTUIncreased(mtu protocol.ByteCount) {
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(mtu)))
+	s.sentPacketHandler.SetMaxDatagramSize(mtu)
+}
+
 func (s *connection) SendDatagram(p []byte) error {
 	if !s.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
 
 	f := &wire.DatagramFrame{DataLenPresent: true}
-	if protocol.ByteCount(len(p)) > f.MaxDataLen(s.peerParams.MaxDatagramFrameSize, s.version) {
-		return &DatagramTooLargeError{
-			PeerMaxDatagramFrameSize: int64(s.peerParams.MaxDatagramFrameSize),
-		}
+	// The payload size estimate is conservative.
+	// Under many circumstances we could send a few more bytes.
+	maxDataLen := min(
+		f.MaxDataLen(s.peerParams.MaxDatagramFrameSize, s.version),
+		protocol.ByteCount(s.maxPayloadSizeEstimate.Load()),
+	)
+	if protocol.ByteCount(len(p)) > maxDataLen {
+		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
 	f.Data = make([]byte, len(p))
 	copy(f.Data, p)
@@ -2377,11 +2421,7 @@ func (s *connection) RemoteAddr() net.Addr {
 	return s.conn.RemoteAddr()
 }
 
-func (s *connection) getPerspective() protocol.Perspective {
-	return s.perspective
-}
-
-func (s *connection) GetVersion() protocol.VersionNumber {
+func (s *connection) GetVersion() protocol.Version {
 	return s.version
 }
 
@@ -2389,4 +2429,11 @@ func (s *connection) NextConnection() Connection {
 	<-s.HandshakeComplete()
 	s.streamsMap.UseResetMaps()
 	return s
+}
+
+// estimateMaxPayloadSize estimates the maximum payload size for short header packets.
+// It is not very sophisticated: it just subtracts the size of header (assuming the maximum
+// connection ID length), and the size of the encryption tag.
+func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
+	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
 }
