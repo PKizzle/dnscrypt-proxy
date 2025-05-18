@@ -6,12 +6,9 @@ import (
 	"errors"
 	"net"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"unicode"
-
-	"github.com/jedisct1/dlog"
 )
 
 type CryptoConstruction uint16
@@ -147,6 +144,8 @@ func TrimAndStripInlineComments(str string) string {
 	return strings.TrimSpace(str)
 }
 
+// ExtractHostAndPort parses a string containing a host and optional port.
+// If no port is present or cannot be parsed, the defaultPort is returned.
 func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 	host, port = str, defaultPort
 	if idx := strings.LastIndex(str, ":"); idx >= 0 && idx < len(str)-1 {
@@ -157,41 +156,16 @@ func ExtractHostAndPort(str string, defaultPort int) (host string, port int) {
 	return
 }
 
+// ReadTextFile reads a file and returns its contents as a string.
+// It automatically removes UTF-8 BOM if present.
 func ReadTextFile(filename string) (string, error) {
 	bin, err := os.ReadFile(filename)
 	if err != nil {
 		return "", err
 	}
+	// Remove UTF-8 BOM if present
 	bin = bytes.TrimPrefix(bin, []byte{0xef, 0xbb, 0xbf})
 	return string(bin), nil
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }
-
-func maybeWritableByOtherUsers(p string) (bool, string, error) {
-	p = path.Clean(p)
-	for p != "/" && p != "." {
-		st, err := os.Stat(p)
-		if err != nil {
-			return false, p, err
-		}
-		mode := st.Mode()
-		if mode.Perm()&2 != 0 && !(st.IsDir() && mode&os.ModeSticky == os.ModeSticky) {
-			return true, p, nil
-		}
-		p = path.Dir(p)
-	}
-	return false, "", nil
-}
-
-func WarnIfMaybeWritableByOtherUsers(p string) {
-	if ok, px, err := maybeWritableByOtherUsers(p); ok {
-		if px == p {
-			dlog.Criticalf("[%s] is writable by other system users - If this is not intentional, it is recommended to fix the access permissions", p)
-		} else {
-			dlog.Warnf("[%s] can be modified by other system users because [%s] is writable by other users - If this is not intentional, it is recommended to fix the access permissions", p, px)
-		}
-	} else if err != nil {
-		dlog.Warnf("Error while checking if [%s] is accessible: [%s] : [%s]", p, px, err)
-	}
-}

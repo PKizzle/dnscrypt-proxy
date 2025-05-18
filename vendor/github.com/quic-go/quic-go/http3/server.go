@@ -57,55 +57,24 @@ type QUICEarlyListener interface {
 
 var _ QUICEarlyListener = &quic.EarlyListener{}
 
-func versionToALPN(v protocol.Version) string {
-	//nolint:exhaustive // These are all the versions we care about.
-	switch v {
-	case protocol.Version1, protocol.Version2:
-		return NextProtoH3
-	default:
-		return ""
-	}
-}
-
 // ConfigureTLSConfig creates a new tls.Config which can be used
-// to create a quic.Listener meant for serving http3. The created
-// tls.Config adds the functionality of detecting the used QUIC version
-// in order to set the correct ALPN value for the http3 connection.
+// to create a quic.Listener meant for serving HTTP/3.
 func ConfigureTLSConfig(tlsConf *tls.Config) *tls.Config {
-	// The tls.Config used to setup the quic.Listener needs to have the GetConfigForClient callback set.
-	// That way, we can get the QUIC version and set the correct ALPN value.
-	return &tls.Config{
-		GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
-			// determine the ALPN from the QUIC version used
-			proto := NextProtoH3
-			val := ch.Context().Value(quic.QUICVersionContextKey)
-			if v, ok := val.(quic.Version); ok {
-				proto = versionToALPN(v)
+	// Workaround for https://github.com/golang/go/issues/60506.
+	// This initializes the session tickets _before_ cloning the config.
+	_, _ = tlsConf.DecryptTicket(nil, tls.ConnectionState{})
+	config := tlsConf.Clone()
+	config.NextProtos = []string{NextProtoH3}
+	if gfc := config.GetConfigForClient; gfc != nil {
+		config.GetConfigForClient = func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
+			conf, err := gfc(ch)
+			if conf == nil || err != nil {
+				return conf, err
 			}
-			config := tlsConf
-			if tlsConf.GetConfigForClient != nil {
-				getConfigForClient := tlsConf.GetConfigForClient
-				var err error
-				conf, err := getConfigForClient(ch)
-				if err != nil {
-					return nil, err
-				}
-				if conf != nil {
-					config = conf
-				}
-			}
-			if config == nil {
-				return nil, nil
-			}
-			// Workaround for https://github.com/golang/go/issues/60506.
-			// This initializes the session tickets _before_ cloning the config.
-			_, _ = config.DecryptTicket(nil, tls.ConnectionState{})
-
-			config = config.Clone()
-			config.NextProtos = []string{proto}
-			return config, nil
-		},
+			return ConfigureTLSConfig(conf), nil
+		}
 	}
+	return config
 }
 
 // contextKey is a value for use with context.WithValue. It's used as
@@ -407,28 +376,10 @@ func (s *Server) generateAltSvcHeader() {
 	}
 
 	// This code assumes that we will use protocol.SupportedVersions if no quic.Config is passed.
-	supportedVersions := protocol.SupportedVersions
-	if s.QUICConfig != nil && len(s.QUICConfig.Versions) > 0 {
-		supportedVersions = s.QUICConfig.Versions
-	}
-
-	// keep track of which have been seen so we don't yield duplicate values
-	seen := make(map[string]struct{}, len(supportedVersions))
-	var versionStrings []string
-	for _, version := range supportedVersions {
-		if v := versionToALPN(version); len(v) > 0 {
-			if _, ok := seen[v]; !ok {
-				versionStrings = append(versionStrings, v)
-				seen[v] = struct{}{}
-			}
-		}
-	}
 
 	var altSvc []string
 	addPort := func(port int) {
-		for _, v := range versionStrings {
-			altSvc = append(altSvc, fmt.Sprintf(`%s=":%d"; ma=2592000`, v, port))
-		}
+		altSvc = append(altSvc, fmt.Sprintf(`%s=":%d"; ma=2592000`, NextProtoH3, port))
 	}
 
 	if s.Port != 0 {
@@ -684,7 +635,7 @@ func (s *Server) handleRequest(conn *connection, str quic.Stream, datagrams *dat
 				if logger == nil {
 					logger = slog.Default()
 				}
-				logger.Error("http: panic serving", "arg", p, "trace", string(buf))
+				logger.Error("http3: panic serving", "arg", p, "trace", string(buf))
 			}
 		}()
 		handler.ServeHTTP(r, req)
@@ -694,18 +645,6 @@ func (s *Server) handleRequest(conn *connection, str quic.Stream, datagrams *dat
 		return
 	}
 
-	// only write response when there is no panic
-	if !panicked {
-		// response not written to the client yet, set Content-Length
-		if !r.headerWritten {
-			if _, haveCL := r.header["Content-Length"]; !haveCL {
-				r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
-			}
-		}
-		r.Flush()
-		r.flushTrailers()
-	}
-
 	// abort the stream when there is a panic
 	if panicked {
 		str.CancelRead(quic.StreamErrorCode(ErrCodeInternalError))
@@ -713,9 +652,17 @@ func (s *Server) handleRequest(conn *connection, str quic.Stream, datagrams *dat
 		return
 	}
 
+	// response not written to the client yet, set Content-Length
+	if !r.headerWritten {
+		if _, haveCL := r.header["Content-Length"]; !haveCL {
+			r.header.Set("Content-Length", strconv.FormatInt(r.numWritten, 10))
+		}
+	}
+	r.Flush()
+	r.flushTrailers()
+
 	// If the EOF was read by the handler, CancelRead() is a no-op.
 	str.CancelRead(quic.StreamErrorCode(ErrCodeNoError))
-
 	str.Close()
 }
 
