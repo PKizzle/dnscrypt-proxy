@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go as build
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go AS build
 
 WORKDIR /src
 
@@ -26,7 +26,7 @@ RUN cp -a /src/dnscrypt-proxy/example-* ./
 COPY dnscrypt-proxy.toml ./
 
 # ----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go as probe
+FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go AS probe
 
 WORKDIR /src/dnsprobe
 
