@@ -418,14 +418,6 @@ type ClientConn struct {
 	// completely unresponsive connection.
 	pendingResets int
 
-	// pendingResets is the number of RST_STREAM frames we have sent to the peer,
-	// without confirming that the peer has received them. When we send a RST_STREAM,
-	// we bundle it with a PING frame, unless a PING is already in flight. We count
-	// the reset stream against the connection's concurrency limit until we get
-	// a PING response. This limits the number of requests we'll try to send to a
-	// completely unresponsive connection.
-	pendingResets int
-
 	// reqHeaderMu is a 1-element semaphore channel controlling access to sending new requests.
 	// Write to reqHeaderMu to lock it, read from it to unlock.
 	// Lock reqmu BEFORE mu or wmu.
