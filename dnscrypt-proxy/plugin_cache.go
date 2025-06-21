@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jedisct1/go-sieve-cache/pkg/sievecache"
 	"github.com/miekg/dns"
-	sieve "github.com/opencoff/go-sieve"
 )
 
 const StaleResponseTTL = 30 * time.Second
@@ -19,8 +19,9 @@ type CachedResponse struct {
 }
 
 type CachedResponses struct {
-	sync.RWMutex
-	cache *sieve.Sieve[[32]byte, CachedResponse]
+	cache     *sievecache.ShardedSieveCache[[32]byte, CachedResponse]
+	cacheMu   sync.Mutex
+	cacheOnce sync.Once
 }
 
 var cachedResponses CachedResponses
@@ -71,19 +72,15 @@ func (plugin *PluginCache) Reload() error {
 func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
 	cacheKey := computeCacheKey(pluginsState, msg)
 
-	cachedResponses.RLock()
 	if cachedResponses.cache == nil {
-		cachedResponses.RUnlock()
 		return nil
 	}
 	cached, ok := cachedResponses.cache.Get(cacheKey)
 	if !ok {
-		cachedResponses.RUnlock()
 		return nil
 	}
 	expiration := cached.expiration
 	synth := cached.msg.Copy()
-	cachedResponses.RUnlock()
 
 	synth.Id = msg.Id
 	synth.Response = true
@@ -148,16 +145,21 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		expiration: time.Now().Add(ttl),
 		msg:        *msg,
 	}
-	cachedResponses.Lock()
-	if cachedResponses.cache == nil {
-		cachedResponses.cache = sieve.New[[32]byte, CachedResponse](pluginsState.cacheSize)
-		if cachedResponses.cache == nil {
-			cachedResponses.Unlock()
-			return fmt.Errorf("failed to initialize the cache")
+	var cacheInitError error
+	cachedResponses.cacheOnce.Do(func() {
+		cache, err := sievecache.NewSharded[[32]byte, CachedResponse](pluginsState.cacheSize)
+		if err != nil {
+			cacheInitError = err
+		} else {
+			cachedResponses.cache = cache
 		}
+	})
+	if cacheInitError != nil {
+		return fmt.Errorf("failed to initialize the cache: %w", cacheInitError)
 	}
-	cachedResponses.cache.Add(cacheKey, cachedResponse)
-	cachedResponses.Unlock()
+	if cachedResponses.cache != nil {
+		cachedResponses.cache.Insert(cacheKey, cachedResponse)
+	}
 	updateTTL(msg, cachedResponse.expiration)
 
 	return nil
