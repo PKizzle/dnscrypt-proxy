@@ -75,6 +75,7 @@ type PluginsState struct {
 	clientAddr                       *net.Addr
 	synthResponse                    *dns.Msg
 	questionMsg                      *dns.Msg
+	xTransport                       *XTransport
 	sessionData                      map[string]interface{}
 	action                           PluginsAction
 	timeout                          time.Duration
@@ -267,6 +268,7 @@ func NewPluginsState(
 		requestStart:                     start,
 		maxUnencryptedUDPSafePayloadSize: MaxDNSUDPSafePacketSize,
 		sessionData:                      make(map[string]interface{}),
+		xTransport:                       proxy.xTransport,
 	}
 }
 
@@ -289,36 +291,35 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 	dlog.Debugf("Handling query for [%v]", qName)
 	pluginsState.qName = qName
 	pluginsState.questionMsg = &msg
-	if len(*pluginsGlobals.queryPlugins) == 0 && len(*pluginsGlobals.loggingPlugins) == 0 {
-		return packet, nil
+	if len(*pluginsGlobals.queryPlugins) > 0 {
+		pluginsGlobals.RLock()
+		for _, plugin := range *pluginsGlobals.queryPlugins {
+			if err := plugin.Eval(pluginsState, &msg); err != nil {
+				dlog.Debugf("Dropping query: %v", err)
+				pluginsState.action = PluginsActionDrop
+				pluginsGlobals.RUnlock()
+				return packet, err
+			}
+			if pluginsState.action == PluginsActionReject {
+				synth := RefusedResponseFromMessage(
+					&msg,
+					pluginsGlobals.refusedCodeInResponses,
+					pluginsGlobals.respondWithIPv4,
+					pluginsGlobals.respondWithIPv6,
+					pluginsState.rejectTTL,
+				)
+				pluginsState.synthResponse = synth
+			}
+			if pluginsState.action != PluginsActionContinue {
+				break
+			}
+		}
+		pluginsGlobals.RUnlock()
 	}
-	pluginsGlobals.RLock()
-	defer pluginsGlobals.RUnlock()
-	for _, plugin := range *pluginsGlobals.queryPlugins {
-		if err := plugin.Eval(pluginsState, &msg); err != nil {
-			pluginsState.action = PluginsActionDrop
-			return packet, err
-		}
-		if pluginsState.action == PluginsActionReject {
-			synth := RefusedResponseFromMessage(
-				&msg,
-				pluginsGlobals.refusedCodeInResponses,
-				pluginsGlobals.respondWithIPv4,
-				pluginsGlobals.respondWithIPv6,
-				pluginsState.rejectTTL,
-			)
-			pluginsState.synthResponse = synth
-		}
-		if pluginsState.action != PluginsActionContinue {
-			break
-		}
-	}
-
 	packet2, err := msg.PackBuffer(packet)
 	if err != nil {
 		return packet, err
 	}
-
 	// Only get server info if we're continuing and need padding
 	if pluginsState.action == PluginsActionContinue && getServerInfo != nil {
 		_, needsEDNS0Padding := getServerInfo()
@@ -329,14 +330,12 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 			}
 		}
 	}
-
 	return packet2, nil
 }
 
 func (pluginsState *PluginsState) ApplyResponsePlugins(
 	pluginsGlobals *PluginsGlobals,
 	packet []byte,
-	ttl *uint32,
 ) ([]byte, error) {
 	msg := dns.Msg{Compress: true}
 	if err := msg.Unpack(packet); err != nil {
@@ -356,29 +355,30 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
 		pluginsState.returnCode = PluginsReturnCodeResponseError
 	}
 	removeEDNS0Options(&msg)
-	pluginsGlobals.RLock()
-	defer pluginsGlobals.RUnlock()
-	for _, plugin := range *pluginsGlobals.responsePlugins {
-		if err := plugin.Eval(pluginsState, &msg); err != nil {
-			pluginsState.action = PluginsActionDrop
-			return packet, err
+	if len(*pluginsGlobals.responsePlugins) > 0 {
+		pluginsGlobals.RLock()
+		for _, plugin := range *pluginsGlobals.responsePlugins {
+			if err := plugin.Eval(pluginsState, &msg); err != nil {
+				dlog.Debugf("Dropping response: %v", err)
+				pluginsState.action = PluginsActionDrop
+				pluginsGlobals.RUnlock()
+				return packet, err
+			}
+			if pluginsState.action == PluginsActionReject {
+				synth := RefusedResponseFromMessage(
+					&msg,
+					pluginsGlobals.refusedCodeInResponses,
+					pluginsGlobals.respondWithIPv4,
+					pluginsGlobals.respondWithIPv6,
+					pluginsState.rejectTTL,
+				)
+				pluginsState.synthResponse = synth
+			}
+			if pluginsState.action != PluginsActionContinue {
+				break
+			}
 		}
-		if pluginsState.action == PluginsActionReject {
-			synth := RefusedResponseFromMessage(
-				&msg,
-				pluginsGlobals.refusedCodeInResponses,
-				pluginsGlobals.respondWithIPv4,
-				pluginsGlobals.respondWithIPv6,
-				pluginsState.rejectTTL,
-			)
-			pluginsState.synthResponse = synth
-		}
-		if pluginsState.action != PluginsActionContinue {
-			break
-		}
-	}
-	if ttl != nil {
-		setMaxTTL(&msg, *ttl)
+		pluginsGlobals.RUnlock()
 	}
 	packet2, err := msg.PackBuffer(packet)
 	if err != nil {

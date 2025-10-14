@@ -75,6 +75,7 @@ func processDNSCryptQuery(
 			if err != nil {
 				pluginsState.returnCode = PluginsReturnCodeParseError
 				pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+				serverInfo.noticeFailure(proxy)
 				return nil, err
 			}
 			response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce)
@@ -85,21 +86,20 @@ func processDNSCryptQuery(
 
 	// Check for stale response if there was an error
 	if err != nil {
+		serverInfo.noticeFailure(proxy)
 		if stale, ok := pluginsState.sessionData["stale"]; ok {
 			dlog.Debug("Serving stale response")
-			response, err = (stale.(*dns.Msg)).Pack()
+			if staleResponse, packErr := (stale.(*dns.Msg)).Pack(); packErr == nil {
+				return staleResponse, nil
+			}
 		}
-	}
-
-	// Handle error cases
-	if err != nil {
+		// If no stale response was served, return the original error
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
 			pluginsState.returnCode = PluginsReturnCodeNetworkError
 		}
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		serverInfo.noticeFailure(proxy)
 		return nil, err
 	}
 
@@ -119,29 +119,30 @@ func processDoHQuery(
 	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
 	SetTransactionID(query, tid)
 
-	// Check for stale response if there was an error
-	if err != nil || tls == nil || !tls.HandshakeComplete {
-		if stale, ok := pluginsState.sessionData["stale"]; ok {
-			dlog.Debug("Serving stale response")
-			return (stale.(*dns.Msg)).Pack()
+	// A response was received, and the TLS handshake was complete.
+	if err == nil && tls != nil && tls.HandshakeComplete {
+		// Restore the original transaction ID
+		response := serverResponse
+		if len(response) >= MinDNSPacketSize {
+			SetTransactionID(response, tid)
+		}
+		return response, nil
+	}
+
+	serverInfo.noticeFailure(proxy)
+
+	// Attempt to serve a stale response as a fallback.
+	if stale, ok := pluginsState.sessionData["stale"]; ok {
+		dlog.Debug("Serving stale response")
+		if staleResponse, packErr := (stale.(*dns.Msg)).Pack(); packErr == nil {
+			return staleResponse, nil
 		}
 	}
 
-	// Handle error cases
-	if err != nil {
-		pluginsState.returnCode = PluginsReturnCodeNetworkError
-		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-		serverInfo.noticeFailure(proxy)
-		return nil, err
-	}
-
-	// Restore the original transaction ID
-	response := serverResponse
-	if len(response) >= MinDNSPacketSize {
-		SetTransactionID(response, tid)
-	}
-
-	return response, nil
+	// If no stale response was served, return the original error.
+	pluginsState.returnCode = PluginsReturnCodeNetworkError
+	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
+	return nil, err
 }
 
 // processODoHQuery - Processes a query using the ODoH protocol
@@ -155,6 +156,8 @@ func processODoHQuery(
 	if len(serverInfo.odohTargetConfigs) == 0 {
 		return nil, nil
 	}
+
+	serverInfo.noticeBegin(proxy)
 
 	target := serverInfo.odohTargetConfigs[rand.Intn(len(serverInfo.odohTargetConfigs))]
 	odohQuery, err := target.encryptQuery(query)
@@ -175,6 +178,7 @@ func processODoHQuery(
 		response, err := odohQuery.decryptResponse(responseBody)
 		if err != nil {
 			dlog.Warnf("Failed to decrypt response from [%v]", serverInfo.Name)
+			serverInfo.noticeFailure(proxy)
 			return nil, err
 		}
 
@@ -254,10 +258,9 @@ func processPlugins(
 	serverInfo *ServerInfo,
 	response []byte,
 ) ([]byte, error) {
-	var ttl *uint32
 	var err error
 
-	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response, ttl)
+	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
 	if err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
@@ -349,15 +352,8 @@ func updateMonitoringMetrics(
 	pluginsState *PluginsState,
 ) {
 	if proxy.monitoringUI.Enabled && proxy.monitoringInstance != nil && pluginsState.questionMsg != nil {
-		dlog.Debugf("Calling UpdateMetrics for query: %s", pluginsState.qName)
 		proxy.monitoringInstance.UpdateMetrics(*pluginsState, pluginsState.questionMsg)
 	} else {
-		if !proxy.monitoringUI.Enabled {
-			dlog.Debugf("Monitoring UI not enabled")
-		}
-		if proxy.monitoringInstance == nil {
-			dlog.Debugf("Monitoring instance is nil")
-		}
 		if pluginsState.questionMsg == nil {
 			dlog.Debugf("Question message is nil")
 		}

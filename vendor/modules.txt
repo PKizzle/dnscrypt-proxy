@@ -47,8 +47,8 @@ github.com/jedisct1/go-dnsstamps
 # github.com/jedisct1/go-hpke-compact v0.0.0-20241212093903-5caa4621366f
 ## explicit; go 1.23.4
 github.com/jedisct1/go-hpke-compact
-# github.com/jedisct1/go-ipcrypt v0.1.0
-## explicit; go 1.21
+# github.com/jedisct1/go-ipcrypt v0.1.1
+## explicit; go 1.20
 github.com/jedisct1/go-ipcrypt
 # github.com/jedisct1/go-minisign v0.0.0-20241212093149-d2f9f49435c7
 ## explicit; go 1.23.4
@@ -86,14 +86,15 @@ github.com/powerman/deepequal
 # github.com/quic-go/qpack v0.5.1
 ## explicit; go 1.22
 github.com/quic-go/qpack
-# github.com/quic-go/quic-go v0.54.0
-## explicit; go 1.23
+# github.com/quic-go/quic-go v0.55.0
+## explicit; go 1.24
 github.com/quic-go/quic-go
 github.com/quic-go/quic-go/http3
 github.com/quic-go/quic-go/internal/ackhandler
 github.com/quic-go/quic-go/internal/congestion
 github.com/quic-go/quic-go/internal/flowcontrol
 github.com/quic-go/quic-go/internal/handshake
+github.com/quic-go/quic-go/internal/monotime
 github.com/quic-go/quic-go/internal/protocol
 github.com/quic-go/quic-go/internal/qerr
 github.com/quic-go/quic-go/internal/utils
@@ -108,10 +109,8 @@ github.com/smartystreets/goconvey/convey/gotest
 github.com/smartystreets/goconvey/convey/reporting
 # go.uber.org/mock v0.6.0
 ## explicit; go 1.23.0
-go.uber.org/mock/mockgen
-go.uber.org/mock/mockgen/model
-# golang.org/x/crypto v0.41.0
-## explicit; go 1.23.0
+# golang.org/x/crypto v0.43.0
+## explicit; go 1.24.0
 golang.org/x/crypto/blake2b
 golang.org/x/crypto/chacha20
 golang.org/x/crypto/chacha20poly1305
@@ -124,14 +123,13 @@ golang.org/x/crypto/nacl/box
 golang.org/x/crypto/nacl/secretbox
 golang.org/x/crypto/poly1305
 golang.org/x/crypto/salsa20/salsa
-# golang.org/x/mod v0.28.0
+# golang.org/x/mod v0.29.0
 ## explicit; go 1.24.0
 golang.org/x/mod/internal/lazyregexp
-golang.org/x/mod/modfile
 golang.org/x/mod/module
 golang.org/x/mod/semver
-# golang.org/x/net v0.43.0
-## explicit; go 1.23.0
+# golang.org/x/net v0.46.0
+## explicit; go 1.24.0
 golang.org/x/net/bpf
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
@@ -147,7 +145,7 @@ golang.org/x/net/proxy
 # golang.org/x/sync v0.17.0
 ## explicit; go 1.24.0
 golang.org/x/sync/errgroup
-# golang.org/x/sys v0.36.0
+# golang.org/x/sys v0.37.0
 ## explicit; go 1.24.0
 golang.org/x/sys/cpu
 golang.org/x/sys/unix
@@ -156,15 +154,17 @@ golang.org/x/sys/windows/registry
 golang.org/x/sys/windows/svc
 golang.org/x/sys/windows/svc/eventlog
 golang.org/x/sys/windows/svc/mgr
-# golang.org/x/text v0.29.0
+# golang.org/x/text v0.30.0
 ## explicit; go 1.24.0
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# golang.org/x/tools v0.36.0
-## explicit; go 1.23.0
+# golang.org/x/tools v0.38.0
+## explicit; go 1.24.0
 golang.org/x/tools/go/ast/astutil
+golang.org/x/tools/go/ast/edge
+golang.org/x/tools/go/ast/inspector
 golang.org/x/tools/go/gcexportdata
 golang.org/x/tools/go/packages
 golang.org/x/tools/go/types/objectpath
@@ -186,11 +186,11 @@ golang.org/x/tools/internal/stdlib
 golang.org/x/tools/internal/typeparams
 golang.org/x/tools/internal/typesinternal
 golang.org/x/tools/internal/versions
-# google.golang.org/genproto/googleapis/rpc v0.0.0-20250818200422-3122310a409c
-## explicit; go 1.23.0
+# google.golang.org/genproto/googleapis/rpc v0.0.0-20251014184007-4626949a642f
+## explicit; go 1.24.0
 google.golang.org/genproto/googleapis/rpc/status
-# google.golang.org/grpc v1.75.0
-## explicit; go 1.23.0
+# google.golang.org/grpc v1.76.0
+## explicit; go 1.24.0
 google.golang.org/grpc/codes
 google.golang.org/grpc/connectivity
 google.golang.org/grpc/grpclog
@@ -199,7 +199,7 @@ google.golang.org/grpc/internal
 google.golang.org/grpc/internal/status
 google.golang.org/grpc/serviceconfig
 google.golang.org/grpc/status
-# google.golang.org/protobuf v1.36.8
+# google.golang.org/protobuf v1.36.10
 ## explicit; go 1.23
 google.golang.org/protobuf/encoding/prototext
 google.golang.org/protobuf/encoding/protowire
