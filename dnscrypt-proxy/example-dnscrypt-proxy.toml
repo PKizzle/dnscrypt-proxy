@@ -103,7 +103,7 @@ disabled_server_names = []
 force_tcp = false
 
 
-## Enable *experimental* support for HTTP/3 (HTTP over QUIC)
+## Enable support for HTTP/3 (HTTP over QUIC)
 ## Note that, like DNSCrypt but unlike other HTTP versions, this uses
 ## UDP and (usually) port 443 instead of TCP.
 
@@ -193,6 +193,19 @@ keepalive = 30
 
 # lb_estimator = true
 
+## Dynamically reduce query timeout as the number of concurrent connections
+## approaches max_clients to prevent overload. Value must be between 0.0 and 1.0.
+## 0.0 = no reduction, 1.0 = maximum reduction.
+## Uses a quartic curve to keep timeout high at low load and reduce sharply near limit.
+## For example, with timeout=5000ms, max_clients=250, and timeout_load_reduction=0.75:
+## - At 125 connections (50% load): timeout remains ~4765ms (95.3%)
+## - At 187 connections (75% load): timeout reduces to ~3826ms (76.5%)
+## - At 225 connections (90% load): timeout reduces to ~2539ms (50.8%)
+## - At 250 connections (100% load): timeout reduces to ~1250ms (25%)
+## This helps maintain responsiveness under high load by failing fast.
+
+# timeout_load_reduction = 0.75
+
 ## Set to `true` to enable hot reloading of configuration files (like allowed-names.txt,
 ## blocked-names.txt, etc.) when they are modified. This can increase CPU and memory usage.
 ## Default is `false` (hot reloading is disabled).
@@ -244,8 +257,8 @@ log_files_max_backups = 1
 #                           Certificate Management                             #
 ###############################################################################
 
-## The maximum concurrency to reload certificates from the resolvers.
-## Default is 10.
+## The maximum concurrency to refresh resolvers (DNSCrypt, DoH, and ODoH).
+## Default is 10. Reduce this on constrained devices such as small routers.
 
 # cert_refresh_concurrency = 10
 
@@ -274,21 +287,13 @@ cert_refresh_delay = 240
 # tls_disable_session_tickets = false
 
 
-## DoH: Use TLS 1.2 and specific cipher suite instead of the server preference
-## 49199 = TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-## 49195 = TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-## 52392 = TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
-## 52393 = TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
-##
-## On non-Intel CPUs such as MIPS routers and ARM systems (Android, Raspberry Pi...),
-## uncommenting the following line may improve performance.
-## This may also help on Intel CPUs running 32-bit operating systems.
-## However, this can cause issues fetching sources or connecting to some HTTP servers,
-## and should not be set on regular CPUs.
-##
-## Keep tls_cipher_suite undefined to let the app automatically choose secure parameters.
+## Prefer RSA certificates over ECDSA for TLS connections.
+## When this is enabled, some servers may become impossible to use,
+## or may stop to work later as they upgrade their configuratione.
+## Changing this setting is generally not recommended, but it may
+## reduce CPU usage on small routers with slow CPUs.
 
-# tls_cipher_suite = [52392, 49199]
+# tls_prefer_rsa = false
 
 
 ## Log TLS key material to a file, for debugging purposes only.
@@ -547,6 +552,12 @@ cache_neg_max_ttl = 600
 
 
 ## Query log format (currently supported: tsv and ltsv)
+##
+## TSV format columns: timestamp, client_ip, query_name, query_type, return_code, duration, server, relay
+## LTSV format fields: time, host, message, type, return, cached, duration, server, relay
+##
+## The relay field shows the anonymizing relay name when using Anonymized DNS or ODoH,
+## or "-" when no relay is used.
 
 format = 'tsv'
 
@@ -741,10 +752,14 @@ format = 'tsv'
 ##
 ## If the `urls` property is missing, cache files and valid signatures
 ## must already be present. This doesn't prevent these cache files from
-## expiring after `refresh_delay` hours.
-## `refreshed_delay` must be in the [24..168] interval.
-## The minimum delay of 24 hours (1 day) avoids unnecessary requests to servers.
-## The maximum delay of 168 hours (1 week) ensures cache freshness.
+## expiring after `cache_ttl` hours.
+##
+## `refresh_delay` controls how often to download updates during normal operation.
+## Must be in the [24..168] interval (1 day to 1 week).
+##
+## `cache_ttl` controls how old the cache can be at startup before requiring
+## an immediate download. Defaults to 168 hours if not set.
+## Must be in [refresh_delay..168] interval.
 
 [sources]
 

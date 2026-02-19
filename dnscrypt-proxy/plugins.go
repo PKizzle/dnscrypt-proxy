@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginsAction int
@@ -70,13 +70,14 @@ type PluginsState struct {
 	requestEnd                       time.Time
 	clientProto                      string
 	serverName                       string
+	relayName                        string
 	serverProto                      string
 	qName                            string
 	clientAddr                       *net.Addr
 	synthResponse                    *dns.Msg
 	questionMsg                      *dns.Msg
 	xTransport                       *XTransport
-	sessionData                      map[string]interface{}
+	sessionData                      map[string]any
 	action                           PluginsAction
 	timeout                          time.Duration
 	returnCode                       PluginsReturnCode
@@ -199,8 +200,8 @@ func parseBlockedQueryResponse(blockedResponse string, pluginsGlobals *PluginsGl
 		}
 
 		if len(blockedIPStrings) > 1 {
-			if strings.HasPrefix(blockedIPStrings[1], "aaaa:") {
-				ipv6Response := strings.TrimPrefix(blockedIPStrings[1], "aaaa:")
+			if after, ok := strings.CutPrefix(blockedIPStrings[1], "aaaa:"); ok {
+				ipv6Response := after
 				if strings.HasPrefix(ipv6Response, "[") {
 					ipv6Response = strings.Trim(ipv6Response, "[]")
 				}
@@ -267,7 +268,7 @@ func NewPluginsState(
 		timeout:                          proxy.timeout,
 		requestStart:                     start,
 		maxUnencryptedUDPSafePayloadSize: MaxDNSUDPSafePacketSize,
-		sessionData:                      make(map[string]interface{}),
+		sessionData:                      make(map[string]any),
 		xTransport:                       proxy.xTransport,
 	}
 }
@@ -277,14 +278,14 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 	packet []byte,
 	getServerInfo func() (*ServerInfo, bool),
 ) ([]byte, error) {
-	msg := dns.Msg{}
-	if err := msg.Unpack(packet); err != nil {
+	msg := dns.Msg{Data: packet}
+	if err := msg.Unpack(); err != nil {
 		return packet, err
 	}
 	if len(msg.Question) != 1 {
 		return packet, errors.New("Unexpected number of questions")
 	}
-	qName, err := NormalizeQName(msg.Question[0].Name)
+	qName, err := NormalizeQName(msg.Question[0].Header().Name)
 	if err != nil {
 		return packet, err
 	}
@@ -316,10 +317,10 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 		}
 		pluginsGlobals.RUnlock()
 	}
-	packet2, err := msg.PackBuffer(packet)
-	if err != nil {
+	if err := msg.Pack(); err != nil {
 		return packet, err
 	}
+	packet2 := msg.Data
 	// Only get server info if we're continuing and need padding
 	if pluginsState.action == PluginsActionContinue && getServerInfo != nil {
 		_, needsEDNS0Padding := getServerInfo()
@@ -337,8 +338,8 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
 	pluginsGlobals *PluginsGlobals,
 	packet []byte,
 ) ([]byte, error) {
-	msg := dns.Msg{Compress: true}
-	if err := msg.Unpack(packet); err != nil {
+	msg := dns.Msg{Data: packet}
+	if err := msg.Unpack(); err != nil {
 		if len(packet) >= MinDNSPacketSize && HasTCFlag(packet) {
 			err = nil
 		}
@@ -380,11 +381,10 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
 		}
 		pluginsGlobals.RUnlock()
 	}
-	packet2, err := msg.PackBuffer(packet)
-	if err != nil {
+	if err := msg.Pack(); err != nil {
 		return packet, err
 	}
-	return packet2, nil
+	return msg.Data, nil
 }
 
 func (pluginsState *PluginsState) ApplyLoggingPlugins(pluginsGlobals *PluginsGlobals) error {

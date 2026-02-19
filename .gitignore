@@ -18,4 +18,5 @@ contrib/msi/*.msi
 contrib/msi/*.wixpdb
 contrib/msi/*.wixobj
 TODO.md
+LOG.md
 .DS_Store

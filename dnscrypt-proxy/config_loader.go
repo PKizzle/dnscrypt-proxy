@@ -65,8 +65,7 @@ func configureLogging(proxy *Proxy, flags *ConfigFlags, config *Config) {
 // configureXTransport - Configures the XTransport
 func configureXTransport(proxy *Proxy, config *Config) error {
 	proxy.xTransport.tlsDisableSessionTickets = config.TLSDisableSessionTickets
-	proxy.xTransport.tlsCipherSuite = config.TLSCipherSuite
-	proxy.xTransport.mainProto = proxy.mainProto
+	proxy.xTransport.tlsPreferRSA = config.TLSPreferRSA
 	proxy.xTransport.http3 = config.HTTP3
 	proxy.xTransport.http3Probe = config.HTTP3Probe
 
@@ -120,7 +119,7 @@ func configureXTransport(proxy *Proxy, config *Config) error {
 			return fmt.Errorf("Unable to use the proxy: [%v]", err)
 		}
 		proxy.xTransport.proxyDialer = &proxyDialer
-		proxy.mainProto = "tcp"
+		proxy.xTransport.mainProto = "tcp"
 	}
 
 	proxy.xTransport.rebuildTransport()
@@ -165,15 +164,17 @@ func configureDoHClientAuth(proxy *Proxy, config *Config) error {
 
 // configureServerParams - Configures server parameters
 func configureServerParams(proxy *Proxy, config *Config) {
-	// Handle legacy response format for blocked queries (handled elsewhere)
-	// This is handled in the main ConfigLoad function
-
 	proxy.blockedQueryResponse = config.BlockedQueryResponse
 	proxy.timeout = time.Duration(config.Timeout) * time.Millisecond
 	proxy.maxClients = config.MaxClients
-	proxy.mainProto = "udp"
+	proxy.timeoutLoadReduction = config.TimeoutLoadReduction
+	if proxy.timeoutLoadReduction < 0.0 || proxy.timeoutLoadReduction > 1.0 {
+		dlog.Warnf("timeout_load_reduction must be between 0.0 and 1.0, using default 0.75")
+		proxy.timeoutLoadReduction = 0.75
+	}
+	proxy.xTransport.mainProto = "udp"
 	if config.ForceTCP {
-		proxy.mainProto = "tcp"
+		proxy.xTransport.mainProto = "tcp"
 	}
 
 	// Configure certificate refresh parameters
@@ -206,8 +207,8 @@ func configureLoadBalancing(proxy *Proxy, config *Config) {
 	case "wp2":
 		lbStrategy = LBStrategyWP2{}
 	default:
-		if strings.HasPrefix(lbStrategyStr, "p") {
-			n, err := strconv.ParseInt(strings.TrimPrefix(lbStrategyStr, "p"), 10, 32)
+		if after, ok := strings.CutPrefix(lbStrategyStr, "p"); ok {
+			n, err := strconv.ParseInt(after, 10, 32)
 			if err != nil || n <= 0 {
 				dlog.Warnf("Invalid load balancing strategy: [%s]", config.LBStrategy)
 			} else {

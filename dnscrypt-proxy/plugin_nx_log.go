@@ -6,8 +6,8 @@ import (
 	"io"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
-	"github.com/miekg/dns"
 )
 
 type PluginNxLog struct {
@@ -60,9 +60,9 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		}
 	}
 	question := msg.Question[0]
-	qType, ok := dns.TypeToString[question.Qtype]
+	qType, ok := dns.TypeToString[dns.RRToType(question)]
 	if !ok {
-		qType = string(qType)
+		qType = fmt.Sprintf("%d", dns.RRToType(question))
 	}
 	qName := pluginsState.qName
 

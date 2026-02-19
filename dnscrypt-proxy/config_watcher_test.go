@@ -75,8 +75,8 @@ func TestConfigWatcher(t *testing.T) {
 	}
 
 	// Test that rapid changes are debounced
-	for i := 0; i < 5; i++ {
-		content := []byte(fmt.Sprintf("%d content", i))
+	for i := range 5 {
+		content := fmt.Appendf(nil, "%d content", i)
 		if err := os.WriteFile(tempFile, content, 0o644); err != nil {
 			t.Fatalf("Failed to update test file in loop: %v", err)
 		}
@@ -113,4 +113,45 @@ func TestConfigWatcher(t *testing.T) {
 
 	// Clean up
 	watcher.Shutdown()
+}
+
+func TestConfigWatcherPollingFallback(t *testing.T) {
+	// Create a temporary file for testing
+	tempDir := t.TempDir()
+	tempFile := filepath.Join(tempDir, "polling_config.txt")
+	if err := os.WriteFile(tempFile, []byte("initial content"), 0o644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	watcher := newPollingConfigWatcher(10 * time.Millisecond)
+	defer watcher.Shutdown()
+
+	var reloadCount int32
+	reloadFunc := func() error {
+		atomic.AddInt32(&reloadCount, 1)
+		return nil
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("AddFile should not panic in polling mode: %v", r)
+		}
+	}()
+
+	if err := watcher.AddFile(tempFile, reloadFunc); err != nil {
+		t.Fatalf("AddFile returned error: %v", err)
+	}
+
+	// Wait for polling loop to process
+	time.Sleep(50 * time.Millisecond)
+
+	// Modify file and allow fallback watcher to detect change
+	if err := os.WriteFile(tempFile, []byte("updated content"), 0o644); err != nil {
+		t.Fatalf("Failed to update test file: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if atomic.LoadInt32(&reloadCount) == 0 {
+		t.Fatalf("Expected at least one reload in polling mode")
+	}
 }

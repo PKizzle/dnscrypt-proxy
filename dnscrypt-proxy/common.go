@@ -16,6 +16,7 @@ import (
 
 	iradix "github.com/hashicorp/go-immutable-radix"
 	"github.com/jedisct1/dlog"
+	"github.com/k-sone/critbitgo"
 )
 
 type CryptoConstruction uint16
@@ -210,23 +211,25 @@ func FormatLogLine(format, clientIP, qName, reason string, additionalFields ...s
 		hour, minute, second := now.Clock()
 		tsStr := fmt.Sprintf("[%d-%02d-%02d %02d:%02d:%02d]", year, int(month), day, hour, minute, second)
 
-		line := fmt.Sprintf("%s\t%s\t%s\t%s", tsStr, clientIP, StringQuote(qName), StringQuote(reason))
+		var line strings.Builder
+		line.WriteString(fmt.Sprintf("%s\t%s\t%s\t%s", tsStr, clientIP, StringQuote(qName), StringQuote(reason)))
 		for _, field := range additionalFields {
-			line += fmt.Sprintf("\t%s", StringQuote(field))
+			line.WriteString(fmt.Sprintf("\t%s", StringQuote(field)))
 		}
-		return line + "\n", nil
+		return line.String() + "\n", nil
 	} else if format == "ltsv" {
-		line := fmt.Sprintf("time:%d\thost:%s\tqname:%s\tmessage:%s", time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason))
+		var line strings.Builder
+		line.WriteString(fmt.Sprintf("time:%d\thost:%s\tqname:%s\tmessage:%s", time.Now().Unix(), clientIP, StringQuote(qName), StringQuote(reason)))
 
 		// For LTSV format, additional fields are added with specific labels
 		for i, field := range additionalFields {
 			if i == 0 {
-				line += fmt.Sprintf("\tip:%s", StringQuote(field))
+				line.WriteString(fmt.Sprintf("\tip:%s", StringQuote(field)))
 			} else {
-				line += fmt.Sprintf("\tfield%d:%s", i, StringQuote(field))
+				line.WriteString(fmt.Sprintf("\tfield%d:%s", i, StringQuote(field)))
 			}
 		}
-		return line + "\n", nil
+		return line.String() + "\n", nil
 	}
 	return "", fmt.Errorf("unexpected log format: [%s]", format)
 }
@@ -311,9 +314,22 @@ func ProcessConfigLines(lines string, processor func(line string, lineNo int) er
 	return nil
 }
 
-// LoadIPRules loads IP rules from text lines into radix tree and map structures
-func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]interface{}) (*iradix.Tree, error) {
+// LoadIPRules loads IP rules from text lines into three structures:
+//   - ips (map): exact IP addresses
+//   - prefixes (radix tree): wildcard prefix rules (e.g. "192.168.*")
+//   - networks (critbit net): CIDR network masks (e.g. "10.0.0.0/8")
+func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]any, networks *critbitgo.Net) (*iradix.Tree, error) {
 	err := ProcessConfigLines(lines, func(line string, lineNo int) error {
+		if strings.Contains(line, "/") {
+			if networks == nil {
+				dlog.Errorf("CIDR rule [%s] at line %d but no network table provided", line, lineNo)
+				return nil
+			}
+			if err := networks.AddCIDR(line, true); err != nil {
+				dlog.Errorf("Invalid CIDR rule [%s] at line %d: %v", line, lineNo, err)
+			}
+			return nil
+		}
 		cleanLine, trailingStar, lineErr := ParseIPRule(line, lineNo)
 		if lineErr != nil {
 			dlog.Error(lineErr)
@@ -336,4 +352,39 @@ func InitializePluginLogger(logFile, format string, maxSize, maxAge, maxBackups 
 		return Logger(maxSize, maxAge, maxBackups, logFile), format
 	}
 	return nil, ""
+}
+
+// reverseAddr returns the in-addr.arpa. or ip6.arpa. hostname of the IP
+// address suitable for reverse DNS (PTR) record lookups.
+func reverseAddr(addr string) (string, error) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return "", errors.New("unrecognized address: " + addr)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		buf := make([]byte, 0, net.IPv4len*4+len("in-addr.arpa."))
+		for i := len(v4) - 1; i >= 0; i-- {
+			buf = strconv.AppendInt(buf, int64(v4[i]), 10)
+			buf = append(buf, '.')
+		}
+		buf = append(buf, "in-addr.arpa."...)
+		return string(buf), nil
+	}
+	// Must be IPv6
+	const hexDigits = "0123456789abcdef"
+	buf := make([]byte, 0, net.IPv6len*4+len("ip6.arpa."))
+	for i := len(ip) - 1; i >= 0; i-- {
+		v := ip[i]
+		buf = append(buf, hexDigits[v&0xF], '.', hexDigits[v>>4], '.')
+	}
+	buf = append(buf, "ip6.arpa."...)
+	return string(buf), nil
+}
+
+// fqdn returns the fully qualified domain name (with trailing dot)
+func fqdn(name string) string {
+	if len(name) == 0 || name[len(name)-1] == '.' {
+		return name
+	}
+	return name + "."
 }

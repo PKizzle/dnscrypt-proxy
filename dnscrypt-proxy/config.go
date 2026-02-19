@@ -82,6 +82,7 @@ type Config struct {
 	SourceIPv4               bool                        `toml:"ipv4_servers"`
 	SourceIPv6               bool                        `toml:"ipv6_servers"`
 	MaxClients               uint32                      `toml:"max_clients"`
+	TimeoutLoadReduction     float64                     `toml:"timeout_load_reduction"`
 	BootstrapResolversLegacy []string                    `toml:"fallback_resolvers"`
 	BootstrapResolvers       []string                    `toml:"bootstrap_resolvers"`
 	IgnoreSystemDNS          bool                        `toml:"ignore_system_dns"`
@@ -91,6 +92,7 @@ type Config struct {
 	LogMaxBackups            int                         `toml:"log_files_max_backups"`
 	TLSDisableSessionTickets bool                        `toml:"tls_disable_session_tickets"`
 	TLSCipherSuite           []uint16                    `toml:"tls_cipher_suite"`
+	TLSPreferRSA             bool                        `toml:"tls_prefer_rsa"`
 	TLSKeyLogFile            string                      `toml:"tls_key_log_file"`
 	NetprobeAddress          string                      `toml:"netprobe_address"`
 	NetprobeTimeout          int                         `toml:"netprobe_timeout"`
@@ -147,6 +149,7 @@ func newConfig() Config {
 		SourceDoH:                true,
 		SourceODoH:               false,
 		MaxClients:               250,
+		TimeoutLoadReduction:     0.75,
 		BootstrapResolvers:       []string{DefaultBootstrapResolver},
 		IgnoreSystemDNS:          false,
 		LogMaxSize:               10,
@@ -154,6 +157,7 @@ func newConfig() Config {
 		LogMaxBackups:            1,
 		TLSDisableSessionTickets: false,
 		TLSCipherSuite:           nil,
+		TLSPreferRSA:             false,
 		TLSKeyLogFile:            "",
 		NetprobeTimeout:          60,
 		OfflineMode:              false,
@@ -184,6 +188,7 @@ type SourceConfig struct {
 	CacheFile      string `toml:"cache_file"`
 	FormatStr      string `toml:"format"`
 	RefreshDelay   int    `toml:"refresh_delay"`
+	CacheTTL       int    `toml:"cache_ttl"`
 	Prefix         string
 }
 
@@ -378,7 +383,10 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	// Configure logging
 	configureLogging(proxy, flags, &config)
 
-	// Configure XTransport
+	// Configure server parameters
+	configureServerParams(proxy, &config)
+
+	// Configure XTransport (may override mainProto if proxy is configured)
 	if err := configureXTransport(proxy, &config); err != nil {
 		return err
 	}
@@ -387,9 +395,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	if err := configureDoHClientAuth(proxy, &config); err != nil {
 		return err
 	}
-
-	// Configure server parameters
-	configureServerParams(proxy, &config)
 
 	// Configure load balancing
 	configureLoadBalancing(proxy, &config)
@@ -688,14 +693,6 @@ func (config *Config) loadSources(proxy *Proxy) error {
 	if err := proxy.updateRegisteredServers(); err != nil {
 		return err
 	}
-	rs1 := proxy.registeredServers
-	rs2 := proxy.serversInfo.registeredServers
-	rand.Shuffle(len(rs1), func(i, j int) {
-		rs1[i], rs1[j] = rs1[j], rs1[i]
-	})
-	rand.Shuffle(len(rs2), func(i, j int) {
-		rs2[i], rs2[j] = rs2[j], rs2[i]
-	})
 	return nil
 }
 
@@ -720,6 +717,10 @@ func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *
 		cfgSource.RefreshDelay = 72
 	}
 	cfgSource.RefreshDelay = Min(169, Max(25, cfgSource.RefreshDelay))
+	if cfgSource.CacheTTL <= 0 {
+		cfgSource.CacheTTL = 168
+	}
+	cfgSource.CacheTTL = Min(168, Max(cfgSource.RefreshDelay, cfgSource.CacheTTL))
 	source, err := NewSource(
 		cfgSourceName,
 		proxy.xTransport,
@@ -728,6 +729,7 @@ func (config *Config) loadSource(proxy *Proxy, cfgSourceName string, cfgSource *
 		cfgSource.CacheFile,
 		cfgSource.FormatStr,
 		time.Duration(cfgSource.RefreshDelay)*time.Hour,
+		time.Duration(cfgSource.CacheTTL)*time.Hour,
 		cfgSource.Prefix,
 	)
 	if err != nil {
