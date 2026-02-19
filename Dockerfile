@@ -1,11 +1,11 @@
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go AS build
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
 
 WORKDIR /src
 
-COPY --chown=nonroot:nonroot dnscrypt-proxy ./dnscrypt-proxy
-COPY --chown=nonroot:nonroot vendor ./vendor
-COPY --chown=nonroot:nonroot go.mod .
-COPY --chown=nonroot:nonroot go.sum .
+COPY --chown=65532:65532 dnscrypt-proxy ./dnscrypt-proxy
+COPY --chown=65532:65532 vendor ./vendor
+COPY --chown=65532:65532 go.mod .
+COPY --chown=65532:65532 go.sum .
 
 WORKDIR /src/dnscrypt-proxy
 
@@ -17,7 +17,7 @@ ARG CGO_ENABLED=0 \
 
 RUN --mount=type=cache,target=/home/nonroot/.cache/go-build,uid=65532,gid=65532 \
     --mount=type=cache,target=/go/pkg \
-    GOARM="${TARGETVARIANT//v}" go build -v -ldflags="-s -w" -mod vendor
+    GOARM="${TARGETVARIANT#v}" go build -v -ldflags="-s -w" -mod vendor
 
 WORKDIR /config
 
@@ -38,11 +38,11 @@ ARG CGO_ENABLED=0 \
 
 COPY dnsprobe/ ./
 
-RUN GOARM="${TARGETVARIANT//v}" go build -o /usr/local/bin/dnsprobe .
+RUN GOARM="${TARGETVARIANT#v}" go build -o /usr/local/bin/dnsprobe .
 
 # ----------------------------------------------------------------------------
 # hadolint ignore=DL3007
-FROM cgr.dev/chainguard/static
+FROM gcr.io/distroless/static:nonroot
 
 COPY --from=build /src/dnscrypt-proxy/dnscrypt-proxy /usr/local/bin/
 COPY --from=probe /usr/local/bin/dnsprobe /usr/local/bin/

@@ -50,12 +50,11 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		return nil
 	}
 	if clientIPStr == "127.0.0.1" || clientIPStr == "::1" {
-		if edns0 := pluginsState.questionMsg.IsEdns0(); edns0 != nil {
-			for _, o := range edns0.Option {
-				switch o.(type) {
-				case *dns.EDNS0_SUBNET:
-					clientIPStr = o.String()
-				}
+		for _, rr := range pluginsState.questionMsg.Pseudo {
+			subnet, ok := rr.(*dns.SUBNET)
+			if ok {
+				clientIPStr = subnet.String()
+				break
 			}
 		}
 	}
