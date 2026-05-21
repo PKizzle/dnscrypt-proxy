@@ -81,7 +81,6 @@ func processDNSCryptQuery(
 
 	// Check for stale response if there was an error
 	if err != nil {
-		serverInfo.noticeFailure(proxy)
 		if stale, ok := pluginsState.sessionData["stale"]; ok {
 			dlog.Debug("Serving stale response")
 			staleMsg := stale.(*dns.Msg)
@@ -89,7 +88,8 @@ func processDNSCryptQuery(
 				return staleMsg.Data, nil
 			}
 		}
-		// If no stale response was served, return the original error
+		// No stale response available; this is a definitive failure
+		serverInfo.noticeFailure(proxy)
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
@@ -125,8 +125,6 @@ func processDoHQuery(
 		return response, nil
 	}
 
-	serverInfo.noticeFailure(proxy)
-
 	// Attempt to serve a stale response as a fallback.
 	if stale, ok := pluginsState.sessionData["stale"]; ok {
 		dlog.Debug("Serving stale response")
@@ -136,7 +134,8 @@ func processDoHQuery(
 		}
 	}
 
-	// If no stale response was served, return the original error.
+	// No stale response available; this is a definitive failure
+	serverInfo.noticeFailure(proxy)
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	return nil, err

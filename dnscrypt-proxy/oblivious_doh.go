@@ -180,6 +180,9 @@ func (q ODoHQuery) decryptResponse(response []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(responsePlaintext) < 2 {
+		return nil, fmt.Errorf("Malformed response")
+	}
 
 	responseLength := binary.BigEndian.Uint16(responsePlaintext[0:2])
 	if int(responseLength)+2 > len(responsePlaintext) {

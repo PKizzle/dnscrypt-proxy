@@ -123,6 +123,11 @@ func (p *UDPConnPool) Put(addr *net.UDPAddr, conn *net.UDPConn) {
 	shard := p.getShard(addrStr)
 
 	shard.Lock()
+	if atomic.LoadInt32(&p.closed) != 0 {
+		shard.Unlock()
+		conn.Close()
+		return
+	}
 	conns := shard.conns[addrStr]
 	if len(conns) >= UDPPoolMaxConnsPerAddr {
 		shard.Unlock()

@@ -60,7 +60,7 @@ func (e *ParseError) Error() (s string) {
 		e.err = e.wrappedErr.Error()
 	}
 	s += "dns: " + e.err + ": " + strconv.QuoteToASCII(e.lex.Token) + " at line: " +
-		strconv.Itoa(e.lex.Line) + ":" + strconv.Itoa(e.lex.Column)
+		strconv.Itoa(int(e.lex.Line)) + ":" + strconv.Itoa(int(e.lex.Column))
 	return
 }
 
@@ -110,13 +110,14 @@ func Read(r io.Reader) (RR, error) { return read(r, "") }
 
 func read(r io.Reader, file string) (RR, error) {
 	zp := NewZoneParser(r, ".", file)
-	zp.SetDefaultTTL(defaultTTL)
+	zp.SetDefaultTTL(3600)
 	rr, _ := zp.Next()
 	return rr, zp.Err()
 }
 
-// NewData parses s, but only for the rdata, i.e. when the full RR is "miek.nl. IN 3600 MX 10 mx.miek.nl.",
+// NewData parses s, but only for the [RDATA], i.e. when the full [RR] is "miek.nl. IN 3600 MX 10 mx.miek.nl.",
 // NewData must get "10 mx.miek.nl." and optionally an origin. Leading spaces are not allowed.
+// Examples can be found in [RDATA].
 func NewData(rrtype uint16, s string, origin ...string) (RDATA, error) {
 	return readData(strings.NewReader(s), rrtype, origin...)
 }
@@ -154,11 +155,15 @@ func readData(r io.Reader, rrtype uint16, origin ...string) (RDATA, error) {
 //		// log.Println(err)
 //	}
 //
-// Callers should not assume all returned data in a RR is
-// syntactically correct, e.g. illegal base64 in RRSIGs will be returned as-is.
+// Callers should not assume all returned data in a [RR] is
+// syntactically correct, e.g. illegal base64 in [RRSIG]s will be returned as-is.
 type ZoneParser struct {
 	h Header // rr header as we parse
 	t uint16 // type as we parse, not stored in the header
+
+	includeDepth       uint8
+	generateDisallowed bool
+
 	r io.Reader
 	c *dnslex.Lexer
 
@@ -191,17 +196,13 @@ type ZoneParser struct {
 	// Next, by calling subNext, forwards the resulting RRs from this
 	// sub parser to the calling code.
 	sub *ZoneParser
-
-	includeDepth       uint8
-	generateDisallowed bool
 }
 
 // NewZoneParser returns an RFC 1035 style zone file parser that reads from r.
 //
-// The string file is used in error reporting and to resolve relative
-// $INCLUDE directives. The string origin is used as the initial
-// origin, as if the file would start with an $ORIGIN directive.
-// IncludeAllowFunc is set to DefaultIncludeAllowFunc.
+// The string file is used in error reporting and to resolve relative $INCLUDE directives. The string origin
+// is used as the initial origin, as if the file would start with an $ORIGIN directive.
+// IncludeAllowFunc is set to [DefaultIncludeAllowFunc].
 func NewZoneParser(r io.Reader, origin, file string) *ZoneParser {
 	var pe *ParseError
 	if origin != "" {
@@ -267,11 +268,9 @@ func (zp *ZoneParser) subNext() (RR, bool) {
 	return zp.Next()
 }
 
-// Next advances the parser to the next RR in the zone file and
-// returns the (RR, true). It will return (nil, false) when the
-// parsing stops, either by reaching the end of the input or an
-// error. After Next returns (nil, false), the Err method will return
-// any error that occurred during parsing.
+// Next advances the parser to the next RR in the zone file and returns the ([RR], true).
+// It will return (nil, false) when the parsing stops, either by reaching the end of the input or an
+// error. After Next returns (nil, false), the Err method will return any error that occurred during parsing.
 func (zp *ZoneParser) Next() (RR, bool) {
 	if zp.parseErr != nil {
 		return nil, false
@@ -300,11 +299,10 @@ func (zp *ZoneParser) Next() (RR, bool) {
 	//   4. dnslex.Owner _ dnslex.String _ dnslex.Class  _ dnslex.Rrtype -> ttl/class
 	//   5. dnslex.Owner _ dnslex.Class  _ dnslex.String _ dnslex.Rrtype -> class/ttl (reversed)
 	//
-	// After detecting these, we know the zRrtype so we can jump to functions handling the rdata for each of these types.
+	// After detecting these, we know the RR type so we can jump to functions handling the rdata for each.
 
 	st := zExpectOwnerDir // initial state
 
-Next:
 	for l, ok := zp.c.Next(); ok; l, ok = zp.c.Next() {
 		// zlexer spotted an error already
 		if l.Value == dnslex.Error {
@@ -313,7 +311,7 @@ Next:
 
 		switch st {
 		case zExpectOwnerDir:
-			// We can also expect a directive, like $TTL or $ORIGIN
+			// We can also expect a directive, like $TTL or $ORIGIN.
 			if zp.defttl != nil {
 				zp.h.TTL = zp.defttl.ttl
 			}
@@ -332,46 +330,31 @@ Next:
 
 				zp.h.Name = name
 
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after owner", l)
 				}
 
 				st = zExpectAny
 			case dnslex.DirTTL:
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after $TTL-directive", l)
 				}
 
 				st = zExpectDirTTL
 			case dnslex.DirOrigin:
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after $ORIGIN-directive", l)
 				}
 
 				st = zExpectDirOrigin
 			case dnslex.DirInclude:
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after $INCLUDE-directive", l)
 				}
 
 				st = zExpectDirInclude
 			case dnslex.DirGenerate:
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after $GENERATE-directive", l)
 				}
 
@@ -383,25 +366,18 @@ Next:
 			case dnslex.Class:
 				zp.h.Class = l.Torc
 
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after class", l)
 				}
 
 				st = zExpectAnyNoClass
 			case dnslex.Blank:
-				// Discard, can happen when there is nothing on the
-				// line except the RR type
+				// Discard, can happen when there is nothing on the line except the RR type.
 			case dnslex.String:
 				if zp.h.TTL, ok = setTTL(l); !ok {
 					return zp.setParseError("not a TTL", l)
 				}
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after TTL", l)
 				}
 
@@ -413,9 +389,8 @@ Next:
 			if l.Value != dnslex.Blank {
 				return zp.setParseError("no blank before RR type", l)
 			}
-			if l, ok = zp.c.Next(); !ok {
-				break Next
-			}
+
+			l, _ = zp.c.Next()
 			if l.Value != dnslex.Rrtype {
 				return zp.setParseError("unknown RR type", l)
 			}
@@ -433,12 +408,9 @@ Next:
 					rr = newFn()
 					*rr.Header() = zp.h
 
-					// We may be parsing a known RR type using the RFC3597 format.
-					// If so, we handle that here in a generic way.
-					//
-					// This is also true for PrivateRR types which will have the
-					// RFC3597 parsing done for them and the Unpack method called
-					// to populate the RR instead of simply deferring to Parse.
+					// We may be parsing a known RR type using the RFC3597 format. If so, we handle that here in a generic way.
+					// Custom RRs will need to be registered and will be called with processed []Tokens in
+					// parse.
 					if zp.c.Peek().Token == "\\#" {
 						parseAsRFC3597 = true
 					}
@@ -621,10 +593,7 @@ Next:
 			case dnslex.Class:
 				zp.h.Class = l.Torc
 
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after class", l)
 				}
 
@@ -633,10 +602,7 @@ Next:
 				if zp.h.TTL, ok = setTTL(l); !ok {
 					return zp.setParseError("not a TTL", l)
 				}
-				if l, ok = zp.c.Next(); !ok {
-					break Next
-				}
-				if l.Value != dnslex.Blank {
+				if !zp.c.Blank() {
 					return zp.setParseError("no blank after TTL", l)
 				}
 
@@ -680,7 +646,7 @@ Next:
 	return nil, false
 }
 
-// RRs allows ranging over the RRs from the zone currently parsed.
+// RRs allows ranging over the RRs from the zone currently parsed. See [Msg.RRs] also.
 func (zp *ZoneParser) RRs() iter.Seq2[RR, error] {
 	return func(yield func(RR, error) bool) {
 		for {
@@ -743,9 +709,8 @@ func stringToTTL(token string) (uint32, bool) {
 	return uint32(s + i), true
 }
 
-// Parse LOC records' <digits>[.<digits>][mM] into a
-// mantissa exponent format. Token should contain the entire
-// string (i.e. no spaces allowed)
+// stringgToCm parses LOC records' <digits>[.<digits>][mM] into a mantissa exponent format. Token should contain the entire
+// string (i.e. no spaces allowed).
 func stringToCm(token string) (e, m uint8, ok bool) {
 	if token[len(token)-1] == 'M' || token[len(token)-1] == 'm' {
 		token = token[0 : len(token)-1]
@@ -758,8 +723,7 @@ func stringToCm(token string) (e, m uint8, ok bool) {
 	mStr, cmStr, hasCM := strings.Cut(token, ".")
 	if hasCM {
 		// There's no point in having more than 2 digits in this part, and would rather make the implementation complicated ('123' should be treated as '12').
-		// So we simply reject it.
-		// We also make sure the first character is a digit to reject '+-' signs.
+		// So we simply reject it. We also make sure the first character is a digit to reject '+-' signs.
 		cmeters, err = strconv.Atoi(cmStr)
 		if err != nil || len(cmStr) > 2 || cmStr[0] < '0' || cmStr[0] > '9' {
 			return
@@ -792,7 +756,7 @@ func stringToCm(token string) (e, m uint8, ok bool) {
 	return e, uint8(val), true
 }
 
-// LOC record helper function
+// LOC record helper function.
 func locCheckNorth(token string, latitude uint32) (uint32, bool) {
 	if latitude > 90*1000*60*60 {
 		return latitude, false
@@ -806,7 +770,7 @@ func locCheckNorth(token string, latitude uint32) (uint32, bool) {
 	return latitude, false
 }
 
-// LOC record helper function
+// LOC record helper function.
 func locCheckEast(token string, longitude uint32) (uint32, bool) {
 	if longitude > 180*1000*60*60 {
 		return longitude, false
@@ -818,23 +782,6 @@ func locCheckEast(token string, longitude uint32) (uint32, bool) {
 		return LOCEquator - longitude, true
 	}
 	return longitude, false
-}
-
-// Parse a 64 bit-like ipv6 address: "0014:4fff:ff20:ee64" Used for NID and L64 record.
-func stringToNodeID(l dnslex.Lex) (uint64, error) {
-	if len(l.Token) < 19 {
-		return 0, &ParseError{file: l.Token, err: "bad NID/L64 NodeID/Locator64", lex: l}
-	}
-	// There must be three colons at fixes positions, if not its a parse error
-	if l.Token[4] != ':' && l.Token[9] != ':' && l.Token[14] != ':' {
-		return 0, &ParseError{file: l.Token, err: "bad NID/L64 NodeID/Locator64", lex: l}
-	}
-	s := l.Token[0:4] + l.Token[5:9] + l.Token[10:14] + l.Token[15:19]
-	u, err := strconv.ParseUint(s, 16, 64)
-	if err != nil {
-		return 0, &ParseError{file: l.Token, err: "bad NID/L64 NodeID/Locator64", lex: l}
-	}
-	return u, nil
 }
 
 // IncludeAllowFunc is a function that gets the full path of the original parsed file name and the included

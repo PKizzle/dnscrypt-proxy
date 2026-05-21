@@ -34,7 +34,7 @@ func (plugin *PluginAllowedIP) Name() string {
 }
 
 func (plugin *PluginAllowedIP) Description() string {
-	return "Allows DNS queries containing specific IP addresses"
+	return "Allows DNS responses containing specific IP addresses"
 }
 
 func (plugin *PluginAllowedIP) Init(proxy *Proxy) error {

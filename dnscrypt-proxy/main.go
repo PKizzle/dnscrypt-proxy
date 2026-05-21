@@ -1,11 +1,8 @@
 package main
 
 import (
-	crypto_rand "crypto/rand"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"math/rand"
 	"os"
 	"os/signal"
 	"runtime"
@@ -33,15 +30,6 @@ func main() {
 		dlog.Warnf("Timezone setup failed: [%v]", tzErr)
 	}
 	runtime.MemProfileRate = 0
-
-	// Initialize random number generator
-	// Note: As of Go 1.20, the global RNG is automatically seeded
-	// This explicit seeding is kept for compatibility with older Go versions
-	seed := make([]byte, 8)
-	if _, err := crypto_rand.Read(seed); err != nil {
-		dlog.Fatal(err)
-	}
-	rand.Seed(int64(binary.LittleEndian.Uint64(seed)))
 
 	pwd, err := os.Getwd()
 	if err != nil {

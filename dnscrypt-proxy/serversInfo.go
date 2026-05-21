@@ -69,6 +69,7 @@ type ServerInfo struct {
 	totalQueries   uint64    // Total queries sent to this server
 	failedQueries  uint64    // Failed queries count
 	lastUpdateTime time.Time // Last time metrics were updated
+	lastDecayTS    time.Time // Last time RTT was decayed for recovery
 }
 
 type LBStrategy interface {
@@ -310,7 +311,6 @@ func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
 		serversInfo.inner[currentActive].rtt.Set(currentActiveRtt)
 		return
 	}
-	partialSort := false
 	if candidateRtt < currentActiveRtt {
 		serversInfo.inner[candidate], serversInfo.inner[currentActive] = serversInfo.inner[currentActive], serversInfo.inner[candidate]
 		dlog.Debugf(
@@ -319,26 +319,64 @@ func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
 			int(candidateRtt),
 			int(currentActiveRtt),
 		)
-		partialSort = true
-	} else if candidateRtt > 0 && candidateRtt >= (serversInfo.inner[0].rtt.Value()+serversInfo.inner[activeCount-1].rtt.Value())/2.0*4.0 {
-		if time.Since(serversInfo.inner[candidate].lastActionTS) > time.Duration(1*time.Minute) {
-			serversInfo.inner[candidate].rtt.Add(candidateRtt / 2.0)
-			dlog.Debugf(
-				"Giving a new chance to candidate [%s], lowering its RTT from %d to %d (best: %d)",
-				serversInfo.inner[candidate].Name,
-				int(candidateRtt),
-				int(serversInfo.inner[candidate].rtt.Value()),
-				int(serversInfo.inner[0].rtt.Value()),
-			)
-			partialSort = true
+		serversInfo.sortByRtt()
+	}
+}
+
+func (serversInfo *ServersInfo) sortByRtt() {
+	for i := 1; i < len(serversInfo.inner); i++ {
+		if serversInfo.inner[i-1].rtt.Value() > serversInfo.inner[i].rtt.Value() {
+			serversInfo.inner[i-1], serversInfo.inner[i] = serversInfo.inner[i], serversInfo.inner[i-1]
 		}
 	}
-	if partialSort {
-		for i := 1; i < serversCount; i++ {
-			if serversInfo.inner[i-1].rtt.Value() > serversInfo.inner[i].rtt.Value() {
-				serversInfo.inner[i-1], serversInfo.inner[i] = serversInfo.inner[i], serversInfo.inner[i-1]
-			}
+}
+
+func (serversInfo *ServersInfo) recoverDormantServers() {
+	if len(serversInfo.inner) <= 1 {
+		return
+	}
+	bestRtt := serversInfo.inner[0].rtt.Value()
+	for _, server := range serversInfo.inner {
+		if rtt := server.rtt.Value(); rtt > 0 && rtt < bestRtt {
+			bestRtt = rtt
 		}
+	}
+	if bestRtt <= 0 {
+		return
+	}
+	now := time.Now()
+	needsSort := false
+	for _, server := range serversInfo.inner {
+		currentRtt := server.rtt.Value()
+		if currentRtt <= bestRtt*4.0 {
+			continue
+		}
+		if now.Sub(server.lastActionTS) <= time.Minute {
+			continue
+		}
+		if now.Sub(server.lastDecayTS) <= 10*time.Second {
+			continue
+		}
+		targetRtt := float64(server.initialRtt)
+		if targetRtt <= 0 {
+			targetRtt = bestRtt
+		}
+		server.rtt.Add(targetRtt)
+		newRtt := server.rtt.Value()
+		server.totalQueries = 0
+		server.failedQueries = 0
+		server.lastDecayTS = now
+		needsSort = true
+		dlog.Debugf(
+			"Giving a new chance to [%s], lowering its RTT from %d to %d (best: %d)",
+			server.Name,
+			int(currentRtt),
+			int(newRtt),
+			int(bestRtt),
+		)
+	}
+	if needsSort {
+		serversInfo.sortByRtt()
 	}
 }
 
@@ -349,6 +387,8 @@ func (serversInfo *ServersInfo) getOne() *ServerInfo {
 		serversInfo.Unlock()
 		return nil
 	}
+
+	serversInfo.recoverDormantServers()
 
 	var candidate int
 
@@ -515,6 +555,9 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 			}
 			candidates = append(candidates, relayIdx)
 		}
+		if len(candidates) == 0 {
+			return nil
+		}
 		return &relayStamps[candidates[rand.Intn(len(candidates))]]
 	} else if server.stamp.Proto != stamps.StampProtoTypeDNSCrypt {
 		return nil
@@ -556,8 +599,10 @@ func findFarthestRoute(proxy *Proxy, name string, relayStamps []stamps.ServerSta
 				break
 			}
 		}
-		if samePrefixBits <= bestRelaySamePrefixBits {
+		if samePrefixBits < bestRelaySamePrefixBits {
 			bestRelaySamePrefixBits = samePrefixBits
+			bestRelayIdxs = []int{relayIdx}
+		} else if samePrefixBits == bestRelaySamePrefixBits {
 			bestRelayIdxs = append(bestRelayIdxs, relayIdx)
 		}
 	}

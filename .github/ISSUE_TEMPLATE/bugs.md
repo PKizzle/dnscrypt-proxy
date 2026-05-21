@@ -9,7 +9,7 @@ assignees: ''
 
 Thanks for taking the time to report a bug! Before filing, please note:
 
-**Need help or have a question?** The issue tracker is for confirmed, reproducible bugs. For assistance with installation, configuration, or general questions, please use our [Q&A Discussions](https://github.com/DNSCrypt/dnscrypt-proxy/discussions/categories/q-a) instead - you'll likely get a faster response there.
+**Need help or have a question?** The issue tracker is for confirmed, reproducible bugs only. For installation help, configuration help, troubleshooting, or general questions, please read the [documentation](https://dnscrypt.info/doc) first. If you still need assistance, use our [Q&A Discussions](https://github.com/DNSCrypt/dnscrypt-proxy/discussions/categories/q-a) instead - you'll likely get a faster response there.
 
 ---
 
@@ -17,6 +17,7 @@ Thanks for taking the time to report a bug! Before filing, please note:
 
 Please make sure:
 
+- You've read the [documentation](https://dnscrypt.info/doc) and this is not answered there already
 - You're running the **latest version** of `dnscrypt-proxy` (precompiled binaries from this repository)
 - The software is correctly installed and configured
 - You can reliably reproduce the issue
@@ -37,6 +38,7 @@ Please run these commands and paste the output:
 ./dnscrypt-proxy -resolve example.com
 ```
 
+- [ ] I read the documentation and this is not answered there
 - [ ] Initially raised as discussion #...
 
 ## What's happening?

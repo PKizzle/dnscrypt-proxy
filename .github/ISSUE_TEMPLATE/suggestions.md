@@ -9,6 +9,8 @@ assignees: ''
 
 Got an idea for improving dnscrypt-proxy? We'd love to hear it!
 
+Please read the [documentation](https://dnscrypt.info/doc) first in case the behavior already exists or is already documented.
+
 ### Start with a discussion
 
 The best way to propose a new feature is to start in [Discussions](https://github.com/DNSCrypt/dnscrypt-proxy/discussions/) under the "Ideas" category. This lets us:

@@ -39,7 +39,7 @@ func (plugin *PluginBlockIPv6) Eval(pluginsState *PluginsState, msg *dns.Msg) er
 		Name: question.Header().Name, Class: dns.ClassINET, TTL: 86400,
 	}
 	hinfo.Cpu = "AAAA queries have been locally blocked by dnscrypt-proxy"
-	hinfo.Os = "Set block_ipv6 to false to disable that feature"
+	hinfo.Os = "Set block_ipv6 to false to disable this feature"
 	synth.Answer = []dns.RR{hinfo}
 	qName := question.Header().Name
 	i := strings.Index(qName, ".")

@@ -4,6 +4,8 @@ package dns
 
 func (o *LLQ) Header() *Header          { return &Header{Name: "."} }
 func (o *LLQ) Pseudo() bool             { return true }
+func (o *UPDATELEASE) Header() *Header  { return &Header{Name: "."} }
+func (o *UPDATELEASE) Pseudo() bool     { return true }
 func (o *REPORTING) Header() *Header    { return &Header{Name: "."} }
 func (o *REPORTING) Pseudo() bool       { return true }
 func (o *COOKIE) Header() *Header       { return &Header{Name: "."} }
@@ -30,12 +32,17 @@ func (o *ESU) Header() *Header          { return &Header{Name: "."} }
 func (o *ESU) Pseudo() bool             { return true }
 func (o *ZONEVERSION) Header() *Header  { return &Header{Name: "."} }
 func (o *ZONEVERSION) Pseudo() bool     { return true }
+func (o *MQQUERY) Header() *Header      { return &Header{Name: "."} }
+func (o *MQQUERY) Pseudo() bool         { return true }
+func (o *MQRESPONSE) Header() *Header   { return &Header{Name: "."} }
+func (o *MQRESPONSE) Pseudo() bool      { return true }
 func (o *ERFC3597) Header() *Header     { return &Header{Name: "."} }
 func (o *ERFC3597) Pseudo() bool        { return true }
 
 // CodeToRR is a map of constructors for each EDNS0 RR type.
 var CodeToRR = map[uint16]func() EDNS0{
 	CodeLLQ:          func() EDNS0 { return new(LLQ) },
+	CodeUPDATELEASE:  func() EDNS0 { return new(UPDATELEASE) },
 	CodeREPORTING:    func() EDNS0 { return new(REPORTING) },
 	CodeCOOKIE:       func() EDNS0 { return new(COOKIE) },
 	CodeNSID:         func() EDNS0 { return new(NSID) },
@@ -49,6 +56,8 @@ var CodeToRR = map[uint16]func() EDNS0{
 	CodeSUBNET:       func() EDNS0 { return new(SUBNET) },
 	CodeESU:          func() EDNS0 { return new(ESU) },
 	CodeZONEVERSION:  func() EDNS0 { return new(ZONEVERSION) },
+	CodeMQQUERY:      func() EDNS0 { return new(MQQUERY) },
+	CodeMQRESPONSE:   func() EDNS0 { return new(MQRESPONSE) },
 }
 
 // RRToCode is the reverse of CodeToRR, implemented as a function.
@@ -56,6 +65,8 @@ func RRToCode(o EDNS0) uint16 {
 	switch o.(type) {
 	case *LLQ:
 		return CodeLLQ
+	case *UPDATELEASE:
+		return CodeUPDATELEASE
 	case *REPORTING:
 		return CodeREPORTING
 	case *COOKIE:
@@ -82,6 +93,10 @@ func RRToCode(o EDNS0) uint16 {
 		return CodeESU
 	case *ZONEVERSION:
 		return CodeZONEVERSION
+	case *MQQUERY:
+		return CodeMQQUERY
+	case *MQRESPONSE:
+		return CodeMQRESPONSE
 	}
 	if x, ok := o.(Typer); ok {
 		return x.Type()
@@ -92,6 +107,7 @@ func RRToCode(o EDNS0) uint16 {
 // CodeToString is a map of strings for each EDNS0 RR type.
 var CodeToString = map[uint16]string{
 	CodeLLQ:          "LLQ",
+	CodeUPDATELEASE:  "UPDATELEASE",
 	CodeREPORTING:    "REPORTING",
 	CodeCOOKIE:       "COOKIE",
 	CodeNSID:         "NSID",
@@ -105,4 +121,6 @@ var CodeToString = map[uint16]string{
 	CodeSUBNET:       "SUBNET",
 	CodeESU:          "ESU",
 	CodeZONEVERSION:  "ZONEVERSION",
+	CodeMQQUERY:      "MQQUERY",
+	CodeMQRESPONSE:   "MQRESPONSE",
 }

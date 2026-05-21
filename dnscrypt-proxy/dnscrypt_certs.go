@@ -112,7 +112,7 @@ func FetchCurrentDNSCryptCert(
 		tsBegin := binary.BigEndian.Uint32(binCert[116:120])
 		tsEnd := binary.BigEndian.Uint32(binCert[120:124])
 		if tsBegin >= tsEnd {
-			dlog.Warnf("[%v] certificate ends before it starts (%v >= %v)", *serverName, tsBegin, tsEnd)
+			dlog.Warnf("[%v] certificate has invalid time range: start >= end (%v >= %v)", *serverName, tsBegin, tsEnd)
 			continue
 		}
 		ttl := tsEnd - tsBegin
@@ -135,9 +135,6 @@ func FetchCurrentDNSCryptCert(
 			} else {
 				dlog.Debugf("[%v] certificate still valid for %d days", *serverName, daysLeft)
 			}
-			certInfo.ForwardSecurity = false
-		} else {
-			certInfo.ForwardSecurity = true
 		}
 		if !proxy.certIgnoreTimestamp {
 			if now > tsEnd || now < tsBegin {
@@ -152,7 +149,7 @@ func FetchCurrentDNSCryptCert(
 			}
 		}
 		if serial < highestSerial {
-			dlog.Debugf("[%v] Superseded by a previous certificate", *serverName)
+			dlog.Debugf("[%v] Superseded by a more recent certificate", *serverName)
 			continue
 		}
 		if serial == highestSerial {
@@ -167,6 +164,7 @@ func FetchCurrentDNSCryptCert(
 			dlog.Noticef("[%v] Cryptographic construction %v not supported", *serverName, cryptoConstruction)
 			continue
 		}
+		certInfo.ForwardSecurity = ttl <= 86400*7
 		var serverPk [32]byte
 		copy(serverPk[:], binCert[72:104])
 		sharedKey := ComputeSharedKey(cryptoConstruction, &proxy.proxySecretKey, &serverPk, &providerName)

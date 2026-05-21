@@ -4,6 +4,7 @@ package dns
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"time"
@@ -44,7 +45,7 @@ func Exchange(ctx context.Context, m *Msg, network, address string) (r *Msg, err
 // If the TLS config is set in the transport a (TCP) connection with TLS is attempted.
 //
 // It is up to the caller to create a message that allows for larger responses to be returned. Specifically
-// this means setting [Msg.Bufsize] that will advertise a larger buffer. Messages without an Bufsize will
+// this means setting [Msg.UDPSize] that will advertise a larger buffer. Messages without a UDPSize will
 // fall back to the historic limit of 512 octets (bytes).
 //
 // The full binary data is included in the (decoded) message as r.Data. If the Data buffer in m is empty
@@ -112,7 +113,7 @@ func (c *Client) ExchangeWithConn(ctx context.Context, m *Msg, conn net.Conn) (r
 		return r, time.Since(t), &Error{err: "response bit is not set"}
 	}
 	if r.ID != m.ID {
-		return r, time.Since(t), ErrID.Fmt(": %d != %d", r.ID, m.ID)
+		return r, time.Since(t), fmt.Errorf("%w: %d != %d", ErrID, r.ID, m.ID)
 	}
 
 	return r, time.Since(t), nil

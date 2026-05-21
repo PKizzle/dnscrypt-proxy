@@ -87,13 +87,16 @@ func (zp *ZoneParser) generate(l dnslex.Lex) (RR, bool) {
 	zp.sub = NewZoneParser(r, zp.origin, zp.file)
 	zp.sub.includeDepth, zp.sub.IncludeAllowFunc = zp.includeDepth, zp.IncludeAllowFunc
 	zp.sub.generateDisallowed = true
-	zp.sub.SetDefaultTTL(defaultTTL)
+	zp.sub.SetDefaultTTL(3600)
 	return zp.subNext()
 }
 
 type generateReader struct {
-	s  string
-	si int
+	lex    *dnslex.Lex
+	s      string
+	si     uint16
+	escape bool
+	eof    bool
 
 	cur   int64
 	start int64
@@ -102,15 +105,10 @@ type generateReader struct {
 
 	mod bytes.Buffer
 
-	escape bool
-
-	eof bool
-
 	file string
-	lex  *dnslex.Lex
 }
 
-func (r *generateReader) parseError(msg string, end int) *ParseError {
+func (r *generateReader) parseError(msg string, end uint16) *ParseError {
 	r.eof = true // Make errors sticky.
 
 	l := *r.lex
@@ -133,7 +131,7 @@ func (r *generateReader) ReadByte() (byte, error) {
 		return r.mod.ReadByte()
 	}
 
-	if r.si >= len(r.s) {
+	if r.si >= uint16(len(r.s)) {
 		r.si = 0
 		r.cur += r.step
 
@@ -161,7 +159,7 @@ func (r *generateReader) ReadByte() (byte, error) {
 
 		mod := "%d"
 
-		if si >= len(r.s)-1 {
+		if si >= uint16(len(r.s)-1) {
 			// End of the string
 			fmt.Fprintf(&r.mod, mod, r.cur)
 			return r.mod.ReadByte()
@@ -177,10 +175,11 @@ func (r *generateReader) ReadByte() (byte, error) {
 		// Search for { and }
 		if r.s[si+1] == '{' {
 			// Modifier block
-			sep := strings.Index(r.s[si+2:], "}")
-			if sep < 0 {
-				return 0, r.parseError("bad modifier in $GENERATE", len(r.s))
+			j := strings.Index(r.s[si+2:], "}")
+			if j < 0 {
+				return 0, r.parseError("bad modifier in $GENERATE", uint16(len(r.s)))
 			}
+			sep := uint16(j)
 
 			var errMsg string
 			mod, offset, errMsg = modToPrintf(r.s[si+2 : si+2+sep])

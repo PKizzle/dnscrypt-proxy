@@ -95,7 +95,7 @@ func (patternMatcher *PatternMatcher) Add(pattern string, val any, position int)
 		pattern = strings.TrimPrefix(pattern, ".") // Remove leading dot if present
 	}
 	if len(pattern) == 0 {
-		dlog.Errorf("Syntax error in the rule file at line %d", position)
+		return fmt.Errorf("Syntax error in the rule file at line %d", position)
 	}
 
 	pattern = strings.ToLower(pattern)
@@ -139,9 +139,9 @@ func (patternMatcher *PatternMatcher) Eval(qName string) (reject bool, reason st
 		if len(match) < len(revQname) && len(revQname) > 0 {
 			if i := strings.LastIndex(revQname, "."); i > 0 {
 				pName := revQname[:i]
-				if match, _, found := patternMatcher.suffixes.LongestPrefix([]byte(pName)); found {
+				if match, xval2, found := patternMatcher.suffixes.LongestPrefix([]byte(pName)); found {
 					if len(match) == len(pName) || pName[len(match)] == '.' {
-						return true, "*." + StringReverse(string(match)), xval
+						return true, "*." + StringReverse(string(match)), xval2
 					}
 				}
 			}

@@ -6,6 +6,10 @@ on:
   schedule:
     - cron: '0 14 * * 6'
 
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   analyze:
     name: Analyze

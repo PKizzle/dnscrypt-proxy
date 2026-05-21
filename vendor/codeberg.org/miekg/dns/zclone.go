@@ -395,6 +395,7 @@ func (rr *DNSKEY) Clone() RR {
 			rr.Protocol,
 			rr.Algorithm,
 			rr.PublicKey,
+			rr.Tag,
 		},
 	}
 }
@@ -830,6 +831,13 @@ func (rr *LLQ) Clone() RR {
 	}
 }
 
+func (rr *UPDATELEASE) Clone() RR {
+	return &UPDATELEASE{
+		rr.Lease,
+		rr.KeyLease,
+	}
+}
+
 func (rr *REPORTING) Clone() RR {
 	return &REPORTING{
 		rr.AgentDomain,
@@ -911,6 +919,18 @@ func (rr *ZONEVERSION) Clone() RR {
 		rr.Labels,
 		rr.Type,
 		slices.Clone(rr.Version),
+	}
+}
+
+func (rr *MQQUERY) Clone() RR {
+	return &MQQUERY{
+		slices.Clone(rr.Types),
+	}
+}
+
+func (rr *MQRESPONSE) Clone() RR {
+	return &MQRESPONSE{
+		slices.Clone(rr.Types),
 	}
 }
 

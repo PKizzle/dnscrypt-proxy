@@ -106,7 +106,7 @@ func (plugin *PluginCloak) loadRules(lines string, patternMatcher *PatternMatche
 			}
 			cloakedName.isIP = true
 		} else {
-			cloakedName.target = target
+			cloakedName.target = strings.ToLower(target)
 		}
 		cloakedName.lineNo = lineNo + 1
 		cloakedNames[line] = cloakedName
@@ -117,10 +117,18 @@ func (plugin *PluginCloak) loadRules(lines string, patternMatcher *PatternMatche
 
 		var ptrLine string
 		if ipv4 := ip.To4(); ipv4 != nil {
-			reversed, _ := reverseAddr(ip.To4().String())
+			reversed, err := reverseAddr(ipv4.String())
+			if err != nil {
+				dlog.Errorf("Failed to reverse IPv4 address at line %d: %v", lineNo+1, err)
+				continue
+			}
 			ptrLine = strings.TrimSuffix(reversed, ".")
 		} else {
-			reversed, _ := reverseAddr(cloakedName.ipv6[0].String())
+			reversed, err := reverseAddr(cloakedName.ipv6[0].String())
+			if err != nil {
+				dlog.Errorf("Failed to reverse IPv6 address at line %d: %v", lineNo+1, err)
+				continue
+			}
 			ptrLine = strings.TrimSuffix(reversed, ".")
 		}
 		ptrQueryLine := ptrEntryToQuery(ptrLine)
@@ -138,6 +146,25 @@ func (plugin *PluginCloak) loadRules(lines string, patternMatcher *PatternMatche
 		if err := patternMatcher.Add(line, cloakedName, cloakedName.lineNo); err != nil {
 			return err
 		}
+	}
+
+	var firstRecursive *CloakedName
+	var firstRecursivePattern string
+	for _, cloakedName := range cloakedNames {
+		if cloakedName.isIP || cloakedName.target == "" {
+			continue
+		}
+		matched, pattern, _ := patternMatcher.Eval(cloakedName.target)
+		if matched && (firstRecursive == nil || cloakedName.lineNo < firstRecursive.lineNo) {
+			firstRecursive = cloakedName
+			firstRecursivePattern = pattern
+		}
+	}
+	if firstRecursive != nil {
+		return fmt.Errorf(
+			"recursive cloaking rule at line %d: target [%s] matches cloak pattern [%s]",
+			firstRecursive.lineNo, firstRecursive.target, firstRecursivePattern,
+		)
 	}
 
 	return nil
@@ -167,28 +194,31 @@ func (plugin *PluginCloak) PrepareReload() error {
 		return fmt.Errorf("error reading config file during reload preparation: %w", err)
 	}
 
-	// Create new staging pattern matcher
-	plugin.stagingMatcher = NewPatternMatcher()
+	stagingMatcher := NewPatternMatcher()
 
 	// Load rules into staging matcher
-	if err := plugin.loadRules(lines, plugin.stagingMatcher); err != nil {
+	if err := plugin.loadRules(lines, stagingMatcher); err != nil {
 		return fmt.Errorf("error parsing config during reload preparation: %w", err)
 	}
+
+	plugin.Lock()
+	plugin.stagingMatcher = stagingMatcher
+	plugin.Unlock()
 
 	return nil
 }
 
 // ApplyReload atomically replaces the active pattern matcher with the staging one
 func (plugin *PluginCloak) ApplyReload() error {
+	plugin.Lock()
+	defer plugin.Unlock()
+
 	if plugin.stagingMatcher == nil {
 		return errors.New("no staged configuration to apply")
 	}
 
-	// Use write lock to swap pattern matchers
-	plugin.Lock()
 	plugin.patternMatcher = plugin.stagingMatcher
 	plugin.stagingMatcher = nil
-	plugin.Unlock()
 
 	dlog.Noticef("Applied new configuration for plugin [%s]", plugin.Name())
 	return nil
@@ -196,7 +226,9 @@ func (plugin *PluginCloak) ApplyReload() error {
 
 // CancelReload cleans up any staging resources
 func (plugin *PluginCloak) CancelReload() {
+	plugin.Lock()
 	plugin.stagingMatcher = nil
+	plugin.Unlock()
 }
 
 // Reload implements hot-reloading for the plugin

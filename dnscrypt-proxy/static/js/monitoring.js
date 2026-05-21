@@ -389,73 +389,34 @@ function formatSourceStatus(status, error) {
     return label;
 }
 
-// Simple direct data loading approach
-function loadData() {
-    console.log('Loading data using simple approach');
-
-    // Create a script element to load the data
-    var script = document.createElement('script');
-    script.src = '/api/metrics?callback=handleMetricsData&_=' + new Date().getTime();
-    script.onerror = function(e) {
-        console.error('Script load error:', e);
-        handleError(new Error('Failed to load metrics data'));
-
-        // Try again after 5 seconds
-        setTimeout(loadData, 5000);
-    };
-
-    // Add the script to the document
-    document.body.appendChild(script);
-
-    // Remove the script after a timeout (whether it loaded or not)
-    setTimeout(function() {
-        if (script.parentNode) {
-            script.parentNode.removeChild(script);
+function fetchMetrics() {
+    return fetch('/api/metrics', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: { 'Accept': 'application/json' },
+    }).then(function(response) {
+        if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
         }
-    }, 10000);
+        return response.json();
+    });
 }
 
-// Callback function for the JSONP-style request
-window.handleMetricsData = function(data) {
-    console.log('Data received via JSONP');
-    if (data) {
-        safeUpdateDashboard(data);
-    } else {
-        console.error('Empty data received');
-        handleError(new Error('Empty data received'));
-    }
-};
+function loadData() {
+    fetchMetrics().then(function(data) {
+        if (data) {
+            safeUpdateDashboard(data);
+        } else {
+            handleError(new Error('Empty data received'));
+        }
+    }).catch(function(err) {
+        console.error('Initial metrics load failed:', err);
+        handleError(err);
+        setTimeout(loadData, 5000);
+    });
+}
 
-// Start loading data
 loadData();
-
-// Fallback: If data doesn't load within 10 seconds, try direct XHR
-setTimeout(function() {
-    var loadingIndicator = document.getElementById('loading-indicator');
-    if (loadingIndicator && loadingIndicator.style.display !== 'none') {
-        console.log('Loading indicator still visible after 10s, trying direct XHR');
-
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/api/metrics', true);
-        xhr.timeout = 10000;
-
-        xhr.onload = function() {
-            if (xhr.status >= 200 && xhr.status < 300) {
-                try {
-                    var data = JSON.parse(xhr.responseText);
-                    if (data) {
-                        console.log('XHR fallback succeeded');
-                        safeUpdateDashboard(data);
-                    }
-                } catch (e) {
-                    console.error('XHR fallback parse error:', e);
-                }
-            }
-        };
-
-        xhr.send();
-    }
-}, 10000);
 
 // WebSocket connection with error handling and reconnection
 let wsReconnectAttempts = 0;
@@ -552,41 +513,18 @@ function connectWebSocket() {
 // Start WebSocket connection
 let ws = connectWebSocket();
 
-// Polling function with error handling - using script tag approach
 function pollMetrics() {
-    console.log('Polling metrics...');
-
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-        // Use script tag approach for better compatibility
-        var pollScript = document.createElement('script');
-        pollScript.src = '/api/metrics?callback=handlePollData&_=' + new Date().getTime();
-
-        // Handle errors
-        pollScript.onerror = function(e) {
-            console.error('Polling script load error:', e);
-        };
-
-        // Add the script to the document
-        document.body.appendChild(pollScript);
-
-        // Remove the script after a timeout
-        setTimeout(function() {
-            if (pollScript.parentNode) {
-                pollScript.parentNode.removeChild(pollScript);
-            }
-        }, 5000);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        return;
     }
+    fetchMetrics().then(function(data) {
+        if (data) {
+            safeUpdateDashboard(data);
+        }
+    }).catch(function(err) {
+        console.error('Polling metrics failed:', err);
+    });
 }
-
-// Callback function for polling
-window.handlePollData = function(data) {
-    if (data) {
-        console.log('Polling data received successfully');
-        safeUpdateDashboard(data);
-    } else {
-        console.warn('Received empty data from polling');
-    }
-};
 
 // Initialize dashboard with default values
 function initializeDashboard() {
@@ -609,53 +547,4 @@ function initializeDashboard() {
 // Initialize with default values
 initializeDashboard();
 
-// Refresh data every 5 seconds as a fallback if WebSocket fails
 setInterval(pollMetrics, 5000);
-
-// Ultimate fallback: If nothing works after 20 seconds, create an iframe
-setTimeout(function() {
-    var loadingIndicator = document.getElementById('loading-indicator');
-    if (loadingIndicator && loadingIndicator.style.display !== 'none') {
-        console.log('Still no data after 20s, trying iframe approach');
-
-        // Create a message for the user
-        loadingIndicator.innerHTML = '<h2>Loading Data...</h2>' +
-            '<p>We\'re having trouble loading data directly. Trying alternative method...</p>' +
-            '<div id="iframe-container" style="display: none;"></div>';
-
-        // Create an iframe to load the metrics directly
-        var iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = '/api/metrics';
-
-        // When the iframe loads, try to extract the data
-        iframe.onload = function() {
-            try {
-                console.log('Iframe loaded, attempting to extract data');
-
-                // Try to get the content
-                var iframeContent = iframe.contentDocument || iframe.contentWindow.document;
-                var jsonText = iframeContent.body.innerText || iframeContent.body.textContent;
-
-                if (jsonText) {
-                    var data = JSON.parse(jsonText);
-                    console.log('Successfully extracted data from iframe');
-                    safeUpdateDashboard(data);
-                }
-            } catch (e) {
-                console.error('Error extracting data from iframe:', e);
-
-                // Last resort: just hide the loading indicator and show whatever we have
-                loadingIndicator.style.display = 'none';
-            }
-        };
-
-        // Add the iframe to the page
-        document.getElementById('iframe-container').appendChild(iframe);
-
-        // Set a timeout to hide the loading indicator regardless
-        setTimeout(function() {
-            loadingIndicator.style.display = 'none';
-        }, 5000);
-    }
-}, 20000);

@@ -149,12 +149,12 @@ func A(a netip.Addr, msg []byte, off int) (int, error) {
 	if off+net.IPv4len > len(msg) {
 		return len(msg), &Error{"overflow a"}
 	}
-	if !a.Is4() && !a.Is4In6() {
-		return len(msg), &Error{"invalid a"}
-	}
 	val := a.As4()
-	_ = msg[off+3]
-	copy(msg[off:off+net.IPv4len], val[:])
+	_ = msg[off+net.IPv4len-1]
+	msg[off] = val[0]
+	msg[off+1] = val[1]
+	msg[off+2] = val[2]
+	msg[off+3] = val[3]
 	return off + net.IPv4len, nil
 }
 
@@ -163,11 +163,27 @@ func AAAA(aaaa netip.Addr, msg []byte, off int) (int, error) {
 		return len(msg), &Error{"overflow aaaa"}
 	}
 	val := aaaa.As16()
-	_ = msg[off+15]
-	copy(msg[off:off+net.IPv6len], val[:])
+	_ = msg[off+net.IPv6len-1]
+	msg[off] = val[0]
+	msg[off+1] = val[1]
+	msg[off+2] = val[2]
+	msg[off+3] = val[3]
+	msg[off+4] = val[4]
+	msg[off+5] = val[5]
+	msg[off+6] = val[6]
+	msg[off+7] = val[7]
+	msg[off+8] = val[8]
+	msg[off+9] = val[9]
+	msg[off+10] = val[10]
+	msg[off+11] = val[11]
+	msg[off+12] = val[12]
+	msg[off+13] = val[13]
+	msg[off+14] = val[14]
+	msg[off+15] = val[15]
 	return off + net.IPv6len, nil
 }
 
+// Name packs the string s into msg.
 func Name(s string, msg []byte, off int, compression map[string]uint16, compress bool) (off1 int, err error) {
 	// XXX: A logical copy of this function exists in dnsutil.IsName and should be kept in sync with this function.
 
@@ -179,16 +195,14 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 		return off + 1, nil
 	}
 	if ls > 1 && s[0] == '.' { // leading dots are not legal except for the root zone
-		return len(msg), &Error{"leading dot in name: " + s}
+		return len(msg), &Error{"leading dot in name"}
 	}
 	if s[ls-1] != '.' {
-		return len(msg), &Error{"name must be fully qualified: " + s}
+		return len(msg), &Error{"name must be fully qualified"}
 	}
 
 	// Each dot ends a segment of the name. We trade each dot byte for a length byte.
-	// Except for escaped dots (\.), which are normal dots. There is also a trailing zero.
-
-	// Emit sequence of counted strings, chopping at dots.
+	// There is also a trailing zero. Emit sequence of counted strings, chopping at dots.
 	var (
 		begin    int
 		labelLen int
@@ -203,10 +217,10 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 
 		labelLen = i - begin
 		if labelLen >= 1<<6 { // top two bits of length must be clear
-			return lenmsg, &Error{"illegal label type in name: " + s}
+			return lenmsg, &Error{"illegal label type in name"}
 		}
 		if labelLen == 0 {
-			return lenmsg, &Error{"consecutive dots in name: " + s}
+			return lenmsg, &Error{"consecutive dots in name"}
 		}
 
 		// off can already (we're in a loop) be bigger than len(msg)
@@ -231,6 +245,95 @@ func Name(s string, msg []byte, off int, compression map[string]uint16, compress
 		off += 1 + labelLen
 		begin = i + 1
 	}
+	if off >= lenmsg {
+		return lenmsg, &Error{"overflow name"}
+	}
+
+	msg[off] = 0
+	return off + 1, nil
+}
+
+// MName packs the string s into msg taking escaped dots into account.
+func MName(s string, msg []byte, off int) (off1 int, err error) {
+	lenmsg := len(msg)
+	ls := len(s)
+
+	if ls == 1 && s[0] == '.' {
+		msg[off] = 0
+		return off + 1, nil
+	}
+	if ls > 1 && s[0] == '.' { // leading dots are not legal except for the root zone
+		return len(msg), &Error{"leading dot in name"}
+	}
+	if s[ls-1] != '.' {
+		return len(msg), &Error{"name must be fully qualified"}
+	}
+
+	// Each dot ends a segment of the name. We trade each dot byte for a length byte.
+	// Except for escaped dots (\.), which are normal dots. There is also a trailing zero.
+	// Emit sequence of counted strings, chopping at dots.
+	var (
+		begin    int
+		labelLen int
+		escape   int
+	)
+
+	for begin < ls {
+		i := strings.IndexByte(s[begin:], '.')
+		if i == -1 {
+			break
+		}
+
+		escape = 0
+		if i > 0 && s[begin+i-1] == '\\' { // escaped dot
+			if begin+i+2 > ls {
+				return lenmsg, &Error{"overflow name after escape"}
+			}
+			j := strings.IndexByte(s[begin+i+1:], '.') // search ahead for another dot
+			if j == -1 {
+				break // no dot found, break as above
+			}
+			// i is the end of the label, 1 for \
+			i += 1 + j
+			escape = 1
+		}
+
+		i += begin
+		labelLen = i - begin - escape
+
+		if labelLen >= 1<<6 { // top two bits of length must be clear
+			return lenmsg, &Error{"illegal label type in name"}
+		}
+		if labelLen == 0 {
+			return lenmsg, &Error{"consecutive dots in name"}
+		}
+
+		// off can already (we're in a loop) be bigger than len(msg)
+		if off+labelLen >= lenmsg {
+			return lenmsg, &Error{"overflow name"}
+		}
+
+		msg[off] = byte(labelLen)
+		if escape == 0 {
+			copy(msg[off+1:], s[begin:i])
+			off += 1 + labelLen
+			begin = i + 1
+			continue
+		}
+
+		// slow(er) copy path to skip the escaped dot
+		l := 1
+		for k := begin; k < i; k++ {
+			if s[k] == '\\' {
+				continue
+			}
+			msg[off+l] = s[k]
+			l++
+		}
+		off += 1 + labelLen
+		begin = i + 1
+	}
+
 	if off >= lenmsg {
 		return lenmsg, &Error{"overflow name"}
 	}

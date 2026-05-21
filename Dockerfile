@@ -26,7 +26,7 @@ RUN cp -a /src/dnscrypt-proxy/example-* ./
 COPY dnscrypt-proxy.toml ./
 
 # ----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM cgr.dev/chainguard/go AS probe
+FROM --platform=$BUILDPLATFORM golang:1.26 AS probe
 
 WORKDIR /src/dnsprobe
 

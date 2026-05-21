@@ -225,22 +225,24 @@ func (plugin *PluginForward) PrepareReload() error {
 	}
 
 	// Store in staging area
+	plugin.rwLock.Lock()
 	plugin.stagingMap = stagingMap
+	plugin.rwLock.Unlock()
 
 	return nil
 }
 
 // ApplyReload atomically replaces the active rules with the staging ones
 func (plugin *PluginForward) ApplyReload() error {
+	plugin.rwLock.Lock()
+	defer plugin.rwLock.Unlock()
+
 	if plugin.stagingMap == nil {
 		return errors.New("no staged configuration to apply")
 	}
 
-	// Use write lock to swap rule structures
-	plugin.rwLock.Lock()
 	plugin.forwardMap = plugin.stagingMap
 	plugin.stagingMap = nil
-	plugin.rwLock.Unlock()
 
 	dlog.Noticef("Applied new configuration for plugin [%s]", plugin.Name())
 	return nil
@@ -248,7 +250,9 @@ func (plugin *PluginForward) ApplyReload() error {
 
 // CancelReload cleans up any staging resources
 func (plugin *PluginForward) CancelReload() {
+	plugin.rwLock.Lock()
 	plugin.stagingMap = nil
+	plugin.rwLock.Unlock()
 }
 
 // Reload implements hot-reloading for the plugin

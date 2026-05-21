@@ -41,7 +41,7 @@ func NewIPCryptConfig(keyHex string, algorithm string) (*IPCryptConfig, error) {
 
 	config := &IPCryptConfig{
 		Key:       key,
-		Algorithm: algorithm,
+		Algorithm: strings.ToLower(algorithm),
 	}
 
 	// Validate key length and prepare config based on algorithm

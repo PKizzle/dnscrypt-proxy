@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"fmt"
 	"hash"
 
 	"codeberg.org/miekg/dns/internal/pack"
@@ -21,7 +22,7 @@ func (h HmacTSIG) Key() []byte { return h.Secret }
 func (h HmacTSIG) Sign(t *TSIG, p []byte, options TSIGOption) ([]byte, error) {
 	secret := h.Key()
 	if secret == nil {
-		return nil, ErrKey.Fmt(": HMAC sign")
+		return nil, fmt.Errorf("%w: %s", ErrKey, "HMAC sign")
 	}
 
 	var hs hash.Hash
@@ -37,7 +38,7 @@ func (h HmacTSIG) Sign(t *TSIG, p []byte, options TSIGOption) ([]byte, error) {
 	case HmacSHA512:
 		hs = hmac.New(sha512.New, secret)
 	default:
-		return nil, ErrKeyAlg.Fmt(": HMAC sign")
+		return nil, fmt.Errorf("%w: %s", ErrKeyAlg, "HMAC sign")
 	}
 	hs.Write(p)
 	return hs.Sum(nil), nil
@@ -53,7 +54,7 @@ func (h HmacTSIG) Verify(t *TSIG, p []byte, options TSIGOption) error {
 		return err
 	}
 	if !hmac.Equal(buf, mac) {
-		return ErrSig.Fmt(": HMAC verify")
+		return fmt.Errorf("%w: %s", ErrSig, "HMAC verify")
 	}
 	return nil
 }
@@ -147,11 +148,11 @@ func (tw *timerWireFmt) pack(buf []byte) (int, error) {
 // RFC 2845, section 3.4.2. TSIG Variables.
 type tsigWireFmt struct {
 	// from Header
-	Name  string `dns:"domain-name"`
+	Name  string `dns:"name"`
 	Class uint16
 	TTL   uint32
 	// Rdata of the TSIG
-	Algorithm  string `dns:"domain-name"`
+	Algorithm  string `dns:"name"`
 	TimeSigned uint64 `dns:"uint48"`
 	Fudge      uint16
 	// MACSize, MAC and OrigId excluded

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"errors"
 	"io"
@@ -299,13 +300,5 @@ func getFileHash(path string) ([]byte, error) {
 
 // hashesEqual compares two hashes for equality
 func hashesEqual(h1, h2 []byte) bool {
-	if len(h1) != len(h2) {
-		return false
-	}
-	for i := range h1 {
-		if h1[i] != h2[i] {
-			return false
-		}
-	}
-	return true
+	return bytes.Equal(h1, h2)
 }

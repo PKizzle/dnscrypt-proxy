@@ -1064,8 +1064,8 @@ func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Serve the main dashboard page - cache for 5 minutes since template is static
-	setStaticCacheHeaders(w, 300)
+	// Don't cache: ensures the browser revalidates auth before the JS issues /api/metrics and WebSocket calls.
+	setDynamicCacheHeaders(w)
 	w.Header().Set("Content-Type", "text/html")
 	w.Write([]byte(MainHTMLTemplate))
 }
@@ -1074,8 +1074,7 @@ func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	dlog.Debugf("Received metrics request from %s", r.RemoteAddr)
 
-	// Set CORS headers and dynamic cache headers for API
-	setCORSHeaders(w)
+	// Set dynamic cache headers for API
 	setDynamicCacheHeaders(w)
 
 	// Handle preflight OPTIONS request
@@ -1088,9 +1087,6 @@ func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 
-	// Check if this is a JSONP request
-	callback := r.URL.Query().Get("callback")
-
 	// Marshal the data to JSON
 	jsonData, err := json.Marshal(metrics)
 	if err != nil {
@@ -1099,16 +1095,7 @@ func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If it's a JSONP request, wrap the JSON in the callback function
-	if callback != "" {
-		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte(callback + "("))
-		w.Write(jsonData)
-		w.Write([]byte(");"))
-	} else {
-		// Regular JSON response
-		w.Write(jsonData)
-	}
+	w.Write(jsonData)
 }
 
 // handleWebSocket - Handles WebSocket connections
