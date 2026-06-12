@@ -292,7 +292,7 @@ func (proxy *Proxy) StartProxy() {
 			dlog.Fatal(err)
 		}
 	}
-	proxy.xTransport.internalResolverReady = false
+	proxy.xTransport.internalResolverReady.Store(false)
 	proxy.xTransport.internalResolvers = proxy.listenAddresses
 	liveServers, err := proxy.serversInfo.refresh(proxy)
 	if liveServers > 0 {
@@ -876,7 +876,7 @@ func (proxy *Proxy) processIncomingQuery(
 			// Process the response through plugins
 			processedResponse, err := processPlugins(proxy, &pluginsState, query, serverInfo, response)
 			if err != nil {
-				return response
+				return nil
 			}
 
 			response = processedResponse

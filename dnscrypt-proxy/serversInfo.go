@@ -162,20 +162,82 @@ type Relay struct {
 
 type ServersInfo struct {
 	sync.RWMutex
-	inner             []*ServerInfo
-	registeredServers []RegisteredServer
-	registeredRelays  []RegisteredServer
-	lbStrategy        LBStrategy
-	lbEstimator       bool
+	inner               []*ServerInfo
+	registeredServers   []RegisteredServer
+	registeredRelays    []RegisteredServer
+	lbStrategy          LBStrategy
+	lbEstimator         bool
+	odohRefreshMu       sync.Mutex
+	odohRefreshInFlight map[string]bool
+	odohLastFailureAt   map[string]time.Time
 }
 
 func NewServersInfo() ServersInfo {
 	return ServersInfo{
-		lbStrategy:        DefaultLBStrategy,
-		lbEstimator:       true,
-		registeredServers: make([]RegisteredServer, 0),
-		registeredRelays:  make([]RegisteredServer, 0),
+		lbStrategy:          DefaultLBStrategy,
+		lbEstimator:         true,
+		registeredServers:   make([]RegisteredServer, 0),
+		registeredRelays:    make([]RegisteredServer, 0),
+		odohRefreshInFlight: make(map[string]bool),
+		odohLastFailureAt:   make(map[string]time.Time),
 	}
+}
+
+// beginODoHRefresh returns true if the caller should perform an ODoH key
+// refresh for the named server. It returns false when another refresh is
+// already in flight or when the previous attempt failed within the
+// failureCooldown window. Successful claims must be paired with a call to
+// endODoHRefresh, ideally via defer so a panic in the refresh path does
+// not leak the in-flight slot.
+func (serversInfo *ServersInfo) beginODoHRefresh(name string, failureCooldown time.Duration) bool {
+	now := time.Now()
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	if serversInfo.odohRefreshInFlight == nil {
+		serversInfo.odohRefreshInFlight = make(map[string]bool)
+	}
+	if serversInfo.odohLastFailureAt == nil {
+		serversInfo.odohLastFailureAt = make(map[string]time.Time)
+	}
+	if serversInfo.odohRefreshInFlight[name] {
+		return false
+	}
+	if last, ok := serversInfo.odohLastFailureAt[name]; ok && now.Sub(last) < failureCooldown {
+		return false
+	}
+	serversInfo.odohRefreshInFlight[name] = true
+	return true
+}
+
+// endODoHRefresh releases the in-flight slot claimed by beginODoHRefresh and
+// records whether the refresh succeeded. On success the failure timestamp is
+// cleared so the next 401 can trigger a fresh refresh immediately if needed.
+// On failure the timestamp is stamped to throttle a hostile-relay retry
+// loop. Callers that claim a slot but then discover they have no refresh to
+// perform (e.g. the server is no longer registered) should use
+// cancelODoHRefresh instead so the cooldown state is not mutated.
+func (serversInfo *ServersInfo) endODoHRefresh(name string, success bool) {
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	delete(serversInfo.odohRefreshInFlight, name)
+	if success {
+		delete(serversInfo.odohLastFailureAt, name)
+	} else {
+		if serversInfo.odohLastFailureAt == nil {
+			serversInfo.odohLastFailureAt = make(map[string]time.Time)
+		}
+		serversInfo.odohLastFailureAt[name] = time.Now()
+	}
+}
+
+// cancelODoHRefresh releases the in-flight slot without touching the failure
+// cooldown. It is used when beginODoHRefresh was claimed but no refresh
+// actually ran, so neither stamping a failure nor clearing a prior one is
+// appropriate.
+func (serversInfo *ServersInfo) cancelODoHRefresh(name string) {
+	serversInfo.odohRefreshMu.Lock()
+	defer serversInfo.odohRefreshMu.Unlock()
+	delete(serversInfo.odohRefreshInFlight, name)
 }
 
 func (serversInfo *ServersInfo) registerServer(name string, stamp stamps.ServerStamp) {
@@ -223,20 +285,20 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	}
 	newServer.rtt = ewma.NewMovingAverage(RTTEwmaDecay)
 	newServer.rtt.Set(float64(newServer.initialRtt))
-	isNew = true
 	serversInfo.Lock()
+	found := false
 	for i, oldServer := range serversInfo.inner {
 		if oldServer.Name == name {
 			serversInfo.inner[i] = &newServer
-			isNew = false
+			found = true
 			break
 		}
 	}
-	serversInfo.Unlock()
-	if isNew {
-		serversInfo.Lock()
+	if !found {
 		serversInfo.inner = append(serversInfo.inner, &newServer)
-		serversInfo.Unlock()
+	}
+	serversInfo.Unlock()
+	if !found {
 		proxy.serversInfo.registerServer(name, stamp)
 	}
 
@@ -261,7 +323,7 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 		go func(registeredServer *RegisteredServer) {
 			err := serversInfo.refreshServer(proxy, registeredServer.name, registeredServer.stamp)
 			if err == nil {
-				proxy.xTransport.internalResolverReady = true
+				proxy.xTransport.internalResolverReady.Store(true)
 			}
 			errorChannel <- err
 			<-countChannel
@@ -812,30 +874,24 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 			&name,
 			false,
 		)
-		if err == nil && len(msg.Question) > 0 {
-			question := msg.Question[0]
-			if dns.RRToType(question) == dns.RRToType(query.Question[0]) && strings.EqualFold(question.Header().Name, query.Question[0].Header().Name) {
-				dlog.Debugf("[%s] also serves plaintext DNS", name)
-				if msg.ID != 0xcafe {
-					dlog.Infof("[%s] handling of DNS message identifiers is broken", name)
+		if err == nil {
+			dlog.Debugf("[%s] also serves plaintext DNS", name)
+			for _, rr := range msg.Answer {
+				rrType := dns.RRToType(rr)
+				if rrType == dns.TypeA || rrType == dns.TypeAAAA {
+					dlog.Warnf("[%s] may be a lying resolver -- skipping", name)
+					return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, rr.String())
 				}
-				for _, rr := range msg.Answer {
-					rrType := dns.RRToType(rr)
-					if rrType == dns.TypeA || rrType == dns.TypeAAAA {
-						dlog.Warnf("[%s] may be a lying resolver -- skipping", name)
-						return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, rr.String())
+			}
+			for _, rr := range msg.Extra {
+				if dns.RRToType(rr) == dns.TypeTXT {
+					dlog.Warnf("[%s] may be a dummy resolver -- skipping", name)
+					txts := rr.(*dns.TXT).Txt
+					cause := ""
+					if len(txts) > 0 {
+						cause = txts[0]
 					}
-				}
-				for _, rr := range msg.Extra {
-					if dns.RRToType(rr) == dns.TypeTXT {
-						dlog.Warnf("[%s] may be a dummy resolver -- skipping", name)
-						txts := rr.(*dns.TXT).Txt
-						cause := ""
-						if len(txts) > 0 {
-							cause = txts[0]
-						}
-						return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, cause)
-					}
+					return ServerInfo{}, fmt.Errorf("[%s] unexpected record: [%s]", name, cause)
 				}
 			}
 		}
@@ -857,7 +913,7 @@ func fetchDNSCryptServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp
 	}, nil
 }
 
-func dohTestPacket(msgID uint16) []byte {
+func dohTestPacket(msgID uint16) *dns.Msg {
 	msg := dns.NewMsg(".", dns.TypeNS)
 	msg.ID = msgID
 	msg.RecursionDesired = true
@@ -870,10 +926,10 @@ func dohTestPacket(msgID uint16) []byte {
 	if err := msg.Pack(); err != nil {
 		dlog.Fatal(err)
 	}
-	return msg.Data
+	return msg
 }
 
-func dohNXTestPacket(msgID uint16) []byte {
+func dohNXTestPacket(msgID uint16) *dns.Msg {
 	qName := make([]byte, 16)
 	charset := "abcdefghijklmnopqrstuvwxyz"
 	for i := range qName {
@@ -891,7 +947,7 @@ func dohNXTestPacket(msgID uint16) []byte {
 	if err := msg.Pack(); err != nil {
 		dlog.Fatal(err)
 	}
-	return msg.Data
+	return msg
 }
 
 func plainNXTestPacket(msgID uint16) *dns.Msg {
@@ -923,7 +979,7 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		Host:   stamp.ProviderName,
 		Path:   stamp.Path,
 	}
-	body := dohTestPacket(0xcafe)
+	body := dohTestPacket(0xcafe).Data
 	useGet := false
 	if _, _, _, _, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout); err != nil {
 		useGet = true
@@ -932,8 +988,8 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 		}
 		dlog.Debugf("Server [%s] doesn't appear to support POST; falling back to GET requests", name)
 	}
-	body = dohNXTestPacket(0xcafe)
-	serverResponse, _, tls, rtt, err := proxy.xTransport.DoHQuery(useGet, url, body, proxy.timeout)
+	queryMsg := dohNXTestPacket(0xcafe)
+	serverResponse, _, tls, rtt, err := proxy.xTransport.DoHQuery(useGet, url, queryMsg.Data, proxy.timeout)
 	if err != nil {
 		dlog.Infof("[%s] [%s]: %v", name, url, err)
 		return ServerInfo{}, err
@@ -944,6 +1000,9 @@ func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isN
 	msg := dns.Msg{Data: serverResponse}
 	if err := msg.Unpack(); err != nil {
 		dlog.Warnf("[%s]: %v", name, err)
+		return ServerInfo{}, err
+	}
+	if err := validateResponseForQuery(queryMsg, &msg); err != nil {
 		return ServerInfo{}, err
 	}
 	if msg.Rcode != dns.RcodeNameError {
@@ -1064,8 +1123,7 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 	for _, odohTargetConfig := range odohTargetConfigs {
 		url := relay.ODoH.URL
 
-		query := dohTestPacket(0xcafe)
-		odohQuery, err := odohTargetConfig.encryptQuery(query)
+		odohQuery, err := odohTargetConfig.encryptQuery(dohTestPacket(0xcafe).Data)
 		if err != nil {
 			continue
 		}
@@ -1079,8 +1137,8 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 			dlog.Debugf("Server [%s] doesn't appear to support POST; falling back to GET requests", name)
 		}
 
-		query = dohNXTestPacket(0xcafe)
-		odohQuery, err = odohTargetConfig.encryptQuery(query)
+		queryMsg := dohNXTestPacket(0xcafe)
+		odohQuery, err = odohTargetConfig.encryptQuery(queryMsg.Data)
 		if err != nil {
 			continue
 		}
@@ -1107,6 +1165,9 @@ func _fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, i
 		msg := dns.Msg{Data: serverResponse}
 		if err := msg.Unpack(); err != nil {
 			dlog.Warnf("[%s]: %v", name, err)
+			return ServerInfo{}, err
+		}
+		if err := validateResponseForQuery(queryMsg, &msg); err != nil {
 			return ServerInfo{}, err
 		}
 		if msg.Rcode != dns.RcodeNameError {
