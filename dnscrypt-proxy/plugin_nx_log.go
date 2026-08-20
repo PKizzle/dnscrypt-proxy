@@ -59,9 +59,10 @@ func (plugin *PluginNxLog) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 		}
 	}
 	question := msg.Question[0]
-	qType, ok := dns.TypeToString[dns.RRToType(question)]
+	rrType := dns.RRToType(question)
+	qType, ok := dns.TypeToString[rrType]
 	if !ok {
-		qType = fmt.Sprintf("%d", dns.RRToType(question))
+		qType = fmt.Sprintf("%d", rrType)
 	}
 	qName := pluginsState.qName
 

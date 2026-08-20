@@ -7,6 +7,7 @@ import (
 	"html"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"sort"
@@ -34,6 +35,8 @@ type MonitoringUIConfig struct {
 	PrometheusEnabled  bool   `toml:"prometheus_enabled"`    // Enable Prometheus metrics endpoint
 	PrometheusPath     string `toml:"prometheus_path"`       // Path for Prometheus metrics endpoint (default: /metrics)
 }
+
+const maxTopDomains = 1000
 
 // MetricsCollector - Collects and stores metrics for the monitoring UI
 type MetricsCollector struct {
@@ -190,14 +193,12 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 				if origin == "" {
 					return true // Allow requests without Origin header (direct connections)
 				}
-				host := r.Host
-				if host == "" {
+				originURL, err := url.Parse(origin)
+				if err != nil || originURL.User != nil || originURL.Host == "" ||
+					originURL.Path != "" || originURL.RawQuery != "" || originURL.Fragment != "" {
 					return false
 				}
-				// Allow same-origin requests and localhost variations
-				return origin == "http://"+host || origin == "https://"+host ||
-					origin == "http://localhost:8080" || origin == "https://localhost:8080" ||
-					origin == "http://127.0.0.1:8080" || origin == "https://127.0.0.1:8080"
+				return originURL.Scheme == requestScheme(r) && strings.EqualFold(originURL.Host, r.Host)
 			},
 		},
 		clients: make(map[*websocket.Conn]bool),
@@ -324,9 +325,10 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 	// Update query types - separate lock
 	if msg != nil && len(msg.Question) > 0 {
 		question := msg.Question[0]
-		qType, ok := dns.TypeToString[dns.RRToType(question)]
+		rrType := dns.RRToType(question)
+		qType, ok := dns.TypeToString[rrType]
 		if !ok {
-			qType = fmt.Sprintf("%d", dns.RRToType(question))
+			qType = fmt.Sprintf("%d", rrType)
 		}
 		mc.queryTypesMutex.Lock()
 		mc.queryTypes[qType]++
@@ -361,6 +363,9 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 		// Store domain name directly - no sanitization needed for internal metrics
 		domainName := pluginsState.qName
 		mc.domainMutex.Lock()
+		if _, found := mc.topDomains[domainName]; !found && len(mc.topDomains) >= maxTopDomains {
+			mc.pruneTopDomainsLocked()
+		}
 		mc.topDomains[domainName]++
 		mc.domainMutex.Unlock()
 	}
@@ -447,6 +452,26 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 
 	// Broadcast updates to WebSocket clients (rate limited)
 	ui.scheduleBroadcast()
+}
+
+func (mc *MetricsCollector) pruneTopDomainsLocked() {
+	type domainCount struct {
+		domain string
+		count  uint64
+	}
+	counts := make([]domainCount, 0, len(mc.topDomains))
+	for domain, hits := range mc.topDomains {
+		counts = append(counts, domainCount{domain, hits})
+	}
+	sort.Slice(counts, func(i, j int) bool {
+		if counts[i].count != counts[j].count {
+			return counts[i].count > counts[j].count
+		}
+		return counts[i].domain < counts[j].domain
+	})
+	for _, dc := range counts[maxTopDomains/2:] {
+		delete(mc.topDomains, dc.domain)
+	}
 }
 
 // generatePrometheusMetrics - Generates Prometheus-formatted metrics
@@ -710,9 +735,9 @@ func (mc *MetricsCollector) collectCacheStats(cacheHitRatio float64, cacheHits, 
 	stats["neg_max_ttl"] = mc.proxy.cacheNegMaxTTL
 	stats["neg_min_ttl"] = mc.proxy.cacheNegMinTTL
 
-	if cachedResponses.cache != nil {
-		stats["entries"] = cachedResponses.cache.Len()
-		stats["capacity"] = cachedResponses.cache.Capacity()
+	if cachedResponses != nil {
+		stats["entries"] = cachedResponses.Len()
+		stats["capacity"] = cachedResponses.Capacity()
 	}
 
 	return stats
@@ -995,11 +1020,24 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 	return metrics
 }
 
-// setCORSHeaders - Sets standard CORS headers for all responses
-func setCORSHeaders(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// requestScheme - Returns the scheme the client used, which a TLS-terminating
+// proxy reports in X-Forwarded-Proto. Browsers cannot forge that header on a
+// WebSocket handshake.
+func requestScheme(r *http.Request) string {
+	forwarded := r.Header.Get("X-Forwarded-Proto")
+	if comma := strings.IndexByte(forwarded, ','); comma >= 0 {
+		forwarded = forwarded[:comma]
+	}
+	switch strings.ToLower(strings.TrimSpace(forwarded)) {
+	case "http":
+		return "http"
+	case "https":
+		return "https"
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // setDynamicCacheHeaders - Sets cache headers for dynamic content (metrics, API)
@@ -1044,9 +1082,6 @@ func (ui *MonitoringUI) handleTestQuery(w http.ResponseWriter, r *http.Request) 
 
 // handleRoot - Handles the root path
 func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
-	setCORSHeaders(w)
-
 	// Handle preflight OPTIONS request
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -1067,7 +1102,8 @@ func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 	// Don't cache: ensures the browser revalidates auth before the JS issues /api/metrics and WebSocket calls.
 	setDynamicCacheHeaders(w)
 	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(MainHTMLTemplate))
+	body := strings.ReplaceAll(MainHTMLTemplate, "{{VERSION}}", AppVersion)
+	w.Write([]byte(body))
 }
 
 // handleMetrics - Handles the metrics API endpoint
@@ -1100,9 +1136,6 @@ func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 // handleWebSocket - Handles WebSocket connections
 func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers for WebSocket
-	setCORSHeaders(w)
-
 	// Handle preflight OPTIONS request
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
@@ -1196,7 +1229,6 @@ func (ui *MonitoringUI) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 // handleStaticJS - Serves the JavaScript for the monitoring UI
 func (ui *MonitoringUI) handleStaticJS(w http.ResponseWriter, r *http.Request) {
-	setCORSHeaders(w)
 	// JavaScript is static - cache for 1 hour
 	setStaticCacheHeaders(w, 3600)
 	w.Header().Set("Content-Type", "application/javascript")

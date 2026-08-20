@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"net/http"
@@ -180,6 +181,7 @@ func configureServerParams(proxy *Proxy, config *Config) {
 		dlog.Warnf("timeout_load_reduction must be between 0.0 and 1.0, using default 0.75")
 		proxy.timeoutLoadReduction = 0.75
 	}
+	proxy.forceTCP = config.ForceTCP
 	proxy.xTransport.mainProto = "udp"
 	if config.ForceTCP {
 		proxy.xTransport.mainProto = "tcp"
@@ -190,6 +192,7 @@ func configureServerParams(proxy *Proxy, config *Config) {
 	proxy.certRefreshDelay = time.Duration(Max(60, config.CertRefreshDelay)) * time.Minute
 	proxy.certRefreshDelayAfterFailure = 10 * time.Second
 	proxy.certIgnoreTimestamp = config.CertIgnoreTimestamp
+	proxy.pqDNSCrypt = config.PQDNSCrypt
 	proxy.ephemeralKeys = config.EphemeralKeys
 	proxy.monitoringUI = config.MonitoringUI
 }
@@ -463,9 +466,11 @@ func configureSourceRestrictions(proxy *Proxy, flags *ConfigFlags, config *Confi
 // determineNetprobeAddress - Determines the address to use for network probing
 func determineNetprobeAddress(flags *ConfigFlags, config *Config) (string, int) {
 	netprobeTimeout := config.NetprobeTimeout
-	if flags.NetprobeTimeoutOverride != nil {
-		netprobeTimeout = *flags.NetprobeTimeoutOverride
-	}
+	flag.Visit(func(commandLineFlag *flag.Flag) {
+		if commandLineFlag.Name == "netprobe-timeout" && flags.NetprobeTimeoutOverride != nil {
+			netprobeTimeout = *flags.NetprobeTimeoutOverride
+		}
+	})
 
 	netprobeAddress := DefaultNetprobeAddress
 	if len(config.NetprobeAddress) > 0 {

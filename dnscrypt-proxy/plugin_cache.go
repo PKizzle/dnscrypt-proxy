@@ -4,7 +4,6 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
-	"sync"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -18,12 +17,20 @@ type CachedResponse struct {
 	msg        *dns.Msg
 }
 
-type CachedResponses struct {
-	cache     *sievecache.ShardedSieveCache[[32]byte, CachedResponse]
-	cacheOnce sync.Once
-}
+// cachedResponses is created once, before any goroutine that reads it exists
+var cachedResponses *sievecache.ShardedSieveCache[[32]byte, CachedResponse]
 
-var cachedResponses CachedResponses
+func initCachedResponses(cacheSize int) error {
+	if cachedResponses != nil {
+		return nil
+	}
+	cache, err := sievecache.NewSharded[[32]byte, CachedResponse](cacheSize)
+	if err != nil {
+		return fmt.Errorf("failed to initialize the cache: %w", err)
+	}
+	cachedResponses = cache
+	return nil
+}
 
 func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	question := msg.Question[0]
@@ -33,6 +40,9 @@ func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	binary.LittleEndian.PutUint16(tmp[2:4], question.Header().Class)
 	if pluginsState.dnssec {
 		tmp[4] = 1
+	}
+	if msg.CheckingDisabled {
+		tmp[4] |= 2
 	}
 	h.Write(tmp[:])
 	normalizedRawQName := []byte(question.Header().Name)
@@ -57,7 +67,7 @@ func (plugin *PluginCache) Description() string {
 }
 
 func (plugin *PluginCache) Init(proxy *Proxy) error {
-	return nil
+	return initCachedResponses(proxy.cacheSize)
 }
 
 func (plugin *PluginCache) Drop() error {
@@ -69,17 +79,16 @@ func (plugin *PluginCache) Reload() error {
 }
 
 func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
-	cacheKey := computeCacheKey(pluginsState, msg)
-
-	if cachedResponses.cache == nil {
+	if cachedResponses == nil {
 		return nil
 	}
-	cached, ok := cachedResponses.cache.Get(cacheKey)
+	cacheKey := computeCacheKey(pluginsState, msg)
+	cached, ok := cachedResponses.Get(cacheKey)
 	if !ok {
 		return nil
 	}
 	expiration := cached.expiration
-	synth := cached.msg.Copy()
+	synth := cloneMsg(cached.msg)
 
 	synth.ID = msg.ID
 	synth.Response = true
@@ -113,7 +122,7 @@ func (plugin *PluginCacheResponse) Description() string {
 }
 
 func (plugin *PluginCacheResponse) Init(proxy *Proxy) error {
-	return nil
+	return initCachedResponses(proxy.cacheSize)
 }
 
 func (plugin *PluginCacheResponse) Drop() error {
@@ -131,6 +140,9 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 	if msg.Truncated {
 		return nil
 	}
+	if cachedResponses == nil {
+		return nil
+	}
 	cacheKey := computeCacheKey(pluginsState, msg)
 	ttl := getMinTTL(
 		msg,
@@ -139,26 +151,11 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		pluginsState.cacheNegMinTTL,
 		pluginsState.cacheNegMaxTTL,
 	)
-	cachedResponse := CachedResponse{
-		expiration: time.Now().Add(ttl),
-		msg:        msg.Copy(),
-	}
-	var cacheInitError error
-	cachedResponses.cacheOnce.Do(func() {
-		cache, err := sievecache.NewSharded[[32]byte, CachedResponse](pluginsState.cacheSize)
-		if err != nil {
-			cacheInitError = err
-		} else {
-			cachedResponses.cache = cache
-		}
-	})
-	if cacheInitError != nil {
-		return fmt.Errorf("failed to initialize the cache: %w", cacheInitError)
-	}
-	if cachedResponses.cache != nil {
-		cachedResponses.cache.Insert(cacheKey, cachedResponse)
-	}
-	updateTTL(msg, cachedResponse.expiration)
+	expiration := time.Now().Add(ttl)
+	cachedMsg := cloneMsg(msg)
+	cachedMsg.Question = nil
+	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})
+	updateTTL(msg, expiration)
 
 	return nil
 }

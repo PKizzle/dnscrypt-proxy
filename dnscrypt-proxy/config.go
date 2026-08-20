@@ -42,6 +42,7 @@ type Config struct {
 	CertRefreshConcurrency   int                `toml:"cert_refresh_concurrency"`
 	CertRefreshDelay         int                `toml:"cert_refresh_delay"`
 	CertIgnoreTimestamp      bool               `toml:"cert_ignore_timestamp"`
+	PQDNSCrypt               bool               `toml:"pqdnscrypt"`
 	EphemeralKeys            bool               `toml:"dnscrypt_ephemeral_keys"`
 	LBStrategy               string             `toml:"lb_strategy"`
 	LBEstimator              bool               `toml:"lb_estimator"`
@@ -131,6 +132,7 @@ func newConfig() Config {
 		HTTP3:                    false,
 		HTTP3Probe:               false,
 		CertIgnoreTimestamp:      false,
+		PQDNSCrypt:               true,
 		EphemeralKeys:            false,
 		Cache:                    true,
 		CacheSize:                512,
@@ -526,16 +528,6 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	}
 
 	return nil
-}
-
-// GetRefusedFlag - Returns whether the config has defined refused_code_in_responses
-func (config *Config) GetRefusedFlag(configFile string) (bool, bool) {
-	var refused bool
-	md, err := toml.DecodeFile(configFile, &refused)
-	if err != nil {
-		return false, false
-	}
-	return refused, md.IsDefined("refused_code_in_responses")
 }
 
 // configureBrokenImplementations - Helper function for IsDefined check
