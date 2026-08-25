@@ -42,31 +42,38 @@ type HandlerFunc func(context.Context, ResponseWriter, *Msg)
 func (f HandlerFunc) ServeDNS(ctx context.Context, w ResponseWriter, r *Msg) { f(ctx, w, r) }
 
 // ServeMux is an DNS request multiplexer. It matches the zone name of each incoming request against a list of
-// registered patterns add calls the handler for the pattern that most closely matches the zone name.
+// registered patterns add calls the handler for the pattern that most closely matches the zone name and
+// class.
 //
 // ServeMux is DNSSEC aware, meaning that queries for the DS record are redirected to the parent zone (if that
 // is also registered), otherwise the child gets the query.
 //
 // ServeMux is also safe for concurrent access from multiple goroutines. The zero ServeMux is empty and ready for use.
 type ServeMux struct {
-	z map[string]Handler
+	z map[uint16]map[string]Handler
 	sync.RWMutex
 }
 
 // NewServeMux allocates and returns a new ServeMux.
-func NewServeMux() *ServeMux { return &ServeMux{z: map[string]Handler{}} }
+func NewServeMux() *ServeMux { return &ServeMux{z: map[uint16]map[string]Handler{}} }
 
 // DefaultServeMux is the default ServeMux used by Serve.
 var DefaultServeMux = NewServeMux()
 
-func (mux *ServeMux) match(q string, t uint16) (Handler, string) {
+func (mux *ServeMux) match(q string, t, c uint16) (Handler, string) {
 	q = dnsutilCanonical(q)
 
 	var handler Handler
 	var ds, off, end = 0, 0, false
 	mux.RLock()
+	m, ok := mux.z[c] // get the class map
+	if !ok {
+		// we don't know anything about the class.
+		mux.RUnlock()
+		return nil, ""
+	}
 	for ; !end; off, end = dnsutilNext(q, off) {
-		if h, ok := mux.z[q[off:]]; ok {
+		if h, ok := m[q[off:]]; ok {
 			if t != TypeDS {
 				mux.RUnlock()
 				return h, q[off:]
@@ -82,7 +89,8 @@ func (mux *ServeMux) match(q string, t uint16) (Handler, string) {
 	}
 
 	// Wildcard match, if we have found nothing try the root zone as a last resort.
-	if h, ok := mux.z["."]; ok {
+	// TODO(miek): is this really needed?
+	if h, ok := m["."]; ok {
 		mux.RUnlock()
 		return h, "."
 	}
@@ -92,30 +100,43 @@ func (mux *ServeMux) match(q string, t uint16) (Handler, string) {
 }
 
 // Handle adds a handler to the ServeMux for pattern. Identical patterns silently overwrites earlier handlers.
-func (mux *ServeMux) Handle(pattern string, handler Handler) {
+// Optionally a class can be given, this defaults to [ClassINET].
+func (mux *ServeMux) Handle(pattern string, handler Handler, class ...uint16) {
 	if dnsutilCanonical(pattern) != pattern || pattern == "" {
 		panic("dns: pattern should be in canonical form: " + pattern)
 	}
 	mux.Lock()
 	if mux.z == nil {
-		mux.z = make(map[string]Handler)
+		mux.z = make(map[uint16]map[string]Handler)
 	}
-	mux.z[pattern] = handler
+	c := uint16(ClassINET)
+	if len(class) > 0 {
+		c = class[0]
+	}
+	if mux.z[c] == nil {
+		mux.z[c] = make(map[string]Handler)
+	}
+	mux.z[c][pattern] = handler
 	mux.Unlock()
 }
 
 // HandleFunc adds a handler function to the ServeMux for pattern.
-func (mux *ServeMux) HandleFunc(pattern string, handler func(context.Context, ResponseWriter, *Msg)) {
-	mux.Handle(pattern, HandlerFunc(handler))
+func (mux *ServeMux) HandleFunc(pattern string, handler func(context.Context, ResponseWriter, *Msg), class ...uint16) {
+	mux.Handle(pattern, HandlerFunc(handler), class...)
 }
 
-// HandleRemove deregisters the handler specific for pattern from the ServeMux.
-func (mux *ServeMux) HandleRemove(pattern string) {
+// HandleRemove deregisters the handler specific for pattern from the ServeMux. Optionally a class can be
+// given, this defaults to [ClassINET].
+func (mux *ServeMux) HandleRemove(pattern string, class ...uint16) {
 	if dnsutilCanonical(pattern) != pattern || pattern == "" {
 		panic("dns: pattern should be in canonical form: " + pattern)
 	}
 	mux.Lock()
-	delete(mux.z, pattern)
+	if len(class) > 0 {
+		delete(mux.z[class[0]], pattern)
+	} else {
+		delete(mux.z[ClassINET], pattern)
+	}
 	mux.Unlock()
 }
 
@@ -126,7 +147,7 @@ func (mux *ServeMux) HandleRemove(pattern string) {
 //
 // If no handler is found a standard REFUSED message is returned. No checks are made on the request message.
 func (mux *ServeMux) ServeDNS(ctx context.Context, w ResponseWriter, req *Msg) {
-	h, zone := mux.match(req.Question[0].Header().Name, req.qtype)
+	h, zone := mux.match(req.Question[0].Header().Name, req.qtype, req.qclass)
 	if h != nil {
 		ctx = context.WithValue(ctx, contextKeyZone, zone)
 		h.ServeDNS(ctx, w, req)
@@ -153,7 +174,7 @@ func refuse(w ResponseWriter, r *Msg) {
 	m := new(Msg)
 	m.Data = r.Data
 
-	// dnsutil.SetReply as used here, but led to all kinds of cyclic imports, just use that very static code here.
+	// dnsutil.SetReply was used here, but led to all kinds of cyclic imports, just use that very static code here.
 	m.ID, m.Rcode = r.ID, RcodeRefused
 	m.Response, m.Opcode = true, r.Opcode
 	m.RecursionDesired = r.RecursionDesired
@@ -162,6 +183,9 @@ func refuse(w ResponseWriter, r *Msg) {
 	m.Question = r.Question
 	m.Answer, m.Ns, m.Extra, m.Pseudo = nil, nil, nil, nil
 
-	m.Pack()
+	if err := m.Pack(); err != nil {
+		msgPut(m)
+		return
+	}
 	io.Copy(w, m)
 }

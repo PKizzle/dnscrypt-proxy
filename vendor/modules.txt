@@ -1,7 +1,8 @@
-# codeberg.org/miekg/dns v0.6.84
+# codeberg.org/miekg/dns v0.6.101
 ## explicit; go 1.25.0
 codeberg.org/miekg/dns
 codeberg.org/miekg/dns/deleg
+codeberg.org/miekg/dns/dnsjson
 codeberg.org/miekg/dns/internal/ddd
 codeberg.org/miekg/dns/internal/dnslex
 codeberg.org/miekg/dns/internal/dnsstring
@@ -19,8 +20,8 @@ github.com/BurntSushi/toml/internal
 # github.com/VividCortex/ewma v1.2.0
 ## explicit; go 1.12
 github.com/VividCortex/ewma
-# github.com/cloudflare/circl v1.6.4
-## explicit; go 1.24.0
+# github.com/cloudflare/circl v1.6.5
+## explicit; go 1.25.0
 github.com/cloudflare/circl/dh/x25519
 github.com/cloudflare/circl/internal/conv
 github.com/cloudflare/circl/internal/sha3
@@ -46,8 +47,6 @@ github.com/dchest/safefile
 ## explicit; go 1.23
 github.com/fsnotify/fsnotify
 github.com/fsnotify/fsnotify/internal
-# github.com/google/go-cmp v0.7.0
-## explicit; go 1.21
 # github.com/gorilla/websocket v1.5.3
 ## explicit; go 1.12
 github.com/gorilla/websocket
@@ -99,8 +98,8 @@ github.com/kardianos/service
 # github.com/lifenjoiner/dhcpdns v0.0.7
 ## explicit; go 1.20
 github.com/lifenjoiner/dhcpdns
-# github.com/miekg/dns v1.1.72
-## explicit; go 1.24.0
+# github.com/miekg/dns v1.1.73
+## explicit; go 1.25.0
 # github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 ## explicit
 # github.com/powerman/check v1.13.0
@@ -113,14 +112,13 @@ github.com/powerman/check/internal/spew
 # github.com/quic-go/qpack v0.6.0
 ## explicit; go 1.24
 github.com/quic-go/qpack
-# github.com/quic-go/quic-go v0.60.0
+# github.com/quic-go/quic-go v0.61.0
 ## explicit; go 1.25.0
 github.com/quic-go/quic-go
 github.com/quic-go/quic-go/http3
 github.com/quic-go/quic-go/http3/qlog
 github.com/quic-go/quic-go/internal/ackhandler
 github.com/quic-go/quic-go/internal/congestion
-github.com/quic-go/quic-go/internal/flowcontrol
 github.com/quic-go/quic-go/internal/handshake
 github.com/quic-go/quic-go/internal/monotime
 github.com/quic-go/quic-go/internal/protocol
@@ -135,7 +133,7 @@ github.com/quic-go/quic-go/qlogwriter/jsontext
 github.com/quic-go/quic-go/quicvarint
 # go.uber.org/mock v0.6.0
 ## explicit; go 1.23.0
-# golang.org/x/crypto v0.54.0
+# golang.org/x/crypto v0.55.0
 ## explicit; go 1.25.0
 golang.org/x/crypto/blake2b
 golang.org/x/crypto/chacha20
@@ -153,9 +151,7 @@ golang.org/x/crypto/pbkdf2
 golang.org/x/crypto/poly1305
 golang.org/x/crypto/salsa20/salsa
 golang.org/x/crypto/scrypt
-# golang.org/x/mod v0.38.0
-## explicit; go 1.25.0
-# golang.org/x/net v0.57.0
+# golang.org/x/net v0.58.0
 ## explicit; go 1.25.0
 golang.org/x/net/bpf
 golang.org/x/net/http/httpguts
@@ -170,8 +166,6 @@ golang.org/x/net/internal/socks
 golang.org/x/net/ipv4
 golang.org/x/net/ipv6
 golang.org/x/net/proxy
-# golang.org/x/sync v0.22.0
-## explicit; go 1.25.0
 # golang.org/x/sys v0.47.0
 ## explicit; go 1.25.0
 golang.org/x/sys/cpu
@@ -181,14 +175,12 @@ golang.org/x/sys/windows/registry
 golang.org/x/sys/windows/svc
 golang.org/x/sys/windows/svc/eventlog
 golang.org/x/sys/windows/svc/mgr
-# golang.org/x/text v0.40.0
+# golang.org/x/text v0.41.0
 ## explicit; go 1.25.0
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# golang.org/x/tools v0.48.0
-## explicit; go 1.25.0
 # gopkg.in/natefinch/lumberjack.v2 v2.2.1
 ## explicit; go 1.13
 gopkg.in/natefinch/lumberjack.v2

@@ -161,6 +161,9 @@ func (m *Msg) Reset() {
 }
 
 func (m *Msg) Pack() error {
+	if len(m.Question) != 1 {
+		return pack.Errorf(": %s", "there must be a single question")
+	}
 	if l := m.Len(); cap(m.Data) < l {
 		m.Data = make([]byte, l)
 	} else {
@@ -204,7 +207,7 @@ func (m *Msg) Pack() error {
 	}
 
 	isPseudo := m.isPseudo()
-	counts := uint64(len(m.Question))<<48 |
+	counts := uint64(1)<<48 |
 		uint64(len(m.Answer))<<32 |
 		uint64(len(m.Ns))<<16 |
 		uint64(len(m.Extra)+isPseudo)
@@ -220,10 +223,8 @@ func (m *Msg) Pack() error {
 		compression = make(map[string]uint16, l+3) // 3 is randomly chosen, as that much rdata might be compressable...
 	}
 
-	if len(m.Question) > 0 {
-		if off, err = packQuestion(m.Question[0], m.Data, off, compression); err != nil {
-			return err
-		}
+	if off, err = packQuestion(m.Question[0], m.Data, off, compression); err != nil {
+		return err
 	}
 
 	for i := range m.Answer {
@@ -311,6 +312,7 @@ func (m *Msg) unpackQuestion(msg *cryptobyte.String, msgBuf []byte) (RR, error) 
 	if !msg.Empty() && !msg.ReadUint16(&qclass) {
 		return nil, unpack.Errorf("overflow %s", "Question class")
 	}
+	m.qclass = qclass
 
 	var rr RR
 	if newFn, ok := TypeToRR[qtype]; ok {
@@ -453,8 +455,7 @@ Extra2:
 
 // Convert a complete message to a string with dig-like output. String also looks at the [Msg.Options] and
 // only prints up to that point, i.e. options set to [MsgOptionUnpackHeader] means String will only return the
-// header. The string format isn't fixed and can change in future released, [dnsutil.StringToMsg] is
-// guaranteed to work.
+// header. The string format isn't fixed and can change in future releases.
 func (m *Msg) String() string {
 	if m == nil {
 		return "<nil> Msg"
@@ -704,18 +705,12 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 		if sess != nil {
 			oob := sourceFromOOB(sess.OOB)
 			n, _, err := sock.WriteMsgUDP(m.Data, oob, sess.Addr)
-			if m.msgPool != nil && !m.hijacked.Load() {
-				m.msgPool.Put(m.Data)
-				m.Data, m.msgPool = nil, nil
-			}
+			msgPut(m)
 			return int64(n), err
 		}
 
 		n, err := r.Conn().Write(m.Data)
-		if m.msgPool != nil && !m.hijacked.Load() {
-			m.msgPool.Put(m.Data)
-			m.Data, m.msgPool = nil, nil
-		}
+		msgPut(m)
 		return int64(n), err
 	}
 
@@ -723,11 +718,20 @@ func (m *Msg) WriteTo(w io.Writer) (int64, error) {
 	binary.BigEndian.PutUint16(l, uint16(len(m.Data)))
 	l = append(l, m.Data...)
 	n, err := r.Write(l)
-	if m.msgPool != nil && !m.hijacked.Load() {
-		m.msgPool.Put(m.Data)
-		m.Data, m.msgPool = nil, nil
-	}
+	msgPut(m)
 	return int64(n), err
+}
+
+// msgPut puts the message's buffer back in the pool, if desired.
+func msgPut(m *Msg) {
+	if m.msgPool == nil {
+		return
+	}
+	if m.hijacked.Load() {
+		return
+	}
+	m.msgPool.Put(m.Data)
+	m.Data, m.msgPool = nil, nil
 }
 
 // ReadFrom reads from r. When r is a *net.TCPConn, first 2 bytes of length are read, then m.Data is *resized*
@@ -810,8 +814,8 @@ func (m *Msg) RRs() iter.Seq[RR] {
 
 // Copy returns a shallow copy of the message, specifically the RR contained in the message are copied by
 // reference, not via a deep copy. If m was hijacked via [Msg.Hijack] the returned Msg will not be hijacked.
-// The msgPool of m will be copied, meaning the new message when traversing a default [dns.ResponseWriter]
-// will have it's buffer returned to the servers msg pool.
+// The msgPool of m will not be copied, meaning the new message's buffer will not be returned to the pool, but
+// be garbage collected.
 func (m *Msg) Copy() *Msg {
 	return &Msg{
 		MsgHeader: m.MsgHeader,
@@ -821,13 +825,12 @@ func (m *Msg) Copy() *Msg {
 		Extra:     m.Extra,
 		Pseudo:    m.Pseudo,
 		Data:      m.Data,
-		msgPool:   m.msgPool,
 	}
 }
 
 // NewMsg returns a new message with the question section sets to z (z is made fully qualified) and the type t. If the type isn't know nil
-// is returned, the recursion desired bit is set.
-func NewMsg(z string, t uint16) *Msg {
+// is returned, the recursion desired bit is set. If c is given it is used as the class.
+func NewMsg(z string, t uint16, c ...uint16) *Msg {
 	var rr RR
 	newFn, ok := TypeToRR[t]
 	if !ok {
@@ -839,6 +842,9 @@ func NewMsg(z string, t uint16) *Msg {
 	rr = newFn()
 	rr.Header().Name = dnsutilFqdn(z)
 	rr.Header().Class = ClassINET
+	if len(c) > 0 {
+		rr.Header().Class = c[0]
+	}
 	m.Question = []RR{rr}
 	return m
 }
