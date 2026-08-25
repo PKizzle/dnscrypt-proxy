@@ -59,7 +59,11 @@ func (cw *ConfigWatcher) watchLoop() {
 			if !ok {
 				return
 			}
-			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+			// Rename and Remove matter as much as Write and Create: a file
+			// can be replaced by renaming another one onto it, and a symlink
+			// can be repointed the same way.
+			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) ||
+				event.Has(fsnotify.Rename) || event.Has(fsnotify.Remove) {
 				cw.handleModifyEvent(event.Name)
 			}
 		case err, ok := <-cw.watcher.Errors:
@@ -84,16 +88,45 @@ func (cw *ConfigWatcher) handleModifyEvent(path string) {
 
 	cw.mu.RLock()
 	wf, exists := cw.watchedFiles[absPath]
+	var siblings []*WatchedFile
+	if !exists {
+		// The event names something other than a watched file. It still arrived
+		// because the directory holding one is watched, and the change it
+		// reports may be the watched file's: an entry that is a symlink is
+		// replaced by repointing what it leads to, not by touching the entry,
+		// so the name in the event is the thing that moved rather than the file
+		// that now reads differently. A projected Kubernetes ConfigMap updates
+		// exactly this way, renaming "..data" while every entry beside it stays
+		// as it was.
+		//
+		// Which of the two happened cannot be told from the name, so the
+		// watched files in that directory are examined. They are only examined:
+		// checkFile compares content and reloads nothing that still reads the
+		// same, which is what keeps an unrelated event in the directory from
+		// costing more than a hash.
+		dir := filepath.Dir(absPath)
+		for _, candidate := range cw.watchedFiles {
+			if filepath.Dir(candidate.path) == dir {
+				siblings = append(siblings, candidate)
+			}
+		}
+	}
 	cw.mu.RUnlock()
 
-	if !exists {
+	if !exists && len(siblings) == 0 {
 		return
 	}
 
 	// Debounce rapid changes with a small delay
 	time.Sleep(100 * time.Millisecond)
 
-	cw.checkFile(wf)
+	if exists {
+		cw.checkFile(wf)
+		return
+	}
+	for _, candidate := range siblings {
+		cw.checkFile(candidate)
+	}
 }
 
 // checkFile checks if a specific file has changed and is stable

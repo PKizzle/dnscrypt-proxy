@@ -155,3 +155,135 @@ func TestConfigWatcherPollingFallback(t *testing.T) {
 		t.Fatalf("Expected at least one reload in polling mode")
 	}
 }
+
+// projectConfigMap lays out a directory the way Kubernetes projects a ConfigMap:
+// the entries are symlinks into "..data", which is itself a symlink to the
+// directory holding the current version. An update writes a new version
+// directory and renames "..data" onto it, leaving the entries untouched.
+func projectConfigMap(t *testing.T, dir, version, name, content string) {
+	t.Helper()
+
+	versionDir := filepath.Join(dir, ".."+version)
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		t.Fatalf("Failed to create version directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(versionDir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to write projected file: %v", err)
+	}
+
+	// Renaming the symlink into place is what makes the swap atomic, and is the
+	// reason the entries never change.
+	tempLink := filepath.Join(dir, "..data_tmp")
+	_ = os.Remove(tempLink)
+	if err := os.Symlink(".."+version, tempLink); err != nil {
+		t.Fatalf("Failed to create data symlink: %v", err)
+	}
+	if err := os.Rename(tempLink, filepath.Join(dir, "..data")); err != nil {
+		t.Fatalf("Failed to swap data symlink: %v", err)
+	}
+
+	entry := filepath.Join(dir, name)
+	if _, err := os.Lstat(entry); err != nil {
+		if err := os.Symlink(filepath.Join("..data", name), entry); err != nil {
+			t.Fatalf("Failed to create entry symlink: %v", err)
+		}
+	}
+}
+
+// A projected ConfigMap updates without the watched path itself being written
+// to, so the notification names "..data" rather than the file. The polling
+// watcher compares content instead of reacting to a path, which is the only
+// reason it notices.
+func TestPollingConfigWatcherSeesProjectedUpdate(t *testing.T) {
+	dir := t.TempDir()
+	const name = "blocked-names.txt"
+
+	projectConfigMap(t, dir, "v1", name, "first\n")
+
+	var reloadCount int32
+	watcher := newPollingConfigWatcher(50 * time.Millisecond)
+	defer watcher.Shutdown()
+
+	if err := watcher.AddFile(filepath.Join(dir, name), func() error {
+		atomic.AddInt32(&reloadCount, 1)
+		return nil
+	}); err != nil {
+		t.Fatalf("Failed to watch projected file: %v", err)
+	}
+
+	projectConfigMap(t, dir, "v2", name, "first\nsecond\n")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&reloadCount) > 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Projected update went unnoticed after 5s (reloads=%d)", atomic.LoadInt32(&reloadCount))
+}
+
+// The event-based watcher is told about the directory holding each watched
+// file, so a projected update does reach it -- named for the symlink that moved
+// rather than for the file that now reads differently. Acting on it is the
+// whole point: without this the entries never appear to change and a reload has
+// to be a restart.
+func TestEventConfigWatcherSeesProjectedUpdate(t *testing.T) {
+	dir := t.TempDir()
+	const name = "blocked-names.txt"
+
+	projectConfigMap(t, dir, "v1", name, "first\n")
+
+	var reloadCount int32
+	watcher := NewConfigWatcher(time.Second)
+	defer watcher.Shutdown()
+
+	if err := watcher.AddFile(filepath.Join(dir, name), func() error {
+		atomic.AddInt32(&reloadCount, 1)
+		return nil
+	}); err != nil {
+		t.Fatalf("Failed to watch projected file: %v", err)
+	}
+
+	projectConfigMap(t, dir, "v2", name, "first\nsecond\n")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&reloadCount) > 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Projected update went unnoticed after 5s (reloads=%d)", atomic.LoadInt32(&reloadCount))
+}
+
+// An event for something in a watched directory that leaves every watched file
+// reading the same must not reload anything: the directory is watched for the
+// sake of the files in it, not for its own sake.
+func TestEventConfigWatcherIgnoresUnrelatedNeighbour(t *testing.T) {
+	dir := t.TempDir()
+	watched := filepath.Join(dir, "watched.txt")
+	if err := os.WriteFile(watched, []byte("unchanged\n"), 0o644); err != nil {
+		t.Fatalf("Failed to create watched file: %v", err)
+	}
+
+	var reloadCount int32
+	watcher := NewConfigWatcher(time.Second)
+	defer watcher.Shutdown()
+
+	if err := watcher.AddFile(watched, func() error {
+		atomic.AddInt32(&reloadCount, 1)
+		return nil
+	}); err != nil {
+		t.Fatalf("Failed to watch file: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "neighbour.txt"), []byte("noise\n"), 0o644); err != nil {
+		t.Fatalf("Failed to write neighbour: %v", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	if n := atomic.LoadInt32(&reloadCount); n != 0 {
+		t.Errorf("Reloaded %d times for an unrelated file in the same directory", n)
+	}
+}
