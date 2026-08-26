@@ -36,6 +36,11 @@ type MonitoringUIConfig struct {
 	MaxMemoryMB        int    `toml:"max_memory_mb"`         // Maximum memory usage in MB for recent queries (default: 1MB)
 	PrometheusEnabled  bool   `toml:"prometheus_enabled"`    // Enable Prometheus metrics endpoint
 	PrometheusPath     string `toml:"prometheus_path"`       // Path for Prometheus metrics endpoint (default: /metrics)
+	// Peers are other instances of this proxy serving the same clients. When
+	// set, the page shows the fleet rather than whichever instance happened to
+	// answer the request for it.
+	Peers            []string `toml:"peers"`
+	PeerDiscoveryDNS string   `toml:"peer_discovery_dns"` // A name resolving to one address per instance
 }
 
 const maxTopDomains = 1000
@@ -147,6 +152,7 @@ type MonitoringUI struct {
 
 	// Prometheus metrics
 	prometheusPath string
+	peers          *peerCollector
 }
 
 // NewMonitoringUI - Creates a new monitoring UI
@@ -224,6 +230,8 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 			return "/metrics"
 		}(),
 	}
+
+	ui.peers = newPeerCollector(ui)
 
 	// Started with the instance rather than with the HTTP server: queries are
 	// recorded whether or not anyone is currently serving the page.
@@ -1249,6 +1257,15 @@ func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	metrics := ui.metricsCollector.GetMetrics()
+
+	// A request from another instance is answered with this instance's own
+	// numbers: aggregating in turn would have every instance asking every other
+	// one for every page view.
+	if r.Header.Get("X-Dnscrypt-Peer") == "" && ui.peers != nil {
+		if fleet := ui.peers.Fleet(metrics); len(fleet.Instances) > 1 {
+			metrics["fleet"] = fleet
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 

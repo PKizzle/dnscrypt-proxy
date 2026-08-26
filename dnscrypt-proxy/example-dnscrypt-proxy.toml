@@ -1084,6 +1084,24 @@ privacy_level = 1
 ## Default: /metrics
 # prometheus_path = "/metrics"
 
+  ## Other instances of dnscrypt-proxy serving the same clients.
+  ##
+  ## Several instances behind one address each answer a share of the traffic,
+  ## and each set of numbers describes only its own share -- so a page showing
+  ## one of them describes a fraction of what happened. With peers set, the
+  ## instance serving the page asks the others and shows the fleet: the totals,
+  ## and the per-instance breakdown behind them.
+  ##
+  ## Nothing is asked for unless someone is looking at the page, and an
+  ## instance that does not answer is reported rather than quietly left out.
+  ##
+  ## Either list the addresses, or give a name that resolves to one address per
+  ## instance -- a headless Service in Kubernetes, or any multi-address name.
+
+  # peers = ['10.0.0.2:8080', '10.0.0.3:8080']
+  # peer_discovery_dns = 'dnscrypt-proxy-monitoring.dns.svc.cluster.local:8080'
+
+
 
 ###############################################################################
 #                            Static entries                                    #
