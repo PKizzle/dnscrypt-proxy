@@ -203,10 +203,10 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// arrive. An unsigned zone is a fact about the zone and stays quiet;
 		// this is a fault on this side and would otherwise be invisible, since
 		// both reach the client the same way.
-		dlog.Debugf("DNSSEC could not check [%s]: %v", qName, why)
+		dlog.Infof("DNSSEC could not check [%s]: %v", qName, why)
 	default:
 		dnssecVerdicts.unknown.Add(1)
-		dlog.Debugf("DNSSEC did not vouch for [%s]: %v", qName, why)
+		dlog.Infof("DNSSEC did not vouch for [%s]: %v", qName, why)
 	}
 
 	if result != dnssec.Bogus {

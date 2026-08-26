@@ -4,6 +4,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"github.com/dnscrypt/dnscrypt-proxy/dnscrypt-proxy/dnssec"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -152,6 +153,15 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		pluginsState.cacheNegMaxTTL,
 	)
 	expiration := time.Now().Add(ttl)
+	// An answer must not outlive the signatures that vouch for it. RFC 4035
+	// section 5.3.3 puts the RRSIG expiration as a hard bound on how long the
+	// data may be used, and this cache carries the validator's verdict with the
+	// entry -- so without the bound it would keep serving a verdict that had
+	// stopped being true, and cache_min_ttl could push an entry past the
+	// signature on its own.
+	if until, ok := dnssec.EarliestSignatureExpiry(time.Now(), msg.Answer, msg.Ns); ok && until.Before(expiration) {
+		expiration = until
+	}
 	cachedMsg := cloneMsg(msg)
 	cachedMsg.Question = nil
 	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})

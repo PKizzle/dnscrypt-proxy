@@ -351,3 +351,34 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 	}
 	return Bogus, nil, lastErr
 }
+
+// SignatureExpiry returns the moment a signature stops being valid.
+//
+// The field is seconds since the epoch modulo 2^32, so it is read the way
+// RFC 4034 section 3.1.5 says to read it: as a distance from now in RFC 1982
+// serial arithmetic, rather than as an absolute number that will be wrong after
+// 2106 and wrong today for a zone signing across the wrap.
+func SignatureExpiry(sig *dns.RRSIG, now time.Time) time.Time {
+	away := int32(sig.Expiration - uint32(now.Unix())) // #nosec G115 -- serial arithmetic, wrap intended
+	return now.Add(time.Duration(away) * time.Second)
+}
+
+// EarliestSignatureExpiry returns when the first signature over any of these
+// records expires, and whether there was one at all.
+func EarliestSignatureExpiry(now time.Time, sections ...[]dns.RR) (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for _, section := range sections {
+		for _, rr := range section {
+			sig, ok := rr.(*dns.RRSIG)
+			if !ok {
+				continue
+			}
+			at := SignatureExpiry(sig, now)
+			if !found || at.Before(earliest) {
+				earliest, found = at, true
+			}
+		}
+	}
+	return earliest, found
+}

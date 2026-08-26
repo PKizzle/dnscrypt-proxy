@@ -419,3 +419,49 @@ func TestNSEC3IterationsAreBounded(t *testing.T) {
 		t.Error("the ordinary case should still hash")
 	}
 }
+
+// RFC 4035 section 5.3.3: an answer may not be used beyond the expiration of
+// the signature that vouches for it. A cache that carries the verdict with the
+// entry would otherwise keep serving a verdict that had stopped being true.
+func TestEarliestSignatureExpiryFindsTheFirstOneToGo(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+
+	soon := []dns.RR{aRecord("a.example.test.", "192.0.2.1")}
+	later := []dns.RR{aRecord("b.example.test.", "192.0.2.2")}
+	soonSig := z.sign(soon, now.Add(-time.Hour), now.Add(10*time.Minute))
+	laterSig := z.sign(later, now.Add(-time.Hour), now.Add(10*time.Hour))
+
+	at, ok := EarliestSignatureExpiry(now, []dns.RR{soon[0], laterSig}, []dns.RR{later[0], soonSig})
+	if !ok {
+		t.Fatal("no signature was found among records that carry two")
+	}
+	if d := at.Sub(now); d > 11*time.Minute || d < 9*time.Minute {
+		t.Errorf("earliest expiry is %v away, want about 10 minutes", d)
+	}
+}
+
+// Records with nothing signing them place no bound, and must not be reported as
+// if they expired at the epoch.
+func TestEarliestSignatureExpiryReportsWhenThereIsNone(t *testing.T) {
+	rrs := []dns.RR{aRecord("a.example.test.", "192.0.2.1")}
+	if _, ok := EarliestSignatureExpiry(time.Now(), rrs); ok {
+		t.Error("an unsigned answer was reported as having a signature expiry")
+	}
+}
+
+// The field wraps, so it is read as a distance from now rather than an absolute
+// second count: a signature valid across the 2106 wrap must not read as expired.
+func TestSignatureExpiryIsReadAsADistanceNotAnAbsolute(t *testing.T) {
+	// A moment shortly before the 32-bit wrap, with a signature expiring after it.
+	now := time.Unix(int64(^uint32(0))-60, 0)
+	sig := &dns.RRSIG{RRSIG: rdata.RRSIG{Expiration: uint32(60)}} // already wrapped
+
+	at := SignatureExpiry(sig, now)
+	if !at.After(now) {
+		t.Errorf("a signature expiring after the wrap read as %v, before now %v", at, now)
+	}
+	if d := at.Sub(now); d > 3*time.Minute {
+		t.Errorf("expiry is %v away, want about two minutes", d)
+	}
+}
