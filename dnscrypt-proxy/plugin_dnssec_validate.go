@@ -206,6 +206,7 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		dlog.Debugf("DNSSEC could not check [%s]: %v", qName, why)
 	default:
 		dnssecVerdicts.unknown.Add(1)
+		dlog.Debugf("DNSSEC did not vouch for [%s]: %v", qName, why)
 	}
 
 	if result != dnssec.Bogus {
@@ -318,7 +319,7 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 			return dnssec.Bogus, fmt.Errorf("%s is signed, but its %s record for %s is not",
 				owner.Zone, dns.TypeToString[set.Type], set.Name)
 		case dnssec.Insecure:
-			return dnssec.Insecure, nil
+			return dnssec.Insecure, owner.Why
 		default:
 			return dnssec.Indeterminate, owner.Why
 		}
@@ -338,7 +339,7 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		case dnssec.Insecure:
 			// The zone that signed is not itself vouched for by its parent, so
 			// the signature proves nothing about authenticity.
-			return dnssec.Insecure, nil
+			return dnssec.Insecure, signer.Why
 		default:
 			return dnssec.Indeterminate, signer.Why
 		}
