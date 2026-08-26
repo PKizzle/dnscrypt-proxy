@@ -273,6 +273,50 @@ func handleDNSExchange(
 	query []byte,
 	serverProto string,
 ) ([]byte, error) {
+	// Collapse this into an exchange already running for the same question, if
+	// there is one. The answer comes back carrying the first caller's
+	// transaction ID, so it is rewritten below for whoever receives it.
+	if key, ok := inflightKey(serverInfo.Name, query); ok {
+		res, shared := proxy.inflight.Do(key, func() inflightResult {
+			response, err := exchangeOnce(proxy, serverInfo, pluginsState, query, serverProto)
+			return inflightResult{
+				response:   response,
+				err:        err,
+				serverName: pluginsState.serverName,
+				returnCode: pluginsState.returnCode,
+			}
+		})
+		if shared {
+			// This caller did none of the work, so the parts of its state the
+			// exchange would have filled in come from the caller that did.
+			if res.serverName != "" {
+				pluginsState.serverName = res.serverName
+			}
+			pluginsState.returnCode = res.returnCode
+			if res.err != nil {
+				return nil, res.err
+			}
+			response := make([]byte, len(res.response))
+			copy(response, res.response)
+			if len(response) >= 2 && len(query) >= 2 {
+				response[0], response[1] = query[0], query[1]
+			}
+			return response, nil
+		}
+		return res.response, res.err
+	}
+	return exchangeOnce(proxy, serverInfo, pluginsState, query, serverProto)
+}
+
+// exchangeOnce performs the exchange itself, without regard for whether another
+// caller is asking the same thing.
+func exchangeOnce(
+	proxy *Proxy,
+	serverInfo *ServerInfo,
+	pluginsState *PluginsState,
+	query []byte,
+	serverProto string,
+) ([]byte, error) {
 	var err error
 	var response []byte
 

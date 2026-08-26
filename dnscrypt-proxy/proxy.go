@@ -31,6 +31,7 @@ type Proxy struct {
 	queryMeta                []string
 	enableHotReload          bool
 	dnssecValidationMode     string
+	inflight                 *inflight
 	dnssecInsecureZones      []string
 	udpListeners             []*net.UDPConn
 	sources                  []*Source
@@ -944,5 +945,6 @@ func NewProxy() *Proxy {
 	return &Proxy{
 		serversInfo: NewServersInfo(),
 		udpConnPool: NewUDPConnPool(),
+		inflight:    newInflight(),
 	}
 }
