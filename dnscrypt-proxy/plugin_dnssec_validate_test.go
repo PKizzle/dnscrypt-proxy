@@ -2,8 +2,12 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
+
+	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 )
 
 func TestParseValidationMode(t *testing.T) {
@@ -93,5 +97,83 @@ func TestBogusVerdictsReachTheExportedCounter(t *testing.T) {
 		if !strings.Contains(exported, `dnscrypt_proxy_dnssec_verdicts_total{verdict="`+verdict+`"}`) {
 			t.Errorf("the %s verdict is not exported", verdict)
 		}
+	}
+}
+
+func answerWithSignature(t *testing.T) *dns.Msg {
+	t.Helper()
+	msg := dns.NewMsg("www.example.test.", dns.TypeA)
+	if msg == nil {
+		t.Fatal("cannot build a message")
+	}
+	msg.Answer = []dns.RR{
+		&dns.A{
+			Hdr: dns.Header{Name: "www.example.test.", Class: dns.ClassINET, TTL: 300},
+			A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+		},
+		&dns.RRSIG{
+			Hdr:   dns.Header{Name: "www.example.test.", Class: dns.ClassINET, TTL: 300},
+			RRSIG: rdata.RRSIG{TypeCovered: dns.TypeA, SignerName: "example.test."},
+		},
+	}
+	msg.AuthenticatedData = true
+	return msg
+}
+
+func countRRSIG(rrs []dns.RR) int {
+	n := 0
+	for _, rr := range rrs {
+		if dns.RRToType(rr) == dns.TypeRRSIG {
+			n++
+		}
+	}
+	return n
+}
+
+// The records the validator needed are kept for a client that asked for them,
+// and the answer reaches that client unchanged.
+func TestAClientThatAskedForSignaturesKeepsThem(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{dnssecClientWantedKey: true}}
+	msg := answerWithSignature(t)
+
+	stripDNSSECForClient(&state, msg)
+
+	if countRRSIG(msg.Answer) != 1 {
+		t.Error("a client that set DO did not get the signature it asked for")
+	}
+	if !msg.AuthenticatedData {
+		t.Error("the verdict was withheld from a client that asked for it")
+	}
+}
+
+// A client that asked for none of this gets the answer it expected, and the
+// verdict is withheld: RFC 6840 section 5.8 reserves the AD bit for clients
+// that set DO or AD, and to anything else it is a bit nobody can act on.
+func TestAClientThatAskedForNothingGetsNeitherRecordsNorVerdict(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{}}
+	msg := answerWithSignature(t)
+
+	stripDNSSECForClient(&state, msg)
+
+	if countRRSIG(msg.Answer) != 0 {
+		t.Error("records the client never asked for were passed through")
+	}
+	if msg.AuthenticatedData {
+		t.Error("the AD bit was set for a client that set neither DO nor AD")
+	}
+}
+
+// A client that wants the verdict but not the records gets exactly that.
+func TestAClientThatAskedOnlyForTheVerdictGetsIt(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{dnssecClientAskedADKey: true}}
+	msg := answerWithSignature(t)
+
+	stripDNSSECForClient(&state, msg)
+
+	if countRRSIG(msg.Answer) != 0 {
+		t.Error("records were passed to a client that only wanted the verdict")
+	}
+	if !msg.AuthenticatedData {
+		t.Error("the verdict was withheld from a client that set AD")
 	}
 }

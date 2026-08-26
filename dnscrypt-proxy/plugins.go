@@ -163,6 +163,11 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	if proxy.cache {
 		*responsePlugins = append(*responsePlugins, Plugin(new(PluginCacheResponse)))
 	}
+	// Last, and so after the cache: what the cache keeps is what upstream sent,
+	// and what each client receives is trimmed to what that client asked for.
+	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
+		*responsePlugins = append(*responsePlugins, Plugin(new(PluginDNSSECStrip)))
+	}
 
 	loggingPlugins := &[]Plugin{}
 	if len(proxy.queryLogFile) != 0 {

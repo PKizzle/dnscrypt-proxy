@@ -213,14 +213,12 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// Secure answers are marked as such; anything else is served without a
 		// claim either way, which is what an unsigned zone deserves.
 		msg.AuthenticatedData = result == dnssec.Secure
-		plugin.stripIfUnwanted(pluginsState, msg)
 		return nil
 	}
 
 	if plugin.mode == ValidationLog {
 		dlog.Warnf("DNSSEC would refuse [%s]: %v", qName, why)
 		msg.AuthenticatedData = false
-		plugin.stripIfUnwanted(pluginsState, msg)
 		return nil
 	}
 	dlog.Warnf("DNSSEC refused [%s]: %v", qName, why)
@@ -406,6 +404,7 @@ func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg
 		return nil
 	}
 	pluginsState.sessionData[dnssecClientWantedKey] = msg.Security
+	pluginsState.sessionData[dnssecClientAskedADKey] = msg.AuthenticatedData
 	msg.Security = true
 	if msg.UDPSize == 0 || msg.UDPSize < 1232 {
 		// Signatures do not fit in 512 bytes. Without room for them the answer
@@ -417,6 +416,9 @@ func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg
 
 // dnssecClientWantedKey records whether the client asked for DNSSEC records.
 const dnssecClientWantedKey = "dnssec_client_wanted"
+
+// dnssecClientAskedADKey records whether the client asked for the verdict alone.
+const dnssecClientAskedADKey = "dnssec_client_asked_ad"
 
 // stripDNSSECRecords removes the records only the validator needed, for a
 // client that did not ask to see them.
@@ -441,17 +443,44 @@ func withoutDNSSEC(rrs []dns.RR) []dns.RR {
 	return kept
 }
 
-// stripIfUnwanted removes the DNSSEC records from an answer when the client did
-// not ask for them.
+// PluginDNSSECStrip returns an answer to the shape the client asked for.
 //
-// The validator sets the DO bit on every query so that there is something to
-// verify. Passing what comes back straight through would hand records to
-// clients that never requested them and, on UDP, inflate answers that used to
-// fit. The verdict still reaches them, as the AD bit.
-func (plugin *PluginDNSSECValidate) stripIfUnwanted(pluginsState *PluginsState, msg *dns.Msg) {
-	wanted, ok := pluginsState.sessionData[dnssecClientWantedKey].(bool)
-	if ok && wanted {
-		return
+// Registered after the cache deliberately. The validator sets the DO bit on
+// every query so that there is something to check, and the records that come
+// back are what the cache must keep: an entry stored without them cannot be
+// checked when it is served again, and would be refused as unsigned by the very
+// plugin that stripped it. So the cache stores what upstream sent, and the
+// trimming happens here, on the way out, per client.
+type PluginDNSSECStrip struct{}
+
+func (plugin *PluginDNSSECStrip) Name() string { return "dnssec_strip" }
+
+func (plugin *PluginDNSSECStrip) Description() string {
+	return "Remove DNSSEC records from answers to clients that did not ask for them"
+}
+
+func (plugin *PluginDNSSECStrip) Init(_ *Proxy) error { return nil }
+func (plugin *PluginDNSSECStrip) Drop() error         { return nil }
+func (plugin *PluginDNSSECStrip) Reload() error       { return nil }
+
+func (plugin *PluginDNSSECStrip) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	stripDNSSECForClient(pluginsState, msg)
+	return nil
+}
+
+// stripDNSSECForClient trims an answer to what the client asked to see.
+//
+// The verdict still reaches a client that asked for none of this, as the AD
+// bit -- but only if it asked in a way that gives the bit a meaning. RFC 6840
+// section 5.8 reserves it for clients that set DO or AD; to anything else it is
+// a bit that was not requested and cannot be acted on.
+func stripDNSSECForClient(pluginsState *PluginsState, msg *dns.Msg) {
+	wanted, _ := pluginsState.sessionData[dnssecClientWantedKey].(bool)
+	askedForVerdict, _ := pluginsState.sessionData[dnssecClientAskedADKey].(bool)
+	if !wanted {
+		stripDNSSECRecords(msg)
 	}
-	stripDNSSECRecords(msg)
+	if !wanted && !askedForVerdict {
+		msg.AuthenticatedData = false
+	}
 }
