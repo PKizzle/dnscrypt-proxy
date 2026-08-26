@@ -167,8 +167,19 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 	// This instance's own numbers are counted without being fetched over the
 	// network: it is one of the instances, and asking itself would be a request
 	// that can fail for reasons the answer already rules out.
+	//
+	// Held as a copy, because the caller puts this result back into the very map
+	// it passed in. Keeping the original would make the fleet contain the map
+	// that contains the fleet, and encoding it would not terminate.
+	self := make(map[string]any, len(own))
+	for k, v := range own {
+		if k == "fleet" {
+			continue
+		}
+		self[k] = v
+	}
 	fleet.Instances = append(fleet.Instances, peerMetrics{
-		Address: "self", Reachable: true, Metrics: own,
+		Address: "self", Reachable: true, Metrics: self,
 	})
 	for _, r := range results {
 		if !r.Reachable {

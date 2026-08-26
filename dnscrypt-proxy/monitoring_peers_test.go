@@ -174,3 +174,21 @@ func TestPeerAddressesAreDeduplicated(t *testing.T) {
 		t.Errorf("peerAddresses() = %v, want duplicates collapsed", addrs)
 	}
 }
+
+// The caller puts the fleet back into the map it passed in, so the fleet must
+// not hold that same map: encoding a structure that contains itself does not
+// terminate, and the endpoint returned nothing at all when it did.
+func TestFleetResultCanBeEncodedAfterBeingStoredInItsOwnInput(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	pc := newPeerCollector(ui)
+
+	own := map[string]any{"total_queries": float64(7)}
+	fleet := pc.Fleet(own)
+	// Exactly what the handler does.
+	own["fleet"] = fleet
+
+	if _, err := json.Marshal(own); err != nil {
+		t.Fatalf("encoding the metrics with the fleet in them failed: %v", err)
+	}
+}
