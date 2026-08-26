@@ -68,6 +68,20 @@ func NewCachingFetcher(query QueryFunc) *CachingFetcher {
 // the answer stays cached elsewhere.
 const chainFetchAttempts = 3
 
+// maxStale bounds how long past its lifetime a key set or delegation signer may
+// still be used when it cannot be refreshed.
+//
+// RFC 8767 allows this when a refresh has genuinely been attempted and failed,
+// and asks for a maximum stale timer of one to three days; unbounded reuse is
+// not what it permits. A day is the conservative end of that range, and well
+// inside the window in which zones keep publishing a key they have stopped
+// signing with.
+//
+// It bounds the reuse, not the trust: what is held is re-verified against the
+// current time wherever it is used, so a signature that has expired fails
+// whether it came from the network or from here.
+const maxStale = 24 * time.Hour
+
 // ask sends a query, retrying a failure or an empty reply.
 func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
 	var lastErr error
@@ -113,7 +127,7 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 	// verifies. The signature check is unaffected -- a key that has genuinely
 	// gone simply will not verify, and that is caught where it matters.
 	fall := func(err error) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
-		if held {
+		if held && f.now().Before(stale.expires.Add(maxStale)) {
 			return stale.keys, stale.sigs, nil
 		}
 		return nil, nil, err
@@ -171,7 +185,7 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	// As for the keys: a delegation signer that could not be refreshed falls
 	// back to the one held before rather than costing the zone its validation.
 	fall := func(err error) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
-		if held {
+		if held && f.now().Before(stale.expires.Add(maxStale)) {
 			return stale.dss, stale.sigs, stale.denial, nil
 		}
 		return nil, nil, Denial{}, err

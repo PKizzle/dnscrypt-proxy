@@ -331,3 +331,51 @@ func TestFetcherWithNothingHeldStillReportsFailure(t *testing.T) {
 		t.Error("a failure with nothing cached was not reported")
 	}
 }
+
+// RFC 8767 permits stale data only for a bounded period, and asks for a maximum
+// stale timer rather than reuse without end.
+func TestFetcherStopsUsingKeysThatAreTooOld(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	fail := false
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		if fail {
+			return nil, fmt.Errorf("upstream unreachable")
+		}
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+	f.Now = func() time.Time { return now }
+
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	fail = true
+
+	// Inside the window the held set is still used.
+	now = now.Add(maxStale / 2)
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Errorf("within the stale window: %v, want the held key set", err)
+	}
+
+	// Beyond it, there is nothing left to stand on.
+	now = now.Add(maxStale * 2)
+	if _, _, err := f.DNSKEY("example.test."); err == nil {
+		t.Error("a key set far past its lifetime was still used")
+	}
+}
+
+// The bound limits reuse, not scrutiny: what is held is checked against the
+// current time wherever it is used, so a set whose signatures have expired does
+// not validate merely because it was cached.
+func TestStaleKeysDoNotEscapeSignatureChecking(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	expired := z.sign(rrset, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+
+	res, _ := VerifyRRSet(rrset, []*dns.RRSIG{expired}, []*dns.DNSKEY{z.key}, now)
+	if res == Secure {
+		t.Error("an expired signature verified, so staleness would bypass the validity window")
+	}
+}
