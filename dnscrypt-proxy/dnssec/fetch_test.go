@@ -1,0 +1,226 @@
+package dnssec
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"codeberg.org/miekg/dns"
+)
+
+// recordingQuery counts what it is asked, so the tests can tell a cache hit
+// from a fetch.
+type recordingQuery struct {
+	calls    map[string]int
+	respond  func(qname string, qtype uint16) (*dns.Msg, error)
+	lastName string
+}
+
+func (r *recordingQuery) fn(qname string, qtype uint16) (*dns.Msg, error) {
+	if r.calls == nil {
+		r.calls = map[string]int{}
+	}
+	r.calls[fmt.Sprintf("%s/%d", qname, qtype)]++
+	r.lastName = qname
+	return r.respond(qname, qtype)
+}
+
+func msgWith(rcode uint16, answer []dns.RR, ns []dns.RR) *dns.Msg {
+	m := &dns.Msg{}
+	m.Rcode = rcode
+	m.Answer = answer
+	m.Ns = ns
+	return m
+}
+
+func TestFetcherReturnsKeysAndCachesThem(t *testing.T) {
+	z := newZone(t, "example.test.")
+	sig := z.sign([]dns.RR{z.key}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key, sig}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	for i := 0; i < 3; i++ {
+		keys, sigs, err := f.DNSKEY("example.test.")
+		if err != nil || len(keys) != 1 || len(sigs) != 1 {
+			t.Fatalf("DNSKEY() = %d keys, %d sigs, err %v", len(keys), len(sigs), err)
+		}
+	}
+	if got := rec.calls["example.test./48"]; got != 1 {
+		t.Errorf("upstream asked %d times, want 1: the answer should be cached", got)
+	}
+}
+
+// The zone's own TTL decides how long its keys are held, so a rollover is
+// picked up when the zone said it would be.
+func TestFetcherHonoursTheTTL(t *testing.T) {
+	z := newZone(t, "example.test.")
+	z.key.Hdr.TTL = 120
+	sig := z.sign([]dns.RR{z.key}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	sig.Hdr.TTL = 120
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key, sig}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	base := time.Now()
+	f.Now = func() time.Time { return base }
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("first DNSKEY(): %v", err)
+	}
+	f.Now = func() time.Time { return base.Add(119 * time.Second) }
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("cached DNSKEY(): %v", err)
+	}
+	if got := rec.calls["example.test./48"]; got != 1 {
+		t.Fatalf("asked %d times before expiry, want 1", got)
+	}
+	f.Now = func() time.Time { return base.Add(2 * time.Minute) }
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("DNSKEY() after expiry: %v", err)
+	}
+	if got := rec.calls["example.test./48"]; got != 2 {
+		t.Errorf("asked %d times after expiry, want 2", got)
+	}
+}
+
+// No delegation signer is an ordinary answer, not an error: it is how an
+// unsigned zone looks, and the chain reads it as insecure.
+func TestFetcherReportsAnAbsentDelegationSignerAsEmpty(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, nil, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	dss, _, err := f.DS("unsigned.test.")
+	if err != nil {
+		t.Fatalf("DS() = %v, want no error", err)
+	}
+	if len(dss) != 0 {
+		t.Errorf("DS() returned %d signers, want none", len(dss))
+	}
+}
+
+// A name that does not exist is not an unsigned zone. Reporting it as one would
+// let a typo -- or a forged NXDOMAIN -- read as a downgrade.
+func TestFetcherDistinguishesNoSuchNameFromNoSigner(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeNameError, nil, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DS("nope.test."); err == nil {
+		t.Error("DS() for a nonexistent name should be an error, not an unsigned delegation")
+	}
+}
+
+func TestFetcherPropagatesFailure(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return nil, fmt.Errorf("upstream unreachable")
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err == nil {
+		t.Error("DNSKEY() should report an upstream failure rather than an empty key set")
+	}
+	if _, _, err := f.DS("example.test."); err == nil {
+		t.Error("DS() should report an upstream failure")
+	}
+}
+
+func TestFetcherRefusesAnEmptyKeySet(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, nil, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err == nil {
+		t.Error("a zone with no keys in the answer is not a usable key set")
+	}
+}
+
+func TestFetcherForgetDropsTheCache(t *testing.T) {
+	z := newZone(t, "example.test.")
+	sig := z.sign([]dns.RR{z.key}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key, sig}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("DNSKEY(): %v", err)
+	}
+	f.Forget()
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("DNSKEY() after Forget(): %v", err)
+	}
+	if got := rec.calls["example.test./48"]; got != 2 {
+		t.Errorf("asked %d times across a Forget(), want 2", got)
+	}
+}
+
+// Names differing only in case and trailing dot are the same zone; caching them
+// separately would multiply every fetch.
+func TestFetcherTreatsNamesCanonically(t *testing.T) {
+	z := newZone(t, "example.test.")
+	sig := z.sign([]dns.RR{z.key}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key, sig}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	for _, name := range []string{"example.test.", "Example.Test.", "example.test"} {
+		if _, _, err := f.DNSKEY(name); err != nil {
+			t.Fatalf("DNSKEY(%q): %v", name, err)
+		}
+	}
+	if got := rec.calls["example.test./48"]; got != 1 {
+		t.Errorf("asked %d times for one zone spelled three ways, want 1", got)
+	}
+}
+
+// The whole point of the fetcher is to feed a chain walk, so it is worth
+// checking the two fit together over a hierarchy served through it.
+func TestFetcherDrivesAChainWalk(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	f := NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch qtype {
+		case dns.TypeDNSKEY:
+			keys, sigs, err := h.DNSKEY(canonicalName(qname))
+			if err != nil {
+				return msgWith(dns.RcodeNameError, nil, nil), nil
+			}
+			answer := make([]dns.RR, 0, len(keys)+len(sigs))
+			for _, k := range keys {
+				answer = append(answer, k)
+			}
+			for _, s := range sigs {
+				answer = append(answer, s)
+			}
+			return msgWith(dns.RcodeSuccess, answer, nil), nil
+		case dns.TypeDS:
+			dss, sigs, err := h.DS(canonicalName(qname))
+			if err != nil {
+				return msgWith(dns.RcodeNameError, nil, nil), nil
+			}
+			answer := make([]dns.RR, 0, len(dss)+len(sigs))
+			for _, d := range dss {
+				answer = append(answer, d)
+			}
+			for _, s := range sigs {
+				answer = append(answer, s)
+			}
+			return msgWith(dns.RcodeSuccess, answer, nil), nil
+		}
+		return msgWith(dns.RcodeNameError, nil, nil), nil
+	})
+
+	res := BuildChain(f, "example.test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("BuildChain() through the fetcher = %v (%v), want secure", res.Status, res.Why)
+	}
+	if res.Zone != "example.test." {
+		t.Errorf("zone = %q, want example.test.", res.Zone)
+	}
+}
