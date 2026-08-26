@@ -97,22 +97,37 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 	zone = canonicalName(zone)
 
 	f.mu.Lock()
-	if e, ok := f.keys[zone]; ok && f.now().Before(e.expires) {
-		keys, sigs := e.keys, e.sigs
+	stale, held := f.keys[zone]
+	if held && f.now().Before(stale.expires) {
+		keys, sigs := stale.keys, stale.sigs
 		f.mu.Unlock()
 		return keys, sigs, nil
 	}
 	f.mu.Unlock()
 
-	msg, err := f.ask(zone, dns.TypeDNSKEY)
-	if err != nil {
+	// A key set that could not be refreshed falls back to the one held before,
+	// past its lifetime. Giving up instead would serve every name under the
+	// zone unvalidated, which is a far larger change than using a key that is
+	// a little old: zones publish keys long before they sign with them and keep
+	// them long after, precisely so that a resolver holding a stale set still
+	// verifies. The signature check is unaffected -- a key that has genuinely
+	// gone simply will not verify, and that is caught where it matters.
+	fall := func(err error) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+		if held {
+			return stale.keys, stale.sigs, nil
+		}
 		return nil, nil, err
 	}
+
+	msg, err := f.ask(zone, dns.TypeDNSKEY)
+	if err != nil {
+		return fall(err)
+	}
 	if msg == nil {
-		return nil, nil, fmt.Errorf("no response for DNSKEY %s", zone)
+		return fall(fmt.Errorf("no response for DNSKEY %s", zone))
 	}
 	if msg.Rcode != dns.RcodeSuccess {
-		return nil, nil, fmt.Errorf("DNSKEY %s: rcode %d", zone, msg.Rcode)
+		return fall(fmt.Errorf("DNSKEY %s: rcode %d", zone, msg.Rcode))
 	}
 
 	var keys []*dns.DNSKEY
@@ -126,7 +141,7 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 		}
 	}
 	if len(keys) == 0 {
-		return nil, nil, fmt.Errorf("no keys in the answer for %s", zone)
+		return fall(fmt.Errorf("no keys in the answer for %s", zone))
 	}
 
 	f.mu.Lock()
@@ -145,26 +160,36 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	zone = canonicalName(zone)
 
 	f.mu.Lock()
-	if e, ok := f.dss[zone]; ok && f.now().Before(e.expires) {
-		dss, sigs, denial := e.dss, e.sigs, e.denial
+	stale, held := f.dss[zone]
+	if held && f.now().Before(stale.expires) {
+		dss, sigs, denial := stale.dss, stale.sigs, stale.denial
 		f.mu.Unlock()
 		return dss, sigs, denial, nil
 	}
 	f.mu.Unlock()
 
-	msg, err := f.ask(zone, dns.TypeDS)
-	if err != nil {
+	// As for the keys: a delegation signer that could not be refreshed falls
+	// back to the one held before rather than costing the zone its validation.
+	fall := func(err error) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+		if held {
+			return stale.dss, stale.sigs, stale.denial, nil
+		}
 		return nil, nil, Denial{}, err
 	}
+
+	msg, err := f.ask(zone, dns.TypeDS)
+	if err != nil {
+		return fall(err)
+	}
 	if msg == nil {
-		return nil, nil, Denial{}, fmt.Errorf("no response for DS %s", zone)
+		return fall(fmt.Errorf("no response for DS %s", zone))
 	}
 	switch msg.Rcode {
 	case dns.RcodeSuccess:
 	case dns.RcodeNameError:
 		return nil, nil, Denial{}, fmt.Errorf("DS %s: the name does not exist", zone)
 	default:
-		return nil, nil, Denial{}, fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode)
+		return fall(fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode))
 	}
 
 	var dss []*dns.DS

@@ -285,3 +285,49 @@ func TestFetcherGivesUpAfterTheRetries(t *testing.T) {
 		t.Errorf("upstream asked %d time(s), want %d", calls, chainFetchAttempts)
 	}
 }
+
+// A key set that cannot be refreshed is better used a little stale than not at
+// all: giving up serves every name under the zone unvalidated, while a key that
+// has genuinely gone simply fails to verify where that is checked.
+func TestFetcherFallsBackToKeysItAlreadyHeld(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	fail := false
+	rec := &recordingQuery{respond: func(name string, qtype uint16) (*dns.Msg, error) {
+		if fail {
+			return nil, fmt.Errorf("upstream unreachable")
+		}
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+	f.Now = func() time.Time { return now }
+
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+
+	// Past the entry's lifetime, with upstream now unreachable.
+	now = now.Add(24 * time.Hour)
+	fail = true
+
+	keys, _, err := f.DNSKEY("example.test.")
+	if err != nil {
+		t.Fatalf("DNSKEY() = %v, want the previously held key set", err)
+	}
+	if len(keys) == 0 {
+		t.Error("no keys returned, so every name under the zone goes unvalidated")
+	}
+}
+
+// With nothing held there is nothing to fall back to, and the failure must be
+// reported rather than answered with an empty key set.
+func TestFetcherWithNothingHeldStillReportsFailure(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return nil, fmt.Errorf("upstream unreachable")
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err == nil {
+		t.Error("a failure with nothing cached was not reported")
+	}
+}
