@@ -2,11 +2,28 @@ package main
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"codeberg.org/miekg/dns"
 )
+
+// newTestMonitoringUI builds a monitoring UI with its collector running.
+func newTestMonitoringUI(t *testing.T) *MonitoringUI {
+	t.Helper()
+	ui := NewMonitoringUI(&Proxy{
+		monitoringUI: MonitoringUIConfig{
+			Enabled:            true,
+			MaxQueryLogEntries: 100,
+			MaxMemoryMB:        1,
+		},
+	})
+	if ui == nil {
+		t.Fatal("Failed to create monitoring UI")
+	}
+	return ui
+}
 
 // TestCacheStatisticsAccuracy tests that cache statistics only include
 // queries that participate in caching (cache hits + queries that went to a server).
@@ -55,7 +72,8 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 			returnCode:   PluginsReturnCodePass,
 		}
 
-		ui.UpdateMetrics(pluginsState, msg)
+		ui.UpdateMetrics(&pluginsState, msg)
+		ui.Flush()
 
 		if mc.cacheHits != 1 {
 			t.Errorf("After cache hit, cacheHits should be 1, got %d", mc.cacheHits)
@@ -84,7 +102,8 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 			returnCode:   PluginsReturnCodePass,
 		}
 
-		ui.UpdateMetrics(pluginsState, msg)
+		ui.UpdateMetrics(&pluginsState, msg)
+		ui.Flush()
 
 		if mc.cacheHits != 1 {
 			t.Errorf("After cache miss, cacheHits should still be 1, got %d", mc.cacheHits)
@@ -113,7 +132,8 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 			returnCode:   PluginsReturnCodeReject, // Blocked query
 		}
 
-		ui.UpdateMetrics(pluginsState, msg)
+		ui.UpdateMetrics(&pluginsState, msg)
+		ui.Flush()
 
 		// Cache stats should NOT change for blocked queries
 		if mc.cacheHits != 1 {
@@ -146,7 +166,8 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 			returnCode:   PluginsReturnCodeDrop, // Dropped query
 		}
 
-		ui.UpdateMetrics(pluginsState, msg)
+		ui.UpdateMetrics(&pluginsState, msg)
+		ui.Flush()
 
 		// Cache stats should NOT change for dropped queries
 		if mc.cacheHits != 1 {
@@ -190,5 +211,79 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 	}
 	if blockedQueries != 2 {
 		t.Errorf("Expected blocked_queries to be 2, got %d", blockedQueries)
+	}
+}
+
+// The collector runs on its own goroutine, so a caller that has just recorded
+// something and needs to read it back has to have a way to wait.
+func TestFlushMakesRecordedQueriesVisible(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	msg := &dns.Msg{}
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "flush.example.", Class: dns.ClassINET}}}
+	for i := 0; i < 50; i++ {
+		pluginsState := PluginsState{
+			returnCode:   PluginsReturnCodePass,
+			serverName:   "test-server",
+			qName:        "flush.example.",
+			questionMsg:  msg,
+			cacheHit:     true,
+			requestStart: time.Now(),
+			timeout:      5 * time.Second,
+		}
+		ui.UpdateMetrics(&pluginsState, msg)
+	}
+	ui.Flush()
+
+	ui.metricsCollector.countersMutex.RLock()
+	total := ui.metricsCollector.totalQueries
+	hits := ui.metricsCollector.cacheHits
+	ui.metricsCollector.countersMutex.RUnlock()
+
+	if total != 50 {
+		t.Errorf("totalQueries = %d after Flush(), want 50", total)
+	}
+	if hits != 50 {
+		t.Errorf("cacheHits = %d after Flush(), want 50", hits)
+	}
+}
+
+// Recording must never block the goroutine answering a query, even when the
+// collector cannot keep up: the events are dropped and counted instead.
+func TestUpdateMetricsDoesNotBlockWhenTheQueueIsFull(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	// Stop the collector so nothing drains, then overfill the queue.
+	close(ui.metricsCollector.collectorStop)
+	time.Sleep(50 * time.Millisecond)
+
+	msg := &dns.Msg{}
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "flood.example.", Class: dns.ClassINET}}}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < cap(ui.metricsCollector.events)*2; i++ {
+			pluginsState := PluginsState{
+				returnCode:   PluginsReturnCodePass,
+				serverName:   "test-server",
+				qName:        "flood.example.",
+				questionMsg:  msg,
+				requestStart: time.Now(),
+				timeout:      5 * time.Second,
+			}
+			ui.UpdateMetrics(&pluginsState, msg)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UpdateMetrics blocked when the collector was not draining")
+	}
+	if atomic.LoadUint64(&ui.metricsCollector.droppedEvents) == 0 {
+		t.Error("events beyond the queue should be counted as dropped")
 	}
 }

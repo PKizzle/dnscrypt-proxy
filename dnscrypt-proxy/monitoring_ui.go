@@ -11,8 +11,10 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -66,6 +68,13 @@ type MetricsCollector struct {
 	maxMemoryBytes     int64
 	currentMemoryBytes int64
 	privacyLevel       int
+
+	// events carries work off the serving goroutines; a single collector drains
+	// it. Buffered so a burst is absorbed rather than felt by the queries that
+	// caused it, and dropped rather than blocking when even that is not enough.
+	events        chan metricEvent
+	collectorStop chan struct{}
+	droppedEvents uint64
 
 	// Caching for expensive calculations
 	cacheMutex      sync.RWMutex
@@ -161,6 +170,8 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 
 	// Initialize metrics collector
 	metricsCollector := &MetricsCollector{
+		events:             make(chan metricEvent, 4096),
+		collectorStop:      make(chan struct{}),
 		startTime:          time.Now(),
 		queryTypes:         make(map[string]uint64),
 		serverResponseTime: make(map[string]uint64),
@@ -182,7 +193,7 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 	dlog.Debugf("Metrics collector initialized with privacy level: %d", metricsCollector.privacyLevel)
 
 	// Create and return the monitoring UI instance
-	return &MonitoringUI{
+	ui := &MonitoringUI{
 		config:           proxy.monitoringUI,
 		metricsCollector: metricsCollector,
 		upgrader: websocket.Upgrader{
@@ -213,6 +224,12 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 			return "/metrics"
 		}(),
 	}
+
+	// Started with the instance rather than with the HTTP server: queries are
+	// recorded whether or not anyone is currently serving the page.
+	go ui.runCollector()
+
+	return ui
 }
 
 // Start - Starts the monitoring UI
@@ -261,21 +278,166 @@ func (ui *MonitoringUI) Start() error {
 }
 
 // Stop - Stops the monitoring UI
+// Flush waits until every event recorded before the call has been applied.
+//
+// The counters are updated on another goroutine, so a reader that has just
+// recorded something and wants to see it -- a test, or a metrics scrape taken
+// right after a query -- needs a point to wait on.
+func (ui *MonitoringUI) Flush() {
+	mc := ui.metricsCollector
+	if mc == nil || mc.events == nil {
+		return
+	}
+	done := make(chan struct{})
+	select {
+	case mc.events <- metricEvent{done: done}:
+	case <-mc.collectorStop:
+		return
+	}
+	select {
+	case <-done:
+	case <-mc.collectorStop:
+	}
+}
+
 func (ui *MonitoringUI) Stop() error {
+	if ui.metricsCollector != nil && ui.metricsCollector.collectorStop != nil {
+		select {
+		case <-ui.metricsCollector.collectorStop:
+			// already stopped
+		default:
+			close(ui.metricsCollector.collectorStop)
+		}
+	}
 	if ui.httpServer != nil {
 		return ui.httpServer.Close()
 	}
 	return nil
 }
 
-// UpdateMetrics - Updates metrics with a new query
-func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
-	if !ui.config.Enabled {
+// metricEvent is everything the metrics need from a query.
+//
+// The fields are copied out on the serving goroutine and the rest of the work
+// happens elsewhere, so a query pays for one channel send instead of four
+// mutexes and a struct copy. It is small and owns its strings: nothing here
+// points back into state the query is about to reuse.
+type metricEvent struct {
+	at           time.Time
+	qName        string
+	qType        string
+	serverName   string
+	clientIP     string
+	returnCode   string
+	responseTime int64
+	cacheHit     bool
+	countCache   bool
+	blocked      bool
+	logQuery     bool
+	// done, when set, is closed once this event has been applied. It carries no
+	// measurement: it is how a caller waits for everything queued before it.
+	done chan struct{}
+}
+
+// UpdateMetrics records one query.
+//
+// Called on the goroutine answering the query, so it does as little as it can:
+// read the fields it needs and hand them on. If the collector is behind, the
+// event is dropped and counted rather than made to wait -- metrics falling
+// behind is a smaller problem than answers doing so.
+func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) {
+	if !ui.config.Enabled || pluginsState == nil {
 		return
 	}
-
 	mc := ui.metricsCollector
 	now := time.Now()
+
+	responseTime := now.Sub(pluginsState.requestStart).Milliseconds()
+	// Cap at the timeout: a suspended machine otherwise reports the time it
+	// spent asleep as query latency.
+	if maxResponseTime := pluginsState.timeout.Milliseconds(); responseTime > maxResponseTime {
+		responseTime = maxResponseTime
+	}
+
+	ev := metricEvent{
+		at:           now,
+		qName:        pluginsState.qName,
+		serverName:   pluginsState.serverName,
+		responseTime: responseTime,
+		cacheHit:     pluginsState.cacheHit,
+		countCache:   pluginsState.cacheHit || pluginsState.serverName != "-",
+		blocked: pluginsState.returnCode == PluginsReturnCodeReject ||
+			pluginsState.returnCode == PluginsReturnCodeDrop,
+		logQuery: ui.config.EnableQueryLog && mc.privacyLevel < 2,
+	}
+	if msg != nil && len(msg.Question) > 0 {
+		rrType := dns.RRToType(msg.Question[0])
+		qType, ok := dns.TypeToString[rrType]
+		if !ok {
+			qType = strconv.FormatUint(uint64(rrType), 10)
+		}
+		ev.qType = qType
+	}
+	if ev.logQuery {
+		ev.clientIP = clientIPForLog(pluginsState, mc.privacyLevel)
+		returnCode, ok := PluginsReturnCodeToString[pluginsState.returnCode]
+		if !ok {
+			returnCode = strconv.Itoa(int(pluginsState.returnCode))
+		}
+		ev.returnCode = returnCode
+	}
+
+	select {
+	case mc.events <- ev:
+	default:
+		atomic.AddUint64(&mc.droppedEvents, 1)
+	}
+}
+
+// clientIPForLog renders the client address for the query log, honouring the
+// privacy level.
+func clientIPForLog(pluginsState *PluginsState, privacyLevel int) string {
+	if privacyLevel >= 1 {
+		return "anonymized"
+	}
+	if pluginsState.clientAddr == nil {
+		return "no-client-addr"
+	}
+	switch pluginsState.clientProto {
+	case "udp":
+		if udpAddr, ok := (*pluginsState.clientAddr).(*net.UDPAddr); ok && udpAddr != nil {
+			return udpAddr.IP.String()
+		}
+		return "unknown-udp"
+	case "tcp", "local_doh":
+		if tcpAddr, ok := (*pluginsState.clientAddr).(*net.TCPAddr); ok && tcpAddr != nil {
+			return tcpAddr.IP.String()
+		}
+		return "unknown-tcp"
+	}
+	return "internal"
+}
+
+// runCollector applies events one at a time. Being the only writer is what
+// keeps the counters consistent without the serving goroutines ever waiting.
+func (ui *MonitoringUI) runCollector() {
+	mc := ui.metricsCollector
+	for {
+		select {
+		case ev := <-mc.events:
+			if ev.done != nil {
+				close(ev.done)
+				continue
+			}
+			ui.applyMetrics(ev)
+		case <-mc.collectorStop:
+			return
+		}
+	}
+}
+
+func (ui *MonitoringUI) applyMetrics(ev metricEvent) {
+	mc := ui.metricsCollector
+	now := ev.at
 
 	// Update counters (total queries, cache, QPS) - separate lock
 	mc.countersMutex.Lock()
@@ -301,9 +463,8 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 	// - Cache hits (cacheHit == true)
 	// - Cache misses (queries that went to a DNS server: serverName != "-")
 	// This excludes blocked queries (REJECT/DROP) that never reach the cache or server
-	shouldCountCacheStats := pluginsState.cacheHit || pluginsState.serverName != "-"
-	if shouldCountCacheStats {
-		if pluginsState.cacheHit {
+	if ev.countCache {
+		if ev.cacheHit {
 			mc.cacheHits++
 		} else {
 			mc.cacheMisses++
@@ -313,8 +474,7 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 	// Update blocked queries count
 	// Only count truly blocked queries: REJECT (blocked by name/IP) and DROP (dropped)
 	// CLOAK is not counted as it redirects queries rather than blocking them
-	if pluginsState.returnCode == PluginsReturnCodeReject ||
-		pluginsState.returnCode == PluginsReturnCodeDrop {
+	if ev.blocked {
 		mc.blockCount++
 	}
 	mc.countersMutex.Unlock()
@@ -323,45 +483,30 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 	mc.invalidateCache()
 
 	// Update query types - separate lock
-	if msg != nil && len(msg.Question) > 0 {
-		question := msg.Question[0]
-		rrType := dns.RRToType(question)
-		qType, ok := dns.TypeToString[rrType]
-		if !ok {
-			qType = fmt.Sprintf("%d", rrType)
-		}
+	if ev.qType != "" {
 		mc.queryTypesMutex.Lock()
-		mc.queryTypes[qType]++
+		mc.queryTypes[ev.qType]++
 		mc.queryTypesMutex.Unlock()
-	} else {
-		dlog.Debugf("No question in message or message is nil")
 	}
 
-	// Update response time - back to counters lock
-	responseTime := time.Since(pluginsState.requestStart).Milliseconds()
-
-	// Cap at timeout to handle system sleep/suspend
-	maxResponseTime := pluginsState.timeout.Milliseconds()
-	if responseTime > maxResponseTime {
-		responseTime = maxResponseTime
-	}
+	responseTime := ev.responseTime
 	mc.countersMutex.Lock()
 	mc.responseTimeSum += uint64(responseTime)
 	mc.responseTimeCount++
 	mc.countersMutex.Unlock()
 
 	// Update server stats - separate lock
-	if pluginsState.serverName != "" && pluginsState.serverName != "-" {
+	if ev.serverName != "" && ev.serverName != "-" {
 		mc.serverMutex.Lock()
-		mc.serverQueryCount[pluginsState.serverName]++
-		mc.serverResponseTime[pluginsState.serverName] += uint64(responseTime)
+		mc.serverQueryCount[ev.serverName]++
+		mc.serverResponseTime[ev.serverName] += uint64(responseTime)
 		mc.serverMutex.Unlock()
 	}
 
 	// Update top domains - separate lock
 	if mc.privacyLevel < 2 {
 		// Store domain name directly - no sanitization needed for internal metrics
-		domainName := pluginsState.qName
+		domainName := ev.qName
 		mc.domainMutex.Lock()
 		if _, found := mc.topDomains[domainName]; !found && len(mc.topDomains) >= maxTopDomains {
 			mc.pruneTopDomainsLocked()
@@ -371,44 +516,11 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 	}
 
 	// Update recent queries if enabled, but only if privacy level < 2
-	if ui.config.EnableQueryLog && mc.privacyLevel < 2 {
-		var clientIP string
-		if mc.privacyLevel >= 1 {
-			clientIP = "anonymized"
-		} else if pluginsState.clientAddr != nil {
-			switch pluginsState.clientProto {
-			case "udp":
-				if udpAddr, ok := (*pluginsState.clientAddr).(*net.UDPAddr); ok && udpAddr != nil {
-					clientIP = udpAddr.IP.String()
-				} else {
-					clientIP = "unknown-udp"
-				}
-			case "tcp", "local_doh":
-				if tcpAddr, ok := (*pluginsState.clientAddr).(*net.TCPAddr); ok && tcpAddr != nil {
-					clientIP = tcpAddr.IP.String()
-				} else {
-					clientIP = "unknown-tcp"
-				}
-			default:
-				clientIP = "internal"
-			}
-		} else {
-			clientIP = "no-client-addr"
-		}
-
-		returnCode, ok := PluginsReturnCodeToString[pluginsState.returnCode]
-		if !ok {
-			returnCode = fmt.Sprintf("%d", pluginsState.returnCode)
-		}
-
-		var qType string
-		if msg != nil && len(msg.Question) > 0 {
-			var ok bool
-			qType, ok = dns.TypeToString[dns.RRToType(msg.Question[0])]
-			if !ok {
-				qType = fmt.Sprintf("%d", dns.RRToType(msg.Question[0]))
-			}
-		} else {
+	if ev.logQuery {
+		clientIP := ev.clientIP
+		returnCode := ev.returnCode
+		qType := ev.qType
+		if qType == "" {
 			qType = "unknown"
 		}
 
@@ -416,12 +528,12 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState PluginsState, msg *dns.Msg) {
 			Timestamp: now,
 			ClientIP:  clientIP,
 			// HTML escape only the fields that will be displayed in web UI
-			Domain:       html.EscapeString(pluginsState.qName),
+			Domain:       html.EscapeString(ev.qName),
 			Type:         qType,      // DNS types are safe, no escaping needed
 			ResponseCode: returnCode, // DNS response codes are safe, no escaping needed
 			ResponseTime: responseTime,
-			Server:       html.EscapeString(pluginsState.serverName),
-			CacheHit:     pluginsState.cacheHit,
+			Server:       html.EscapeString(ev.serverName),
+			CacheHit:     ev.cacheHit,
 		}
 
 		mc.queryLogMutex.Lock()
@@ -589,6 +701,23 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# HELP dnscrypt_proxy_memory_usage_bytes Current memory usage in bytes for query logs\n")
 	result.WriteString("# TYPE dnscrypt_proxy_memory_usage_bytes gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_memory_usage_bytes %d\n", memoryUsage))
+
+	// Events discarded because the collector was behind. Non-zero means the
+	// numbers above undercount, which is worth knowing before trusting them.
+	result.WriteString("# HELP dnscrypt_proxy_metric_events_dropped_total Metric events discarded because the collector queue was full\n")
+	result.WriteString("# TYPE dnscrypt_proxy_metric_events_dropped_total counter\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_metric_events_dropped_total %d\n", atomic.LoadUint64(&mc.droppedEvents)))
+
+	// Whether this machine accelerates AES in hardware. The cipher a TLS
+	// connection ends up using follows from it, and on a mixed fleet the answer
+	// differs per host -- which is exactly when it is worth being able to see.
+	aesHW := 0
+	if hasAESGCMHardwareSupport {
+		aesHW = 1
+	}
+	result.WriteString("# HELP dnscrypt_proxy_aes_hardware_support Whether the CPU accelerates AES-GCM, which decides the preferred TLS cipher\n")
+	result.WriteString("# TYPE dnscrypt_proxy_aes_hardware_support gauge\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_aes_hardware_support %d\n", aesHW))
 
 	return result.String()
 }
@@ -1073,7 +1202,7 @@ func (ui *MonitoringUI) handleTestQuery(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Update metrics
-	ui.UpdateMetrics(pluginsState, msg)
+	ui.UpdateMetrics(&pluginsState, msg)
 
 	// Return success
 	w.Header().Set("Content-Type", "text/plain")
