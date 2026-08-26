@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -130,5 +131,46 @@ func TestPeerCollectorAggregatesARealPeer(t *testing.T) {
 	}
 	if got, _ := toFloat(fleet.Totals["cache_hits"]); got != 35 {
 		t.Errorf("cache_hits = %v, want 35", got)
+	}
+}
+
+// A proxy configured not to use the system resolver must still be able to look
+// up the discovery name, which is the whole reason this setting exists.
+func TestPeerDiscoveryUsesTheConfiguredResolver(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	if got := newPeerCollector(ui).resolver(); got != net.DefaultResolver {
+		t.Error("with nothing configured, discovery should use the system resolver")
+	}
+
+	ui.config.PeerDiscoveryResolver = "10.43.0.10"
+	if got := newPeerCollector(ui).resolver(); got == net.DefaultResolver {
+		t.Error("a configured resolver should be used instead of the system one")
+	}
+}
+
+// Static peers need no resolution at all, so they work regardless.
+func TestStaticPeersNeedNoResolver(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.3:8080"}
+
+	addrs := newPeerCollector(ui).peerAddresses()
+	if len(addrs) != 2 {
+		t.Fatalf("peerAddresses() = %v, want the two configured peers", addrs)
+	}
+}
+
+// The same instance listed twice, or discovered twice, is still one instance:
+// counting it twice would inflate every total.
+func TestPeerAddressesAreDeduplicated(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.2:8080", "10.0.0.3:8080"}
+
+	addrs := newPeerCollector(ui).peerAddresses()
+	if len(addrs) != 2 {
+		t.Errorf("peerAddresses() = %v, want duplicates collapsed", addrs)
 	}
 }

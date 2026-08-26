@@ -96,7 +96,7 @@ func (pc *peerCollector) peerAddresses() []string {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), peerFetchTimeout)
 		defer cancel()
-		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
+		addrs, err := pc.resolver().LookupHost(ctx, host)
 		if err != nil {
 			dlog.Debugf("Monitoring peer discovery for [%s] failed: %v", host, err)
 		}
@@ -106,6 +106,30 @@ func (pc *peerCollector) peerAddresses() []string {
 		}
 	}
 	return out
+}
+
+// resolver looks up the discovery name.
+//
+// A proxy is commonly configured not to use the system resolver, since it is
+// the resolver; that leaves it unable to look up a name only a local resolver
+// knows, which is exactly what a discovery name tends to be. Naming one here
+// keeps discovery working without giving the rest of the process a dependency
+// it was configured not to have.
+func (pc *peerCollector) resolver() *net.Resolver {
+	addr := pc.ui.config.PeerDiscoveryResolver
+	if addr == "" {
+		return net.DefaultResolver
+	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		addr = net.JoinHostPort(addr, "53")
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: peerFetchTimeout}
+			return d.DialContext(ctx, network, addr)
+		},
+	}
 }
 
 // listenPort is the port this instance serves on, which peers are assumed to

@@ -1101,6 +1101,12 @@ privacy_level = 1
   # peers = ['10.0.0.2:8080', '10.0.0.3:8080']
   # peer_discovery_dns = 'dnscrypt-proxy-monitoring.dns.svc.cluster.local:8080'
 
+  ## The resolver to look that name up with. A proxy is often configured not to
+  ## use the system resolver -- being the resolver is the point -- which leaves
+  ## it unable to resolve a discovery name only a local resolver knows.
+
+  # peer_discovery_resolver = '10.43.0.10'
+
 
 
 ###############################################################################

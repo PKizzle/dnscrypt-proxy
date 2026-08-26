@@ -41,6 +41,11 @@ type MonitoringUIConfig struct {
 	// answer the request for it.
 	Peers            []string `toml:"peers"`
 	PeerDiscoveryDNS string   `toml:"peer_discovery_dns"` // A name resolving to one address per instance
+	// PeerDiscoveryResolver is the resolver to look that name up with. A proxy
+	// is often configured not to use the system resolver at all -- the whole
+	// point of it being the resolver -- which leaves discovery unable to
+	// resolve a name that only a local resolver knows.
+	PeerDiscoveryResolver string `toml:"peer_discovery_resolver"`
 }
 
 const maxTopDomains = 1000
