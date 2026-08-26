@@ -192,3 +192,60 @@ func TestFleetResultCanBeEncodedAfterBeingStoredInItsOwnInput(t *testing.T) {
 		t.Fatalf("encoding the metrics with the fleet in them failed: %v", err)
 	}
 }
+
+// One instance listening on several addresses is handed back once per address
+// by discovery. Counted once per address, the totals come out a multiple of the
+// truth -- which reads as traffic that never happened.
+func TestOneInstanceReachedByTwoAddressesIsCountedOnce(t *testing.T) {
+	serve := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"instance_id":   "the-same-proxy",
+				"total_queries": float64(33), "cache_hits": float64(30),
+			})
+		}))
+	}
+	v4, v6 := serve(), serve()
+	defer v4.Close()
+	defer v6.Close()
+
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.Peers = []string{v4.Listener.Addr().String(), v6.Listener.Addr().String()}
+	pc := newPeerCollector(ui)
+
+	fleet := pc.Fleet(map[string]any{"total_queries": float64(7), "cache_hits": float64(5)})
+	if got, _ := toFloat(fleet.Totals["total_queries"]); got != 40 {
+		t.Errorf("total_queries = %v, want 40 (7 own + 33 from the one peer)", got)
+	}
+	if len(fleet.Instances) != 2 {
+		t.Fatalf("instances = %d, want 2 (self and the one peer)", len(fleet.Instances))
+	}
+	if aliases := fleet.Instances[1].Aliases; len(aliases) != 1 {
+		t.Errorf("the second address should be recorded as an alias, got %v", aliases)
+	}
+}
+
+// Discovery hands this instance its own addresses along with everyone else's,
+// and it has already counted itself.
+func TestThisInstanceIsNotCountedTwiceWhenDiscoveryReturnsIt(t *testing.T) {
+	me := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"instance_id": instanceID, "total_queries": float64(7),
+		})
+	}))
+	defer me.Close()
+
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.Peers = []string{me.Listener.Addr().String()}
+	pc := newPeerCollector(ui)
+
+	fleet := pc.Fleet(map[string]any{"instance_id": instanceID, "total_queries": float64(7)})
+	if got, _ := toFloat(fleet.Totals["total_queries"]); got != 7 {
+		t.Errorf("total_queries = %v, want 7 -- this instance counted once", got)
+	}
+	if len(fleet.Instances) != 1 {
+		t.Errorf("instances = %d, want 1", len(fleet.Instances))
+	}
+}

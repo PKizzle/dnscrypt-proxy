@@ -33,10 +33,22 @@ const (
 
 // peerMetrics is one instance's answer, or the reason there was not one.
 type peerMetrics struct {
-	Address   string         `json:"address"`
+	Address string `json:"address"`
+	// Aliases are the other addresses that reached this same instance. A name
+	// that resolves to both an A and a AAAA record, or to a service address as
+	// well as a host address, yields one instance under several addresses;
+	// counting it once per address is how totals silently become wrong.
+	Aliases   []string       `json:"aliases,omitempty"`
 	Reachable bool           `json:"reachable"`
 	Error     string         `json:"error,omitempty"`
 	Metrics   map[string]any `json:"metrics,omitempty"`
+}
+
+// instanceOf reports which instance answered, so that the same one arriving by
+// two addresses is recognised. Empty for an instance too old to say.
+func (p peerMetrics) instanceOf() string {
+	id, _ := p.Metrics["instance_id"].(string)
+	return id
 }
 
 // FleetMetrics is what the page is drawn from: the totals, and who contributed.
@@ -181,9 +193,21 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 	fleet.Instances = append(fleet.Instances, peerMetrics{
 		Address: "self", Reachable: true, Metrics: self,
 	})
+	// This instance is already counted, and it answers on every address it
+	// listens on -- including the ones discovery just handed back.
+	byInstance := map[string]int{instanceID: 0}
 	for _, r := range results {
 		if !r.Reachable {
 			fleet.Degraded = true
+			fleet.Instances = append(fleet.Instances, r)
+			continue
+		}
+		if id := r.instanceOf(); id != "" {
+			if at, seen := byInstance[id]; seen {
+				fleet.Instances[at].Aliases = append(fleet.Instances[at].Aliases, r.Address)
+				continue
+			}
+			byInstance[id] = len(fleet.Instances)
 		}
 		fleet.Instances = append(fleet.Instances, r)
 	}
