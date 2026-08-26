@@ -177,3 +177,21 @@ func TestAClientThatAskedOnlyForTheVerdictGetsIt(t *testing.T) {
 		t.Error("the verdict was withheld from a client that set AD")
 	}
 }
+
+// The validator's own fetches carry exactly the records it needs to build a
+// chain. Trimming those leaves it unable to check anything at all: every answer
+// comes back insecure for want of the keys, and nothing says why.
+func TestTheValidatorsOwnFetchesAreNotTrimmed(t *testing.T) {
+	state := PluginsState{
+		clientProto: dnssecInternalProto,
+		sessionData: map[string]any{},
+	}
+	msg := answerWithSignature(t)
+
+	if err := (&PluginDNSSECStrip{}).Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if countRRSIG(msg.Answer) != 1 {
+		t.Error("the validator's own fetch was stripped of the records it needs")
+	}
+}

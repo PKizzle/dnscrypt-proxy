@@ -32,7 +32,9 @@ func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]by
 	// the path a cache hit takes, and the cache holds what upstream sent --
 	// signatures included, and the verdict already recorded in the AD bit by the
 	// validation done when the entry was made.
-	stripDNSSECForClient(pluginsState, synth)
+	if pluginsState.clientProto != dnssecInternalProto {
+		stripDNSSECForClient(pluginsState, synth)
+	}
 	if err := synth.Pack(); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		return nil, err

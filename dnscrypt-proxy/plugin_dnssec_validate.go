@@ -464,6 +464,12 @@ func (plugin *PluginDNSSECStrip) Drop() error         { return nil }
 func (plugin *PluginDNSSECStrip) Reload() error       { return nil }
 
 func (plugin *PluginDNSSECStrip) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	if pluginsState.clientProto == dnssecInternalProto {
+		// The validator's own fetches. These carry exactly the records it needs
+		// to build a chain, and taking them out here leaves it unable to check
+		// anything at all -- every answer insecure, for want of the keys.
+		return nil
+	}
 	stripDNSSECForClient(pluginsState, msg)
 	return nil
 }
