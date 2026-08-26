@@ -256,3 +256,31 @@ func TestBuildChainStillStopsAtAGenuinelyUnsignedDelegation(t *testing.T) {
 		t.Error("an unsigned delegation was handed keys to verify with")
 	}
 }
+
+// RFC 4035 section 5.3.1: a signature is only evidence about a record if the
+// zone that signed it is the zone that contains the record. Without that check,
+// a signature naming any zone the attacker controls would be accepted for any
+// name, since that zone's own chain to the root verifies perfectly well.
+func TestWithinZoneRejectsASignerThatDoesNotContainTheName(t *testing.T) {
+	for _, tc := range []struct {
+		name, zone string
+		want       bool
+	}{
+		{"www.example.test.", "example.test.", true},
+		{"example.test.", "example.test.", true},
+		{"www.example.test.", ".", true},
+		{"deep.sub.example.test.", "example.test.", true},
+		// The case a plain suffix test gets wrong.
+		{"notexample.test.", "example.test.", false},
+		{"example.test.evil.test.", "example.test.", false},
+		{"example.test.", "www.example.test.", false},
+		{"attacker.test.", "example.test.", false},
+		// Case must not matter; the wrong answer here is a missed match.
+		{"WWW.Example.Test.", "example.test.", true},
+		{"www.example.test", "example.test", true},
+	} {
+		if got := WithinZone(tc.name, tc.zone); got != tc.want {
+			t.Errorf("WithinZone(%q, %q) = %v, want %v", tc.name, tc.zone, got, tc.want)
+		}
+	}
+}

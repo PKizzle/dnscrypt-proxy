@@ -281,37 +281,70 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	return worst, worstErr
 }
 
-// judgeSet checks one RRset against the zone that owns it. chain is the chain
-// already built for the name that was asked, reused when the set belongs to
-// that same zone so the common answer costs no extra fetches.
+// judgeSet checks one RRset against the zone that signed it.
+//
+// The signer is taken from the signature rather than found by probing for a
+// delegation at each ancestor of the name. RFC 4035 section 5.3.1 names the
+// RRSIG's signer field as the zone whose keys are to be used, subject to that
+// zone actually containing the RRset -- without which any zone could offer to
+// vouch for any name. Probing instead asks the parent about names that are not
+// delegations at all, and depends on it returning a proof that says so; the
+// signer field states the same thing directly and is signed.
 func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
-	keys, zone := chain.Keys, chain.Zone
-	if !dnssec.WithinZone(set.Name, chain.Zone) {
-		owner := dnssec.BuildChain(plugin.fetcher, set.Name, plugin.anchors, now)
+	if len(set.Sigs) == 0 {
+		// Nothing claims to have signed this. Whether that is a forgery or an
+		// ordinary unsigned answer depends on whether the zone holding the name
+		// signs at all, which is what the walk to the name decides.
+		owner := plugin.chainFor(set.Name, chain, now)
 		switch owner.Status {
 		case dnssec.Secure:
-			keys, zone = owner.Keys, owner.Zone
+			return dnssec.Bogus, fmt.Errorf("%s is signed, but its %s record for %s is not",
+				owner.Zone, dns.TypeToString[set.Type], set.Name)
 		case dnssec.Insecure:
-			// The name this answer led to lives in an unsigned zone. That is
-			// not a fault in the answer; it only means the answer as a whole
-			// cannot be called authentic.
 			return dnssec.Insecure, nil
 		default:
 			return dnssec.Indeterminate, owner.Why
 		}
 	}
 
-	res, err := dnssec.VerifyRRSet(set.Records, set.Sigs, keys, now)
-	if res == dnssec.Secure {
-		return dnssec.Secure, nil
+	var lastErr error
+	for _, sig := range set.Sigs {
+		// A signature naming a zone that does not contain the record it covers
+		// is not evidence about that record, whoever signed it.
+		if !dnssec.WithinZone(set.Name, sig.SignerName) {
+			lastErr = fmt.Errorf("%s does not lie within %s, which signed for it", set.Name, sig.SignerName)
+			continue
+		}
+		signer := plugin.chainFor(sig.SignerName, chain, now)
+		switch signer.Status {
+		case dnssec.Secure:
+		case dnssec.Insecure:
+			// The zone that signed is not itself vouched for by its parent, so
+			// the signature proves nothing about authenticity.
+			return dnssec.Insecure, nil
+		default:
+			return dnssec.Indeterminate, signer.Why
+		}
+		res, err := dnssec.VerifyRRSet(set.Records, []*dns.RRSIG{sig}, signer.Keys, now)
+		if res == dnssec.Secure {
+			return dnssec.Secure, nil
+		}
+		lastErr = err
 	}
-	if err == dnssec.ErrNoSignature {
-		// A signed zone that answers without a signature is the case this
-		// exists to catch: an unsigned answer for a name whose zone signs.
-		return dnssec.Bogus, fmt.Errorf("%s is signed, but its %s record for %s is not",
-			zone, dns.TypeToString[set.Type], set.Name)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no signature over %s could be checked", set.Name)
 	}
-	return res, err
+	return dnssec.Bogus, lastErr
+}
+
+// chainFor returns the chain to zone, reusing the one already built for the
+// name that was asked when it is the same zone. The fetcher caches, so the
+// difference is a map lookup rather than a query either way.
+func (plugin *PluginDNSSECValidate) chainFor(zone string, chain dnssec.ChainResult, now time.Time) dnssec.ChainResult {
+	if chain.Status == dnssec.Secure && dnssec.WithinZone(zone, chain.Zone) && dnssec.WithinZone(chain.Zone, zone) {
+		return chain
+	}
+	return dnssec.BuildChain(plugin.fetcher, zone, plugin.anchors, now)
 }
 
 // PluginDNSSECRequest asks upstream for the signatures the validator needs.
