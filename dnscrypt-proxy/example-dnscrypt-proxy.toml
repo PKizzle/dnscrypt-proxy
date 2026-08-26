@@ -213,6 +213,35 @@ keepalive = 30
 # enable_hot_reload = false
 
 
+##################################
+#      DNSSEC validation         #
+##################################
+
+## Check answers against the signatures their zone published, instead of
+## trusting the resolver that relayed them.
+##
+## `require_dnssec` above only picks upstream resolvers that promise to
+## validate; it does not check anything locally. This does, and it is the
+## difference that matters when the resolver on the other end is the problem.
+##
+## mode:
+##   off      - do nothing (default)
+##   log      - judge every answer and report, but serve it either way
+##   enforce  - refuse an answer whose signatures do not hold up (SERVFAIL)
+##
+## Run in `log` first and read what it says about the traffic you actually
+## have. Enforcing a validator that has never run is how a resolver goes dark.
+##
+## insecure_zones names zones to exempt, for one whose signing is known to be
+## broken. Each entry covers everything at or below it, on label boundaries.
+
+[dnssec_validation]
+
+  mode = 'off'
+
+  # insecure_zones = ['broken-zone.example.']
+
+
 ###############################################################################
 #                                Logging                                       #
 ###############################################################################

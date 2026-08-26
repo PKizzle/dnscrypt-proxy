@@ -135,6 +135,11 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	}
 
 	responsePlugins := &[]Plugin{}
+	// First, and so before the cache: an answer is judged once on the way in,
+	// on what upstream actually sent, rather than on every hit afterwards.
+	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
+		*responsePlugins = append(*responsePlugins, Plugin(new(PluginDNSSECValidate)))
+	}
 	if len(proxy.nxLogFile) != 0 {
 		*responsePlugins = append(*responsePlugins, Plugin(new(PluginNxLog)))
 	}

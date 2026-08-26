@@ -30,6 +30,8 @@ type Proxy struct {
 	localDoHListeners        []*net.TCPListener
 	queryMeta                []string
 	enableHotReload          bool
+	dnssecValidationMode     string
+	dnssecInsecureZones      []string
 	udpListeners             []*net.UDPConn
 	sources                  []*Source
 	tcpListeners             []*net.TCPListener

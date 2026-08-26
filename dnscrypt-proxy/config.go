@@ -22,34 +22,48 @@ const (
 	DefaultNetprobeAddress = "9.9.9.9:53"
 )
 
+// DNSSECValidationConfig controls whether answers are checked against the
+// signatures the zone published.
+type DNSSECValidationConfig struct {
+	// Mode is "off", "log" or "enforce". Enforcing a validator that has never
+	// run is how a resolver goes dark, so the useful order is log first, read
+	// what it says about the traffic that is actually seen, then enforce.
+	Mode string `toml:"mode"`
+	// InsecureZones are treated as unsigned however the chain reads them, for
+	// a zone whose signing is known to be broken. Each entry disables the
+	// protection for everything at or below it.
+	InsecureZones []string `toml:"insecure_zones"`
+}
+
 type Config struct {
-	LogLevel                 int                `toml:"log_level"`
-	LogFile                  *string            `toml:"log_file"`
-	LogFileLatest            bool               `toml:"log_file_latest"`
-	UseSyslog                bool               `toml:"use_syslog"`
-	ServerNames              []string           `toml:"server_names"`
-	DisabledServerNames      []string           `toml:"disabled_server_names"`
-	ListenAddresses          []string           `toml:"listen_addresses"`
-	LocalDoH                 LocalDoHConfig     `toml:"local_doh"`
-	MonitoringUI             MonitoringUIConfig `toml:"monitoring_ui"`
-	UserName                 string             `toml:"user_name"`
-	ForceTCP                 bool               `toml:"force_tcp"`
-	HTTP3                    bool               `toml:"http3"`
-	HTTP3Probe               bool               `toml:"http3_probe"`
-	Timeout                  int                `toml:"timeout"`
-	KeepAlive                int                `toml:"keepalive"`
-	Proxy                    string             `toml:"proxy"`
-	CertRefreshConcurrency   int                `toml:"cert_refresh_concurrency"`
-	CertRefreshDelay         int                `toml:"cert_refresh_delay"`
-	CertIgnoreTimestamp      bool               `toml:"cert_ignore_timestamp"`
-	PQDNSCrypt               bool               `toml:"pqdnscrypt"`
-	EphemeralKeys            bool               `toml:"dnscrypt_ephemeral_keys"`
-	LBStrategy               string             `toml:"lb_strategy"`
-	LBEstimator              bool               `toml:"lb_estimator"`
-	BlockIPv6                bool               `toml:"block_ipv6"`
-	BlockUnqualified         bool               `toml:"block_unqualified"`
-	BlockUndelegated         bool               `toml:"block_undelegated"`
-	EnableHotReload          bool               `toml:"enable_hot_reload"`
+	LogLevel                 int                    `toml:"log_level"`
+	LogFile                  *string                `toml:"log_file"`
+	LogFileLatest            bool                   `toml:"log_file_latest"`
+	UseSyslog                bool                   `toml:"use_syslog"`
+	ServerNames              []string               `toml:"server_names"`
+	DisabledServerNames      []string               `toml:"disabled_server_names"`
+	ListenAddresses          []string               `toml:"listen_addresses"`
+	LocalDoH                 LocalDoHConfig         `toml:"local_doh"`
+	MonitoringUI             MonitoringUIConfig     `toml:"monitoring_ui"`
+	UserName                 string                 `toml:"user_name"`
+	ForceTCP                 bool                   `toml:"force_tcp"`
+	HTTP3                    bool                   `toml:"http3"`
+	HTTP3Probe               bool                   `toml:"http3_probe"`
+	Timeout                  int                    `toml:"timeout"`
+	KeepAlive                int                    `toml:"keepalive"`
+	Proxy                    string                 `toml:"proxy"`
+	CertRefreshConcurrency   int                    `toml:"cert_refresh_concurrency"`
+	CertRefreshDelay         int                    `toml:"cert_refresh_delay"`
+	CertIgnoreTimestamp      bool                   `toml:"cert_ignore_timestamp"`
+	PQDNSCrypt               bool                   `toml:"pqdnscrypt"`
+	EphemeralKeys            bool                   `toml:"dnscrypt_ephemeral_keys"`
+	LBStrategy               string                 `toml:"lb_strategy"`
+	LBEstimator              bool                   `toml:"lb_estimator"`
+	BlockIPv6                bool                   `toml:"block_ipv6"`
+	BlockUnqualified         bool                   `toml:"block_unqualified"`
+	BlockUndelegated         bool                   `toml:"block_undelegated"`
+	EnableHotReload          bool                   `toml:"enable_hot_reload"`
+	DNSSECValidation         DNSSECValidationConfig `toml:"dnssec_validation"`
 	Cache                    bool
 	CacheSize                int                         `toml:"cache_size"`
 	CacheNegTTL              uint32                      `toml:"cache_neg_ttl"`
@@ -113,10 +127,11 @@ type Config struct {
 
 func newConfig() Config {
 	return Config{
-		LogLevel:        int(dlog.LogLevel()),
-		LogFileLatest:   true,
-		ListenAddresses: []string{"127.0.0.1:53"},
-		LocalDoH:        LocalDoHConfig{Path: "/dns-query"},
+		DNSSECValidation: DNSSECValidationConfig{Mode: "off"},
+		LogLevel:         int(dlog.LogLevel()),
+		LogFileLatest:    true,
+		ListenAddresses:  []string{"127.0.0.1:53"},
+		LocalDoH:         LocalDoHConfig{Path: "/dns-query"},
 		MonitoringUI: MonitoringUIConfig{
 			Enabled:        false,
 			ListenAddress:  "127.0.0.1:8080",
@@ -380,6 +395,8 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	proxy.userName = config.UserName
 	proxy.child = *flags.Child
 	proxy.enableHotReload = config.EnableHotReload
+	proxy.dnssecValidationMode = config.DNSSECValidation.Mode
+	proxy.dnssecInsecureZones = config.DNSSECValidation.InsecureZones
 	proxy.xTransport = NewXTransport()
 
 	// Configure logging
