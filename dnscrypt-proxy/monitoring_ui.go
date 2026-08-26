@@ -91,6 +91,11 @@ type MetricsCollector struct {
 	cachedMetrics   map[string]any
 	cacheLastUpdate time.Time
 	cacheTTL        time.Duration
+	// dataVersion counts the changes the counters have seen. Computing a set of
+	// metrics takes long enough for a query to be recorded while it happens, and
+	// storing that set afterwards would otherwise put back numbers taken before
+	// the change and keep them for a whole TTL.
+	dataVersion atomic.Uint64
 
 	// Prometheus metrics (optional)
 	prometheusEnabled bool
@@ -960,6 +965,7 @@ func (mc *MetricsCollector) collectSourceRefresh() []map[string]any {
 
 // invalidateCache - Marks the cache as stale (call when data changes)
 func (mc *MetricsCollector) invalidateCache() {
+	mc.dataVersion.Add(1)
 	mc.cacheMutex.Lock()
 	mc.cacheLastUpdate = time.Time{} // Zero time to force refresh
 	mc.cacheMutex.Unlock()
@@ -975,6 +981,10 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		return cached
 	}
 	mc.cacheMutex.RUnlock()
+
+	// Read before the counters, so that any change made while they are read and
+	// the rest is computed is seen as a change when the result is stored.
+	version := mc.dataVersion.Load()
 
 	// Read basic counters first
 	mc.countersMutex.RLock()
@@ -1151,12 +1161,17 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		"resolver_health":    resolverHealth,
 		"sources":            sourceRefresh,
 		"generated_at":       generatedAt,
+		"instance_id":        instanceID,
 	}
 
-	// Cache the computed metrics
+	// Cache the computed metrics, unless a query was recorded while they were
+	// being computed: they no longer describe the counters, and storing them
+	// would discard that change rather than merely miss it.
 	mc.cacheMutex.Lock()
-	mc.cachedMetrics = metrics
-	mc.cacheLastUpdate = generatedAt
+	if mc.dataVersion.Load() == version {
+		mc.cachedMetrics = metrics
+		mc.cacheLastUpdate = generatedAt
+	}
 	mc.cacheMutex.Unlock()
 
 	return metrics
