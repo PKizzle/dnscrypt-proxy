@@ -156,6 +156,28 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		return Indeterminate, fmt.Errorf("no delegation signer to anchor against")
 	}
 
+	// Whether the parent published a delegation signer this build can compute at
+	// all. RFC 4035 section 5.2 treats a delegation whose digests are all
+	// unknown as unsigned rather than forged: refusing it would take zones off
+	// the air as digest types turn over, which is the opposite of what
+	// validating is for.
+	//
+	// Deliberately independent of whether any key matches. A key the parent
+	// never delegated is forged, and must stay refused -- that is the case this
+	// whole function exists for.
+	checkable := false
+	for _, ds := range dss {
+		for _, key := range keys {
+			if key.ToDS(ds.DigestType) != nil {
+				checkable = true
+				break
+			}
+		}
+		if checkable {
+			break
+		}
+	}
+
 	anchored := make([]*dns.DNSKEY, 0, len(keys))
 	for _, key := range keys {
 		for _, ds := range dss {
@@ -164,8 +186,8 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 			}
 			computed := key.ToDS(ds.DigestType)
 			if computed == nil {
-				// A digest algorithm this build cannot compute is not a
-				// mismatch; it simply proves nothing.
+				// A digest this build cannot compute is not a mismatch; it
+				// simply proves nothing.
 				continue
 			}
 			if equalFold(computed.Digest, ds.Digest) {
@@ -175,6 +197,9 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		}
 	}
 	if len(anchored) == 0 {
+		if !checkable {
+			return Insecure, fmt.Errorf("no delegation signer this build can check")
+		}
 		return Bogus, fmt.Errorf("no offered key matches the delegation signer")
 	}
 

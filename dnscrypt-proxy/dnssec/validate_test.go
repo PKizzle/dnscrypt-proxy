@@ -228,3 +228,35 @@ func TestSplitSignatures(t *testing.T) {
 		t.Fatalf("SplitSignatures() = %d records, %d sigs; want 1 and 1", len(records), len(sigs))
 	}
 }
+
+// A zone signed with an algorithm this build cannot check is unsigned as far as
+// this validator is concerned, not forged. Refusing it would take zones off the
+// air as signing algorithms turn over -- and enforcement would do exactly that.
+func TestDelegationThisBuildCannotCheckIsInsecureNotBogus(t *testing.T) {
+	z := newZone(t, "example.test.")
+	// A digest type no build computes, so nothing about this delegation can be
+	// established either way.
+	ds := z.key.ToDS(dns.SHA256)
+	ds.DigestType = 99
+
+	res, err := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, nil, []*dns.DS{ds}, time.Now())
+	if res == Bogus {
+		t.Fatalf("an uncheckable delegation was refused as forged: %v", err)
+	}
+	if res != Insecure {
+		t.Errorf("result = %v, want Insecure", res)
+	}
+}
+
+// A delegation that CAN be checked and does not match is still forged, and must
+// stay refused: treating the uncheckable case as unsigned must not soften this.
+func TestCheckableDelegationThatDoesNotMatchIsStillBogus(t *testing.T) {
+	z := newZone(t, "example.test.")
+	ds := z.key.ToDS(dns.SHA256)
+	ds.Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	res, _ := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, nil, []*dns.DS{ds}, time.Now())
+	if res != Bogus {
+		t.Errorf("result = %v, want Bogus -- a checkable mismatch is still forged", res)
+	}
+}
