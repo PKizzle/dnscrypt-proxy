@@ -120,6 +120,11 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	if len(proxy.cloakFile) != 0 {
 		*queryPlugins = append(*queryPlugins, Plugin(new(PluginCloak)))
 	}
+	// Before the payload-size plugin, which reads the DO bit and reinstates it:
+	// setting it here both survives and gets the larger budget signatures need.
+	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
+		*queryPlugins = append(*queryPlugins, Plugin(new(PluginDNSSECRequest)))
+	}
 	*queryPlugins = append(*queryPlugins, Plugin(new(PluginGetSetPayloadSize)))
 	if proxy.cache {
 		*queryPlugins = append(*queryPlugins, Plugin(new(PluginCache)))

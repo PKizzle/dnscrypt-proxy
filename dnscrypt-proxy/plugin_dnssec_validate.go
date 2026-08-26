@@ -201,12 +201,14 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// Secure answers are marked as such; anything else is served without a
 		// claim either way, which is what an unsigned zone deserves.
 		msg.AuthenticatedData = result == dnssec.Secure
+		plugin.stripIfUnwanted(pluginsState, msg)
 		return nil
 	}
 
 	if plugin.mode == ValidationLog {
 		dlog.Warnf("DNSSEC would refuse [%s]: %v", qName, why)
 		msg.AuthenticatedData = false
+		plugin.stripIfUnwanted(pluginsState, msg)
 		return nil
 	}
 	dlog.Warnf("DNSSEC refused [%s]: %v", qName, why)
@@ -262,4 +264,84 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		return dnssec.Bogus, fmt.Errorf("%s is signed, but this answer is not", chain.Zone)
 	}
 	return res, err
+}
+
+// PluginDNSSECRequest asks upstream for the signatures the validator needs.
+//
+// A client that does not set DO gets an answer with no signatures in it, and an
+// answer with no signatures cannot be checked -- so the validator would report
+// every signed zone as unsigned, which is exactly what it did before this
+// existed. The bit is therefore set on the way out regardless of what the
+// client asked for.
+//
+// What the client asked for is remembered, because it decides what comes back:
+// a client that did not ask for DNSSEC records should not receive them, only
+// the verdict, as the AD bit.
+type PluginDNSSECRequest struct{}
+
+func (plugin *PluginDNSSECRequest) Name() string { return "dnssec_request" }
+
+func (plugin *PluginDNSSECRequest) Description() string {
+	return "Request DNSSEC records so answers can be verified"
+}
+
+func (plugin *PluginDNSSECRequest) Init(_ *Proxy) error { return nil }
+func (plugin *PluginDNSSECRequest) Drop() error         { return nil }
+func (plugin *PluginDNSSECRequest) Reload() error       { return nil }
+
+func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	if pluginsState.clientProto == dnssecInternalProto {
+		// Already asks for signatures, and must not be recorded as a client
+		// that wanted them.
+		return nil
+	}
+	pluginsState.sessionData[dnssecClientWantedKey] = msg.Security
+	msg.Security = true
+	if msg.UDPSize == 0 || msg.UDPSize < 1232 {
+		// Signatures do not fit in 512 bytes. Without room for them the answer
+		// comes back truncated and there is nothing to verify.
+		msg.UDPSize = 1232
+	}
+	return nil
+}
+
+// dnssecClientWantedKey records whether the client asked for DNSSEC records.
+const dnssecClientWantedKey = "dnssec_client_wanted"
+
+// stripDNSSECRecords removes the records only the validator needed, for a
+// client that did not ask to see them.
+func stripDNSSECRecords(msg *dns.Msg) {
+	msg.Answer = withoutDNSSEC(msg.Answer)
+	msg.Ns = withoutDNSSEC(msg.Ns)
+	msg.Extra = withoutDNSSEC(msg.Extra)
+}
+
+func withoutDNSSEC(rrs []dns.RR) []dns.RR {
+	if len(rrs) == 0 {
+		return rrs
+	}
+	kept := rrs[:0]
+	for _, rr := range rrs {
+		switch dns.RRToType(rr) {
+		case dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeDS:
+			continue
+		}
+		kept = append(kept, rr)
+	}
+	return kept
+}
+
+// stripIfUnwanted removes the DNSSEC records from an answer when the client did
+// not ask for them.
+//
+// The validator sets the DO bit on every query so that there is something to
+// verify. Passing what comes back straight through would hand records to
+// clients that never requested them and, on UDP, inflate answers that used to
+// fit. The verdict still reaches them, as the AD bit.
+func (plugin *PluginDNSSECValidate) stripIfUnwanted(pluginsState *PluginsState, msg *dns.Msg) {
+	wanted, ok := pluginsState.sessionData[dnssecClientWantedKey].(bool)
+	if ok && wanted {
+		return
+	}
+	stripDNSSECRecords(msg)
 }
