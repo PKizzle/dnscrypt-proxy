@@ -8,6 +8,7 @@ package dnssec
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -248,4 +249,57 @@ func SplitSignatures(rrs []dns.RR) (records []dns.RR, sigs []*dns.RRSIG) {
 		records = append(records, rr)
 	}
 	return records, sigs
+}
+
+// RRSet is a group of records that share an owner, class and type, together
+// with the signatures offered for them. A signature covers exactly one of
+// these, which is why an answer has to be taken apart before it can be checked.
+type RRSet struct {
+	Name    string
+	Type    uint16
+	Records []dns.RR
+	Sigs    []*dns.RRSIG
+}
+
+// GroupRRSets splits a message section into the sets a signature can cover.
+//
+// A section is not one RRset, and treating it as one is not a near-enough
+// approximation: a CNAME chain answers with the alias and the records it leads
+// to, each owned by a different name and often signed by a different zone. No
+// single signature covers all of that, so the whole answer reads as carrying no
+// signature at all -- indistinguishable, from the outside, from a zone that
+// signs nothing.
+func GroupRRSets(rrs []dns.RR) []RRSet {
+	var sigs []*dns.RRSIG
+	var sets []RRSet
+	at := map[string]int{}
+
+	for _, rr := range rrs {
+		if sig, ok := rr.(*dns.RRSIG); ok {
+			sigs = append(sigs, sig)
+			continue
+		}
+		h := rr.Header()
+		rrtype := dns.RRToType(rr)
+		// Owner names are compared without case, so a set is not split in two
+		// by an upstream that varies the case it answers in.
+		key := fmt.Sprintf("%s/%d/%d", strings.ToLower(h.Name), h.Class, rrtype)
+		if i, seen := at[key]; seen {
+			sets[i].Records = append(sets[i].Records, rr)
+			continue
+		}
+		at[key] = len(sets)
+		sets = append(sets, RRSet{Name: h.Name, Type: rrtype, Records: []dns.RR{rr}})
+	}
+
+	for i := range sets {
+		for _, sig := range sigs {
+			if sig.TypeCovered == sets[i].Type &&
+				dns.EqualName(sig.Header().Name, sets[i].Name) &&
+				sig.Header().Class == sets[i].Records[0].Header().Class {
+				sets[i].Sigs = append(sets[i].Sigs, sig)
+			}
+		}
+	}
+	return sets
 }

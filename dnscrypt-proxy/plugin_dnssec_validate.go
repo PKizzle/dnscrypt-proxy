@@ -236,7 +236,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		return dnssec.Indeterminate, chain.Why
 	}
 
-	records, sigs := dnssec.SplitSignatures(msg.Answer)
+	records, _ := dnssec.SplitSignatures(msg.Answer)
 	if len(records) == 0 {
 		// Nothing was answered: the zone should have proved why.
 		denial := dnssec.CollectDenial(msg.Ns)
@@ -256,14 +256,60 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		return dnssec.Bogus, fmt.Errorf("no proof that %s holds no record of this type", qName)
 	}
 
-	res, err := dnssec.VerifyRRSet(records, sigs, chain.Keys, time.Now())
+	// Each set is checked on its own, against a chain for the zone that owns it.
+	// An answer following a CNAME leaves the zone that was asked -- the alias is
+	// signed by one zone and what it points at by another, and the target's zone
+	// may not be signed at all. One verdict over the whole answer cannot express
+	// that, and one set of keys cannot check it.
+	now := time.Now()
+	worst := dnssec.Secure
+	var worstErr error
+	for _, set := range dnssec.GroupRRSets(msg.Answer) {
+		res, err := plugin.judgeSet(set, chain, now)
+		switch res {
+		case dnssec.Bogus:
+			// A forged set is not redeemed by a genuine one beside it.
+			return res, err
+		case dnssec.Indeterminate:
+			worst, worstErr = res, err
+		case dnssec.Insecure:
+			if worst != dnssec.Indeterminate {
+				worst, worstErr = res, err
+			}
+		}
+	}
+	return worst, worstErr
+}
+
+// judgeSet checks one RRset against the zone that owns it. chain is the chain
+// already built for the name that was asked, reused when the set belongs to
+// that same zone so the common answer costs no extra fetches.
+func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
+	keys, zone := chain.Keys, chain.Zone
+	if !dnssec.WithinZone(set.Name, chain.Zone) {
+		owner := dnssec.BuildChain(plugin.fetcher, set.Name, plugin.anchors, now)
+		switch owner.Status {
+		case dnssec.Secure:
+			keys, zone = owner.Keys, owner.Zone
+		case dnssec.Insecure:
+			// The name this answer led to lives in an unsigned zone. That is
+			// not a fault in the answer; it only means the answer as a whole
+			// cannot be called authentic.
+			return dnssec.Insecure, nil
+		default:
+			return dnssec.Indeterminate, owner.Why
+		}
+	}
+
+	res, err := dnssec.VerifyRRSet(set.Records, set.Sigs, keys, now)
 	if res == dnssec.Secure {
 		return dnssec.Secure, nil
 	}
 	if err == dnssec.ErrNoSignature {
 		// A signed zone that answers without a signature is the case this
 		// exists to catch: an unsigned answer for a name whose zone signs.
-		return dnssec.Bogus, fmt.Errorf("%s is signed, but this answer is not", chain.Zone)
+		return dnssec.Bogus, fmt.Errorf("%s is signed, but its %s record for %s is not",
+			zone, dns.TypeToString[set.Type], set.Name)
 	}
 	return res, err
 }

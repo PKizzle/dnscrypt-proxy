@@ -260,3 +260,77 @@ func TestCheckableDelegationThatDoesNotMatchIsStillBogus(t *testing.T) {
 		t.Errorf("result = %v, want Bogus -- a checkable mismatch is still forged", res)
 	}
 }
+
+func cnameRecord(name, target string) dns.RR {
+	return &dns.CNAME{
+		Hdr:   dns.Header{Name: name, Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: target},
+	}
+}
+
+// The answer to a CNAME is two RRsets: the alias, and what it points at. No
+// single signature covers both, so checking the answer as one set finds nothing
+// that covers it -- which is indistinguishable from an answer carrying no
+// signature at all, and would be refused under enforcement.
+func TestGroupRRSetsSeparatesACNAMEChain(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+
+	alias := []dns.RR{cnameRecord("www.example.test.", "host.example.test.")}
+	target := []dns.RR{aRecord("host.example.test.", "192.0.2.1")}
+	aliasSig := z.sign(alias, now.Add(-time.Hour), now.Add(time.Hour))
+	targetSig := z.sign(target, now.Add(-time.Hour), now.Add(time.Hour))
+
+	answer := []dns.RR{alias[0], aliasSig, target[0], targetSig}
+
+	// The whole answer as one set: no signature covers it.
+	all, sigs := SplitSignatures(answer)
+	if res, err := VerifyRRSet(all, sigs, []*dns.DNSKEY{z.key}, now); res == Secure {
+		t.Fatal("a mixed answer verified as one set; this test no longer covers the bug")
+	} else if err != ErrNoSignature {
+		t.Logf("mixed set failed with %v (still not Secure, which is the point)", err)
+	}
+
+	// Taken apart, each set carries its own signature and verifies.
+	sets := GroupRRSets(answer)
+	if len(sets) != 2 {
+		t.Fatalf("groups = %d, want 2 (the alias and its target)", len(sets))
+	}
+	for _, set := range sets {
+		res, err := VerifyRRSet(set.Records, set.Sigs, []*dns.DNSKEY{z.key}, now)
+		if res != Secure {
+			t.Errorf("%s %s: result = %v (%v), want Secure",
+				set.Name, dns.TypeToString[set.Type], res, err)
+		}
+	}
+}
+
+// Grouping must not become a way to smuggle records past verification: a set
+// with no signature of its own still has none after the answer is split up.
+func TestGroupRRSetsDoesNotInventSignatures(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+
+	signed := []dns.RR{aRecord("host.example.test.", "192.0.2.1")}
+	sig := z.sign(signed, now.Add(-time.Hour), now.Add(time.Hour))
+	// Injected alongside a legitimately signed set, carrying nothing of its own.
+	unsigned := aRecord("evil.example.test.", "203.0.113.1")
+
+	sets := GroupRRSets([]dns.RR{signed[0], sig, unsigned})
+	var checked bool
+	for _, set := range sets {
+		if set.Name != "evil.example.test." {
+			continue
+		}
+		checked = true
+		if len(set.Sigs) != 0 {
+			t.Errorf("an unsigned set was handed %d signature(s)", len(set.Sigs))
+		}
+		if res, _ := VerifyRRSet(set.Records, set.Sigs, []*dns.DNSKEY{z.key}, now); res == Secure {
+			t.Error("an unsigned set verified as secure")
+		}
+	}
+	if !checked {
+		t.Fatal("the injected set was not grouped at all")
+	}
+}

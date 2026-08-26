@@ -143,3 +143,17 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	}
 	return current
 }
+
+// WithinZone reports whether name is the zone itself or sits below it.
+//
+// The comparison is on whole labels. A suffix test alone would place
+// "notexample.com" inside "example.com" and hand it that zone's keys, which is
+// how a name the zone never delegated gets checked as though it had.
+func WithinZone(name, zone string) bool {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	zone = strings.ToLower(strings.TrimSuffix(zone, "."))
+	if zone == "" || name == zone {
+		return true
+	}
+	return strings.HasSuffix(name, "."+zone)
+}
