@@ -45,6 +45,7 @@ type keyEntry struct {
 type dsEntry struct {
 	dss     []*dns.DS
 	sigs    []*dns.RRSIG
+	denial  Denial
 	expires time.Time
 }
 
@@ -113,30 +114,30 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 // chain reads as an unsigned delegation. NXDOMAIN is deliberately not treated
 // that way: a name that does not exist is not a zone that is merely unsigned,
 // and reporting it as one would turn a typo into a silent downgrade.
-func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, error) {
+func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	zone = canonicalName(zone)
 
 	f.mu.Lock()
 	if e, ok := f.dss[zone]; ok && f.now().Before(e.expires) {
-		dss, sigs := e.dss, e.sigs
+		dss, sigs, denial := e.dss, e.sigs, e.denial
 		f.mu.Unlock()
-		return dss, sigs, nil
+		return dss, sigs, denial, nil
 	}
 	f.mu.Unlock()
 
 	msg, err := f.Query(zone, dns.TypeDS)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, Denial{}, err
 	}
 	if msg == nil {
-		return nil, nil, fmt.Errorf("no response for DS %s", zone)
+		return nil, nil, Denial{}, fmt.Errorf("no response for DS %s", zone)
 	}
 	switch msg.Rcode {
 	case dns.RcodeSuccess:
 	case dns.RcodeNameError:
-		return nil, nil, fmt.Errorf("DS %s: the name does not exist", zone)
+		return nil, nil, Denial{}, fmt.Errorf("DS %s: the name does not exist", zone)
 	default:
-		return nil, nil, fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode)
+		return nil, nil, Denial{}, fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode)
 	}
 
 	var dss []*dns.DS
@@ -154,13 +155,18 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, error) {
 	// delegation is the common case, and re-asking for every name below it
 	// would cost more than the signed path does.
 	records := msg.Answer
+	denial := Denial{}
 	if len(dss) == 0 {
 		records = msg.Ns
+		// Held with the absence it explains: it is what says whether there is a
+		// delegation here at all, and re-deriving it per name below this one
+		// would cost a query each time.
+		denial = CollectDenial(msg.Ns)
 	}
 	f.mu.Lock()
-	f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, expires: f.now().Add(ttlOf(records))}
+	f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, denial: denial, expires: f.now().Add(ttlOf(records))}
 	f.mu.Unlock()
-	return dss, sigs, nil
+	return dss, sigs, denial, nil
 }
 
 // Forget drops everything cached, for a reload.

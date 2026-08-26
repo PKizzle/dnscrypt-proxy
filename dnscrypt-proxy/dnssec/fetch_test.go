@@ -93,7 +93,7 @@ func TestFetcherReportsAnAbsentDelegationSignerAsEmpty(t *testing.T) {
 	}}
 	f := NewCachingFetcher(rec.fn)
 
-	dss, _, err := f.DS("unsigned.test.")
+	dss, _, _, err := f.DS("unsigned.test.")
 	if err != nil {
 		t.Fatalf("DS() = %v, want no error", err)
 	}
@@ -110,7 +110,7 @@ func TestFetcherDistinguishesNoSuchNameFromNoSigner(t *testing.T) {
 	}}
 	f := NewCachingFetcher(rec.fn)
 
-	if _, _, err := f.DS("nope.test."); err == nil {
+	if _, _, _, err := f.DS("nope.test."); err == nil {
 		t.Error("DS() for a nonexistent name should be an error, not an unsigned delegation")
 	}
 }
@@ -124,7 +124,7 @@ func TestFetcherPropagatesFailure(t *testing.T) {
 	if _, _, err := f.DNSKEY("example.test."); err == nil {
 		t.Error("DNSKEY() should report an upstream failure rather than an empty key set")
 	}
-	if _, _, err := f.DS("example.test."); err == nil {
+	if _, _, _, err := f.DS("example.test."); err == nil {
 		t.Error("DS() should report an upstream failure")
 	}
 }
@@ -200,7 +200,7 @@ func TestFetcherDrivesAChainWalk(t *testing.T) {
 			}
 			return msgWith(dns.RcodeSuccess, answer, nil), nil
 		case dns.TypeDS:
-			dss, sigs, err := h.DS(canonicalName(qname))
+			dss, sigs, _, err := h.DS(canonicalName(qname))
 			if err != nil {
 				return msgWith(dns.RcodeNameError, nil, nil), nil
 			}

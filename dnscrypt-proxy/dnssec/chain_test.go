@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 )
 
 // hierarchy is a signed tree built for a test: each zone has a key, each child
@@ -19,6 +20,9 @@ type hierarchy struct {
 	// broken zones have a DS whose signature does not verify.
 	brokenDS map[string]bool
 	now      time.Time
+	// Names that are not zone cuts at all: the parent publishes no DS because
+	// there is nothing delegated there.
+	notACut map[string]bool
 }
 
 func newHierarchy(t *testing.T, names ...string) *hierarchy {
@@ -26,7 +30,8 @@ func newHierarchy(t *testing.T, names ...string) *hierarchy {
 	h := &hierarchy{
 		t: t, zones: map[string]*zone{},
 		unsigned: map[string]bool{}, brokenDS: map[string]bool{},
-		now: time.Now(),
+		notACut: map[string]bool{},
+		now:     time.Now(),
 	}
 	for _, n := range names {
 		h.zones[n] = newZone(t, n)
@@ -52,17 +57,31 @@ func (h *hierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error)
 	return keys, []*dns.RRSIG{sig}, nil
 }
 
-func (h *hierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, error) {
+// nsecProving builds the denial a parent offers in place of a DS: the types
+// present at that name decide whether there is a delegation there at all.
+func nsecProving(name string, types ...uint16) Denial {
+	return Denial{NSEC: []*dns.NSEC{{
+		Hdr:  dns.Header{Name: name, Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "\\000." + name, TypeBitMap: types},
+	}}}
+}
+
+func (h *hierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if h.notACut[zoneName] {
+		// A name inside its parent: records, but nothing delegated.
+		return nil, nil, nsecProving(zoneName, dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC), nil
+	}
 	if h.unsigned[zoneName] {
-		return nil, nil, nil
+		// A real delegation the parent does not sign for.
+		return nil, nil, nsecProving(zoneName, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC), nil
 	}
 	z, ok := h.zones[zoneName]
 	if !ok {
-		return nil, nil, fmt.Errorf("no such zone %s", zoneName)
+		return nil, nil, Denial{}, fmt.Errorf("no such zone %s", zoneName)
 	}
 	parent, ok := h.zones[h.parentOf(zoneName)]
 	if !ok {
-		return nil, nil, fmt.Errorf("no parent for %s", zoneName)
+		return nil, nil, Denial{}, fmt.Errorf("no parent for %s", zoneName)
 	}
 	ds := z.key.ToDS(dns.SHA256)
 	ds.Hdr.Name = zoneName
@@ -73,7 +92,7 @@ func (h *hierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, error) {
 		signer = z
 	}
 	sig := signer.sign([]dns.RR{ds}, h.now.Add(-time.Hour), h.now.Add(time.Hour))
-	return []*dns.DS{ds}, []*dns.RRSIG{sig}, nil
+	return []*dns.DS{ds}, []*dns.RRSIG{sig}, Denial{}, nil
 }
 
 // anchors returns trust anchors for this hierarchy's root, standing in for the
@@ -198,5 +217,42 @@ func TestRootAnchorsAreWellFormed(t *testing.T) {
 	}
 	if !seen[20326] {
 		t.Error("KSK-2017 (tag 20326) is missing")
+	}
+}
+
+// Most names are not zone cuts. "www.example.test." is a record inside
+// "example.test.", and its parent publishes no delegation signer for it because
+// nothing is delegated there. Reading that absence as an unsigned delegation
+// stops the walk one zone too deep and leaves the name unvalidated -- which is
+// nearly every name anyone actually looks up.
+func TestBuildChainStopsAtTheZoneThatOwnsTheName(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	h.notACut["www.example.test."] = true
+
+	res := BuildChain(h, "www.example.test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("BuildChain() = %v (%v), want secure", res.Status, res.Why)
+	}
+	if res.Zone != "example.test." {
+		t.Errorf("zone = %q, want example.test. -- the zone that signs the name", res.Zone)
+	}
+	if len(res.Keys) == 0 {
+		t.Error("no keys returned, so nothing below the zone could be verified")
+	}
+}
+
+// The other reading of a missing delegation signer must survive: a delegation
+// that genuinely exists and is genuinely unsigned is still insecure, and must
+// not be handed its parent's keys.
+func TestBuildChainStillStopsAtAGenuinelyUnsignedDelegation(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	h.unsigned["example.test."] = true
+
+	res := BuildChain(h, "www.example.test.", h.anchors(), h.now)
+	if res.Status != Insecure {
+		t.Fatalf("BuildChain() = %v (%v), want insecure", res.Status, res.Why)
+	}
+	if len(res.Keys) != 0 {
+		t.Error("an unsigned delegation was handed keys to verify with")
 	}
 }

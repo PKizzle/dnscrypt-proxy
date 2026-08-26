@@ -40,9 +40,11 @@ type Fetcher interface {
 	// DNSKEY returns the key set of zone, with the signatures over it.
 	DNSKEY(zone string) (keys []*dns.DNSKEY, sigs []*dns.RRSIG, err error)
 	// DS returns the delegation signers the PARENT of zone publishes for it,
-	// with the signatures over them. No records and no error means the parent
-	// published none -- a delegation to an unsigned zone.
-	DS(zone string) (dss []*dns.DS, sigs []*dns.RRSIG, err error)
+	// with the signatures over them and whatever the parent offered in place of
+	// them. No records and no error does NOT by itself mean an unsigned
+	// delegation: most names are not zone cuts at all, and the denial is what
+	// tells the two apart.
+	DS(zone string) (dss []*dns.DS, sigs []*dns.RRSIG, denial Denial, err error)
 }
 
 // ChainResult is what walking the chain established about a zone.
@@ -107,17 +109,44 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
 
 	for _, child := range zones[1:] {
-		dss, dsSigs, err := f.DS(child)
+		dss, dsSigs, denial, err := f.DS(child)
 		if err != nil {
 			return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch DS for %s: %w", child, err)}
 		}
 		if len(dss) == 0 {
-			// The parent delegates without signing for the child. Everything at
-			// or below here is outside DNSSEC's reach.
-			current.Status = Insecure
-			current.Keys = nil
-			current.Why = fmt.Errorf("%s is delegated without a signer", child)
-			return current
+			// No delegation signer has two very different meanings, and reading
+			// the wrong one costs either coverage or correctness.
+			//
+			// Most names are not zone cuts: "www.example.com" is a record
+			// inside "example.com", and its parent publishes no DS for it
+			// because there is nothing there to delegate. Calling that an
+			// unsigned delegation stops the walk one zone too deep and leaves
+			// every such name unvalidated -- which is nearly every name that
+			// matters.
+			//
+			// A delegation that genuinely exists and is genuinely unsigned is
+			// the other meaning, and the parent says which by whether it proves
+			// an NS at that name.
+			switch {
+			case denial.ProvesNoDS(child):
+				current.Status = Insecure
+				current.Keys = nil
+				current.Why = fmt.Errorf("%s is delegated without a signer", child)
+				return current
+			case denial.Empty():
+				// Nothing was offered to tell the two apart. Descending on the
+				// parent's keys would refuse a genuinely unsigned zone for
+				// carrying no signature, so this stays where it was.
+				current.Status = Insecure
+				current.Keys = nil
+				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
+				return current
+			default:
+				// Proven not to be a delegation, so the name lives inside the
+				// zone reached so far and that zone's keys are the ones that
+				// sign it.
+				return current
+			}
 		}
 
 		// The DS set is the parent's data, so the parent's keys must sign it.
