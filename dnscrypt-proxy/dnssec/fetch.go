@@ -162,6 +162,14 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 		// delegation here at all, and re-deriving it per name below this one
 		// would cost a query each time.
 		denial = CollectDenial(msg.Ns)
+		if denial.Empty() {
+			// An absence nothing accounts for is not a fact worth keeping. A
+			// response that lost its authority section on the way back looks
+			// exactly like an unsigned delegation, and caching that reading
+			// would hold every name under this zone unvalidated until the entry
+			// expired -- long after the answer that caused it was gone.
+			return dss, sigs, denial, nil
+		}
 	}
 	f.mu.Lock()
 	f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, denial: denial, expires: f.now().Add(ttlOf(records))}

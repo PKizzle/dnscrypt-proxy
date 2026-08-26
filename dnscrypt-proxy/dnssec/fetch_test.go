@@ -224,3 +224,25 @@ func TestFetcherDrivesAChainWalk(t *testing.T) {
 		t.Errorf("zone = %q, want example.test.", res.Zone)
 	}
 }
+
+// A delegation signer that is absent with nothing to account for the absence is
+// not a fact: a response that lost its authority section looks identical to an
+// unsigned delegation, and remembering that reading holds every name under the
+// zone unvalidated long after the response that caused it is gone.
+func TestFetcherDoesNotCacheAnAbsenceNothingAccountsFor(t *testing.T) {
+	calls := 0
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		calls++
+		return msgWith(dns.RcodeSuccess, nil, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	for i := 0; i < 3; i++ {
+		if _, _, _, err := f.DS("unproven.test."); err != nil {
+			t.Fatalf("DS() = %v, want no error", err)
+		}
+	}
+	if calls != 3 {
+		t.Errorf("upstream asked %d time(s), want 3 -- an unproven absence was cached", calls)
+	}
+}
