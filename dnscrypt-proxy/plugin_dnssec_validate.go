@@ -195,6 +195,15 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		dnssecVerdicts.secure.Add(1)
 	case dnssec.Bogus:
 		dnssecVerdicts.bogus.Add(1)
+	case dnssec.Indeterminate:
+		dnssecVerdicts.unknown.Add(1)
+		// Distinct from an unsigned zone, and worth saying so: the answer was
+		// served unvalidated because something in the way of checking it did
+		// not work -- a chain that could not be fetched, a key set that did not
+		// arrive. An unsigned zone is a fact about the zone and stays quiet;
+		// this is a fault on this side and would otherwise be invisible, since
+		// both reach the client the same way.
+		dlog.Debugf("DNSSEC could not check [%s]: %v", qName, why)
 	default:
 		dnssecVerdicts.unknown.Add(1)
 	}
