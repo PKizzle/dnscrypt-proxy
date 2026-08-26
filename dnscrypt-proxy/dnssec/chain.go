@@ -141,10 +141,19 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				current.Keys = nil
 				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
 				return current
+			case denial.ProvesNotADelegation(child):
+				// Shown to be an ordinary name inside the zone reached so far,
+				// so that zone's keys are the ones that sign it.
+				return current
 			default:
-				// Proven not to be a delegation, so the name lives inside the
-				// zone reached so far and that zone's keys are the ones that
-				// sign it.
+				// The parent offered something, but nothing that settles which
+				// of the two this is. Carrying on would hand its keys to what
+				// may be a child zone and then refuse that zone's unsigned
+				// answers as forged -- which is what a reverse-DNS delegation
+				// under an opt-out span looks like from here.
+				current.Status = Insecure
+				current.Keys = nil
+				current.Why = fmt.Errorf("%s: nothing shown either way about a delegation there", child)
 				return current
 			}
 		}

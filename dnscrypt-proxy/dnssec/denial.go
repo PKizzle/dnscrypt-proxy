@@ -414,3 +414,39 @@ func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
 	}
 	return false
 }
+
+// ProvesNotADelegation reports whether the zone showed that name is an ordinary
+// name inside it rather than a delegation to a child zone.
+//
+// The distinction decides whether a missing delegation signer means "there is
+// nothing delegated here" or "there is a child zone and its parent does not
+// sign for it", and only the first allows the walk to carry on using this
+// zone's keys. Positive proof is required: an NSEC or NSEC3 matching the name
+// itself, without NS in its type bitmap. Anything less -- a proof for another
+// name, an opt-out span, hashing this build declines to do -- establishes
+// nothing, and treating that as "not a delegation" would hand the parent's keys
+// to a child zone and refuse its unsigned answers as forged.
+func (d Denial) ProvesNotADelegation(name string) bool {
+	for _, rr := range d.NSEC {
+		if canonicalCompare(rr.Header().Name, name) != 0 {
+			continue
+		}
+		// SOA marks a zone apex, which this name would not be if it were merely
+		// a name inside the zone above.
+		if coversType(rr.TypeBitMap, dns.TypeNS) || coversType(rr.TypeBitMap, dns.TypeSOA) {
+			return false
+		}
+		return true
+	}
+	for _, rr := range d.NSEC3 {
+		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
+		if hashed == "" || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
+			continue
+		}
+		if coversType(rr.TypeBitMap, dns.TypeNS) || coversType(rr.TypeBitMap, dns.TypeSOA) {
+			return false
+		}
+		return true
+	}
+	return false
+}

@@ -23,6 +23,8 @@ type hierarchy struct {
 	// Names that are not zone cuts at all: the parent publishes no DS because
 	// there is nothing delegated there.
 	notACut map[string]bool
+	// Names whose parent offers a denial that settles nothing either way.
+	unproven map[string]bool
 }
 
 func newHierarchy(t *testing.T, names ...string) *hierarchy {
@@ -30,8 +32,8 @@ func newHierarchy(t *testing.T, names ...string) *hierarchy {
 	h := &hierarchy{
 		t: t, zones: map[string]*zone{},
 		unsigned: map[string]bool{}, brokenDS: map[string]bool{},
-		notACut: map[string]bool{},
-		now:     time.Now(),
+		notACut: map[string]bool{}, unproven: map[string]bool{},
+		now: time.Now(),
 	}
 	for _, n := range names {
 		h.zones[n] = newZone(t, n)
@@ -67,6 +69,11 @@ func nsecProving(name string, types ...uint16) Denial {
 }
 
 func (h *hierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if h.unproven[zoneName] {
+		// Something came back, but nothing that settles whether anything is
+		// delegated here -- an opt-out span, or a proof about another name.
+		return nil, nil, nsecProving("other."+zoneName, dns.TypeA), nil
+	}
 	if h.notACut[zoneName] {
 		// A name inside its parent: records, but nothing delegated.
 		return nil, nil, nsecProving(zoneName, dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC), nil
@@ -282,5 +289,26 @@ func TestWithinZoneRejectsASignerThatDoesNotContainTheName(t *testing.T) {
 		if got := WithinZone(tc.name, tc.zone); got != tc.want {
 			t.Errorf("WithinZone(%q, %q) = %v, want %v", tc.name, tc.zone, got, tc.want)
 		}
+	}
+}
+
+// A parent that offers something, but nothing that settles whether a name is a
+// delegation, has established nothing. Reading that as "not a delegation" hands
+// the parent's keys to what may be a child zone, and then refuses that zone's
+// unsigned answers as forged -- which is what a reverse-DNS delegation sitting
+// under an NSEC3 opt-out span looks like from here.
+func TestBuildChainWillNotGuessWhenTheParentSettlesNothing(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	h.unproven["sub.example.test."] = true
+
+	res := BuildChain(h, "sub.example.test.", h.anchors(), h.now)
+	if res.Status == Secure {
+		t.Fatal("the walk carried on into a name nothing was shown about")
+	}
+	if res.Status != Insecure {
+		t.Errorf("status = %v, want insecure", res.Status)
+	}
+	if len(res.Keys) != 0 {
+		t.Error("keys were handed to a name that may belong to another zone")
 	}
 }
