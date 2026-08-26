@@ -24,7 +24,6 @@ require (
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.3.0
 	github.com/lifenjoiner/dhcpdns v0.0.7
-	github.com/miekg/dns v1.1.73
 	github.com/powerman/check v1.13.0
 	github.com/quic-go/quic-go v0.61.0
 	golang.org/x/crypto v0.55.0
@@ -43,3 +42,10 @@ require (
 	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 )
+
+// crypto/rsa refuses public exponents above 2^31-1 (golang/go#3161), so a
+// DNSKEY using a larger one -- the F5 exponent 2^32+1 that BIND's dnssec-keygen
+// offers, still in use in signed zones -- cannot be verified by any Go DNS
+// library. The fork adds a verification path for those keys and changes nothing
+// for the keys crypto/rsa already accepts.
+replace codeberg.org/miekg/dns => github.com/PKizzle/dns v0.0.0-20260826195542-aa9351af91aa

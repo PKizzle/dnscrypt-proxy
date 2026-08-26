@@ -366,14 +366,25 @@ func (rr *RRSIG) Verify(k *DNSKEY, rrset []RR, options *SignOption) error {
 
 	switch rr.Algorithm {
 	case RSASHA1, RSASHA1NSEC3SHA1, RSASHA256, RSASHA512:
-		pubkey := k.publicKeyRSA()
-		if pubkey == nil {
-			return ErrKey
-		}
-
 		h = hash.New()
 		h.Write(signeddata)
-		return rsa.VerifyPKCS1v15(pubkey, hash, h.Sum(nil), sigbuf)
+		hashed := h.Sum(nil)
+
+		pubkey := k.publicKeyRSA()
+		if pubkey == nil {
+			// A key crypto/rsa cannot represent, which for DNSSEC means an
+			// exponent above 2^31-1: signed zones carry them because BIND
+			// offered the next Fermat number for -e. Verifying with a public
+			// key needs only a modular exponentiation, which math/big does at
+			// any size.
+			n, e := k.publicKeyRSABig()
+			if n == nil {
+				return ErrKey
+			}
+			return verifyPKCS1v15Big(n, e, hash, hashed, sigbuf)
+		}
+
+		return rsa.VerifyPKCS1v15(pubkey, hash, hashed, sigbuf)
 
 	case ECDSAP256SHA256, ECDSAP384SHA384:
 		pubkey := k.publicKeyECDSA()
