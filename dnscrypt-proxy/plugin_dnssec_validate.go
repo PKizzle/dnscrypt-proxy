@@ -221,24 +221,27 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 
 // judge decides what an answer is worth.
 func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Result, error) {
-	chain := dnssec.BuildChain(plugin.fetcher, qName, plugin.anchors, time.Now())
-	switch chain.Status {
-	case dnssec.Secure:
-	case dnssec.Insecure:
-		// The zone is unsigned, so there is nothing to check. Whether the
-		// delegation saying so was itself genuine is what the denial proofs
-		// decide, and that is checked where the delegation is read.
-		return dnssec.Insecure, nil
-	default:
-		// A chain that could not be built is not evidence that an answer is
-		// forged. Refusing here would take the resolver down whenever the path
-		// to the root is unreachable.
-		return dnssec.Indeterminate, chain.Why
-	}
-
+	now := time.Now()
 	records, _ := dnssec.SplitSignatures(msg.Answer)
+
 	if len(records) == 0 {
-		// Nothing was answered: the zone should have proved why.
+		// Nothing was answered, so there is no signature to follow back to a
+		// zone and the walk to the name is the only way to learn whether the
+		// absence had to be proved.
+		chain := dnssec.BuildChain(plugin.fetcher, qName, plugin.anchors, now)
+		switch chain.Status {
+		case dnssec.Secure:
+		case dnssec.Insecure:
+			// The zone is unsigned, so there is nothing to check. Whether the
+			// delegation saying so was itself genuine is what the denial proofs
+			// decide, and that is checked where the delegation is read.
+			return dnssec.Insecure, nil
+		default:
+			// A chain that could not be built is not evidence that an answer is
+			// forged. Refusing here would take the resolver down whenever the
+			// path to the root is unreachable.
+			return dnssec.Indeterminate, chain.Why
+		}
 		denial := dnssec.CollectDenial(msg.Ns)
 		if denial.Empty() {
 			return dnssec.Bogus, fmt.Errorf("a signed zone answered nothing and proved nothing")
@@ -256,12 +259,17 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		return dnssec.Bogus, fmt.Errorf("no proof that %s holds no record of this type", qName)
 	}
 
-	// Each set is checked on its own, against a chain for the zone that owns it.
-	// An answer following a CNAME leaves the zone that was asked -- the alias is
-	// signed by one zone and what it points at by another, and the target's zone
-	// may not be signed at all. One verdict over the whole answer cannot express
-	// that, and one set of keys cannot check it.
-	now := time.Now()
+	// Each set is checked on its own, against a chain for the zone that signed
+	// it. Deliberately not gated on a chain to the name that was asked: that
+	// name is usually not a zone cut, so the walk to it stops at whatever the
+	// parent is willing to say about a name it does not delegate -- which
+	// decided nothing about the signatures actually on the answer, and threw
+	// away perfectly good ones whenever the parent said little.
+	//
+	// An answer following a CNAME leaves the zone that was asked in any case:
+	// the alias is signed by one zone and what it points at by another, and the
+	// target's zone may not be signed at all.
+	var chain dnssec.ChainResult
 	worst := dnssec.Secure
 	var worstErr error
 	for _, set := range dnssec.GroupRRSets(msg.Answer) {
