@@ -246,3 +246,42 @@ func TestFetcherDoesNotCacheAnAbsenceNothingAccountsFor(t *testing.T) {
 		t.Errorf("upstream asked %d time(s), want 3 -- an unproven absence was cached", calls)
 	}
 }
+
+// One lost packet should not cost a zone its validation: a dropped fetch means
+// nothing can be concluded, which for a signed zone removes the protection from
+// every name beneath it.
+func TestFetcherRetriesADroppedFetch(t *testing.T) {
+	calls := 0
+	rec := &recordingQuery{respond: func(name string, qtype uint16) (*dns.Msg, error) {
+		calls++
+		if calls == 1 {
+			return nil, fmt.Errorf("packet lost")
+		}
+		return msgWith(dns.RcodeSuccess, nil, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, _, err := f.DS("example.test."); err != nil {
+		t.Fatalf("DS() = %v, want the retry to have succeeded", err)
+	}
+	if calls != 2 {
+		t.Errorf("upstream asked %d time(s), want 2 (one lost, one retried)", calls)
+	}
+}
+
+// Retrying forever would turn an upstream that is simply down into a hang.
+func TestFetcherGivesUpAfterTheRetries(t *testing.T) {
+	calls := 0
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		calls++
+		return nil, fmt.Errorf("upstream unreachable")
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, _, err := f.DS("example.test."); err == nil {
+		t.Error("DS() should report a failure that never resolved")
+	}
+	if calls != chainFetchAttempts {
+		t.Errorf("upstream asked %d time(s), want %d", calls, chainFetchAttempts)
+	}
+}

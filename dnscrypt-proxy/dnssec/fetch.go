@@ -58,6 +58,33 @@ func NewCachingFetcher(query QueryFunc) *CachingFetcher {
 	}
 }
 
+// chainFetchAttempts is how many times a key or delegation signer is asked for
+// before the chain is given up on.
+//
+// One lost packet should not cost a zone its validation. The answer to a
+// dropped fetch is that nothing can be concluded, which for a zone that signs
+// means it is served unvalidated -- so a single drop anywhere along the walk
+// silently removes the protection for every name beneath it, for as long as
+// the answer stays cached elsewhere.
+const chainFetchAttempts = 3
+
+// ask sends a query, retrying a failure or an empty reply.
+func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
+	var lastErr error
+	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+		msg, err := f.Query(zone, qtype)
+		if err == nil && msg != nil {
+			return msg, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("no response for %s/%d", zone, qtype)
+		}
+	}
+	return nil, lastErr
+}
+
 func (f *CachingFetcher) now() time.Time {
 	if f.Now != nil {
 		return f.Now()
@@ -77,7 +104,7 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 	}
 	f.mu.Unlock()
 
-	msg, err := f.Query(zone, dns.TypeDNSKEY)
+	msg, err := f.ask(zone, dns.TypeDNSKEY)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -125,7 +152,7 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	}
 	f.mu.Unlock()
 
-	msg, err := f.Query(zone, dns.TypeDS)
+	msg, err := f.ask(zone, dns.TypeDS)
 	if err != nil {
 		return nil, nil, Denial{}, err
 	}

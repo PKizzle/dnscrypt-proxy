@@ -7,6 +7,7 @@
 package dnssec
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -348,6 +349,13 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 	}
 	if lastErr == nil {
 		return Indeterminate, nil, ErrNoSignature
+	}
+	// RFC 6840 section 5.2: a key this build cannot use proves nothing either
+	// way, and a zone must not be refused for being signed in a way this
+	// validator cannot follow -- which is what refusing here would come to as
+	// algorithms turn over.
+	if errors.Is(lastErr, dns.ErrKey) {
+		return Insecure, nil, lastErr
 	}
 	return Bogus, nil, lastErr
 }

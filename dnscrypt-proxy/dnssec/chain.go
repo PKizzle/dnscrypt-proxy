@@ -166,6 +166,9 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 			return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch keys for %s: %w", child, err)}
 		}
 		if res, err := VerifyDNSKEYs(childKeys, childSigs, dss, now); res != Secure {
+			// A key set that cannot be used stops the walk without condemning
+			// the zone: everything at or below is served unvalidated, which is
+			// what an unsigned zone gets and what RFC 6840 section 5.2 asks for.
 			return ChainResult{Status: res, Zone: child, Why: fmt.Errorf("key set for %s: %w", child, err)}
 		}
 		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
