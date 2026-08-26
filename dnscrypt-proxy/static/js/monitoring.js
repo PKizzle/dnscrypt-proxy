@@ -118,6 +118,30 @@ function safeUpdateDashboard(data) {
         }
 
         // Update cache stats with null checks
+        // DNSSEC summary. The share is of answers that could be judged at all --
+        // counting unsigned zones in the denominator would report a resolver
+        // that validates everything it can as mostly failing.
+        const dnssec = data.dnssec || {};
+        const secure = dnssec.secure || 0;
+        const bogus = dnssec.bogus || 0;
+        const indeterminate = dnssec.indeterminate || 0;
+        updateElementText('dnssec-mode', dnssec.mode || 'off');
+        updateElementText('dnssec-secure', secure.toLocaleString());
+        updateElementText('dnssec-insecure', (dnssec.insecure || 0).toLocaleString());
+        updateElementText('dnssec-indeterminate', indeterminate.toLocaleString());
+        updateElementText('dnssec-bogus', bogus.toLocaleString());
+        const checkable = secure + bogus + indeterminate;
+        updateElementText('dnssec-verified-share',
+            checkable > 0 ? (secure / checkable * 100).toFixed(1) + '% verified' : 'nothing to check yet');
+        const bogusEl = document.getElementById('dnssec-bogus');
+        if (bogusEl) {
+            bogusEl.className = bogus > 0 ? 'dnssec-bogus' : '';
+        }
+        const indetEl = document.getElementById('dnssec-indeterminate');
+        if (indetEl) {
+            indetEl.className = indeterminate > 0 ? 'dnssec-indeterminate' : '';
+        }
+
         const cacheHitRatio = data.cache_hit_ratio !== undefined ? data.cache_hit_ratio : 0;
         const cacheHits = data.cache_hits !== undefined ? data.cache_hits : 0;
         const cacheMisses = data.cache_misses !== undefined ? data.cache_misses : 0;
@@ -245,7 +269,16 @@ function safeUpdateDashboard(data) {
                 row.insertCell(3).textContent = query.client_ip || '-';
                 row.insertCell(4).textContent = query.server || '-';
                 row.insertCell(5).textContent = query.response_code || '-';
-                row.insertCell(6).textContent = formatMilliseconds(query.response_time);
+                const dnssecCell = row.insertCell(6);
+                const verdict = describeDnssec(query.dnssec_verdict);
+                dnssecCell.textContent = verdict.icon;
+                dnssecCell.className = verdict.className;
+                // The reason is why a name will not resolve under enforce, so it
+                // belongs where someone looking at the row will find it.
+                dnssecCell.title = query.dnssec_reason
+                    ? verdict.label + ': ' + query.dnssec_reason
+                    : verdict.label;
+                row.insertCell(7).textContent = formatMilliseconds(query.response_time);
             });
         }
 
@@ -548,3 +581,25 @@ function initializeDashboard() {
 initializeDashboard();
 
 setInterval(pollMetrics, 5000);
+
+
+// describeDnssec turns a verdict into what the table shows for it.
+//
+// The four are deliberately distinct. "Unsigned" is a fact about the zone and
+// the ordinary case for most of the internet; "unchecked" is this resolver
+// failing to check and is the one worth chasing; "failed" is the only one that
+// costs anyone an answer, and only while the mode is enforce.
+function describeDnssec(verdict) {
+    switch (verdict) {
+        case 'secure':
+            return { icon: '\u{1F512}', label: 'Verified', className: 'dnssec-secure' };
+        case 'insecure':
+            return { icon: '\u{1F513}', label: 'Unsigned zone', className: 'dnssec-insecure' };
+        case 'indeterminate':
+            return { icon: '\u2753', label: 'Could not be checked', className: 'dnssec-indeterminate' };
+        case 'bogus':
+            return { icon: '\u26A0', label: 'Signature did not hold up', className: 'dnssec-bogus' };
+        default:
+            return { icon: '\u2013', label: 'Validation is switched off', className: '' };
+    }
+}

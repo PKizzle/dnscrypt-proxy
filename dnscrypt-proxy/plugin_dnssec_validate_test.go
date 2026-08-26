@@ -195,3 +195,59 @@ func TestTheValidatorsOwnFetchesAreNotTrimmed(t *testing.T) {
 		t.Error("the validator's own fetch was stripped of the records it needs")
 	}
 }
+
+// The verdict has to reach whatever reports on the query. On the wire there is
+// room for it as one bit; someone looking at a dashboard to find out why a name
+// will not resolve needs the sentence that goes with it.
+func TestTheVerdictAndItsReasonReachTheQueryLog(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.EnableQueryLog = true
+
+	state := PluginsState{
+		qName:      "example.test.",
+		serverName: "test-server",
+		returnCode: PluginsReturnCodePass,
+		sessionData: map[string]any{
+			dnssecVerdictKey: "bogus",
+			dnssecReasonKey:  "example.test. is signed, but this answer is not",
+		},
+	}
+	msg := dns.NewMsg("example.test.", dns.TypeA)
+	if msg == nil {
+		t.Fatal("cannot build a message")
+	}
+
+	ui.UpdateMetrics(&state, msg)
+	ui.Flush()
+
+	metrics := ui.metricsCollector.GetMetrics()
+	recent, _ := metrics["recent_queries"].([]QueryLogEntry)
+	if len(recent) == 0 {
+		t.Fatal("the query was not recorded at all")
+	}
+	last := recent[len(recent)-1]
+	if last.DNSSECVerdict != "bogus" {
+		t.Errorf("verdict = %q, want bogus", last.DNSSECVerdict)
+	}
+	if last.DNSSECReason == "" {
+		t.Error("the reason was dropped, so the page can only say that something failed")
+	}
+}
+
+// The summary the page draws from must separate the four, since three of them
+// mean entirely different things about who is at fault.
+func TestTheMetricsCarryEachVerdictSeparately(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	summary, ok := ui.metricsCollector.GetMetrics()["dnssec"].(map[string]any)
+	if !ok {
+		t.Fatal("the page has no DNSSEC figures to draw")
+	}
+	for _, key := range []string{"secure", "bogus", "insecure", "indeterminate", "mode"} {
+		if _, present := summary[key]; !present {
+			t.Errorf("%q is missing from the summary", key)
+		}
+	}
+}

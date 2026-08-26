@@ -116,6 +116,14 @@
                 padding: 6px 10px;
             }
         }
+        /* DNSSEC verdicts. Colour carries emphasis, not meaning: the icon and
+           the tooltip say what happened, for anyone who cannot tell these
+           apart. */
+        .dnssec-secure { color: #2e7d32; }
+        .dnssec-insecure { color: #757575; }
+        .dnssec-indeterminate { color: #ef6c00; font-weight: 600; }
+        .dnssec-bogus { color: #c62828; font-weight: 700; }
+        #queries-table td:nth-child(7) { text-align: center; font-size: 1.1em; cursor: help; }
     </style>
 </head>
 <body>
@@ -176,6 +184,33 @@
                 <div class="stat">
                     <span class="stat-label">Avg Response Time:</span>
                     <span id="avg-response-time">-</span>
+                </div>
+            </div>
+            <div class="card">
+                <h2 id="dnssec">DNSSEC</h2>
+                <div class="stat">
+                    <span class="stat-label">Mode:</span>
+                    <span id="dnssec-mode">-</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label" title="Signed, and the signatures held up">&#128274; Verified:</span>
+                    <span id="dnssec-secure">-</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label" title="The zone publishes no signatures, so there was nothing to check">&#128275; Unsigned:</span>
+                    <span id="dnssec-insecure">-</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label" title="Could not be checked: keys that did not arrive, a chain that could not be walked. Served unvalidated">&#10067; Unchecked:</span>
+                    <span id="dnssec-indeterminate">-</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label" title="Signatures that did not hold up. Refused outright in enforce mode">&#9888; Failed:</span>
+                    <span id="dnssec-bogus">-</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Of those checkable:</span>
+                    <span id="dnssec-verified-share">-</span>
                 </div>
             </div>
             <div class="card">
@@ -287,6 +322,7 @@
                         <th>Client</th>
                         <th>Server</th>
                         <th>Response</th>
+                        <th title="DNSSEC verdict for this answer">DNSSEC</th>
                         <th>Time (ms)</th>
                     </tr>
                 </thead>

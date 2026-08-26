@@ -64,6 +64,13 @@ type PluginDNSSECValidate struct {
 // dnssecVerdicts counts what validation concluded, so that the decision to move
 // from logging refusals to making them can rest on how often a refusal would
 // have happened rather than on how quiet the log looked.
+// dnssecMode is what the validator does with a refusal, for anything reporting
+// on it: "log" records what it would have refused and serves the answer anyway,
+// which reads identically to "enforce" unless it is said out loud.
+var dnssecMode atomic.Value
+
+func init() { dnssecMode.Store("off") }
+
 var dnssecVerdicts struct {
 	secure atomic.Uint64
 	bogus  atomic.Uint64
@@ -90,6 +97,7 @@ func (plugin *PluginDNSSECValidate) Init(proxy *Proxy) error {
 		return err
 	}
 	plugin.mode = mode
+	dnssecMode.Store(modeName(mode))
 	plugin.anchors = dnssec.RootAnchors
 
 	for _, zone := range proxy.dnssecInsecureZones {
@@ -195,6 +203,11 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	}
 
 	result, why := plugin.judge(msg, qName)
+
+	pluginsState.sessionData[dnssecVerdictKey] = verdictName(result)
+	if why != nil && result != dnssec.Secure {
+		pluginsState.sessionData[dnssecReasonKey] = why.Error()
+	}
 
 	switch result {
 	case dnssec.Secure:
@@ -425,6 +438,41 @@ const dnssecClientWantedKey = "dnssec_client_wanted"
 
 // dnssecClientAskedADKey records whether the client asked for the verdict alone.
 const dnssecClientAskedADKey = "dnssec_client_asked_ad"
+
+// dnssecVerdictKey and dnssecReasonKey carry what validation concluded about an
+// answer, and why, to whatever reports on the query afterwards. The wire has
+// room for the verdict alone, as one bit; anyone looking at a dashboard to find
+// out why a name will not resolve needs the sentence.
+const (
+	dnssecVerdictKey = "dnssec_verdict"
+	dnssecReasonKey  = "dnssec_reason"
+)
+
+// modeName is how the mode is written for a reader.
+func modeName(mode ValidationMode) string {
+	switch mode {
+	case ValidationEnforce:
+		return "enforce"
+	case ValidationLog:
+		return "log"
+	default:
+		return "off"
+	}
+}
+
+// verdictName is how a verdict is written for a reader.
+func verdictName(result dnssec.Result) string {
+	switch result {
+	case dnssec.Secure:
+		return "secure"
+	case dnssec.Bogus:
+		return "bogus"
+	case dnssec.Insecure:
+		return "insecure"
+	default:
+		return "indeterminate"
+	}
+}
 
 // stripDNSSECRecords removes the records only the validator needed, for a
 // client that did not ask to see them.

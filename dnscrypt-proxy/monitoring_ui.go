@@ -114,6 +114,10 @@ type QueryLogEntry struct {
 	ResponseTime int64     `json:"response_time"`
 	Server       string    `json:"server"`
 	CacheHit     bool      `json:"cache_hit"`
+	// DNSSECVerdict is empty when validation is switched off, which is not the
+	// same as an answer nothing was concluded about.
+	DNSSECVerdict string `json:"dnssec_verdict,omitempty"`
+	DNSSECReason  string `json:"dnssec_reason,omitempty"`
 }
 
 // EstimateMemoryUsage estimates the memory usage of a QueryLogEntry in bytes
@@ -347,10 +351,14 @@ type metricEvent struct {
 	clientIP     string
 	returnCode   string
 	responseTime int64
-	cacheHit     bool
-	countCache   bool
-	blocked      bool
-	logQuery     bool
+	// dnssecVerdict is empty when validation is off, which is not the same as
+	// an answer nothing could be concluded about.
+	dnssecVerdict string
+	dnssecReason  string
+	cacheHit      bool
+	countCache    bool
+	blocked       bool
+	logQuery      bool
 	// done, when set, is closed once this event has been applied. It carries no
 	// measurement: it is how a caller waits for everything queued before it.
 	done chan struct{}
@@ -386,6 +394,12 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 		blocked: pluginsState.returnCode == PluginsReturnCodeReject ||
 			pluginsState.returnCode == PluginsReturnCodeDrop,
 		logQuery: ui.config.EnableQueryLog && mc.privacyLevel < 2,
+	}
+	if verdict, ok := pluginsState.sessionData[dnssecVerdictKey].(string); ok {
+		ev.dnssecVerdict = verdict
+		if reason, ok := pluginsState.sessionData[dnssecReasonKey].(string); ok {
+			ev.dnssecReason = reason
+		}
 	}
 	if msg != nil && len(msg.Question) > 0 {
 		rrType := dns.RRToType(msg.Question[0])
@@ -552,6 +566,9 @@ func (ui *MonitoringUI) applyMetrics(ev metricEvent) {
 			ResponseTime: responseTime,
 			Server:       html.EscapeString(ev.serverName),
 			CacheHit:     ev.cacheHit,
+			// Escaped: the reason quotes names taken from the answer.
+			DNSSECVerdict: html.EscapeString(ev.dnssecVerdict),
+			DNSSECReason:  html.EscapeString(ev.dnssecReason),
 		}
 
 		mc.queryLogMutex.Lock()
@@ -1172,6 +1189,15 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		"sources":            sourceRefresh,
 		"generated_at":       generatedAt,
 		"instance_id":        instanceID,
+		// Counted apart because they mean different things: insecure is a zone
+		// that signs nothing, indeterminate is this resolver failing to check.
+		"dnssec": map[string]any{
+			"secure":        dnssecVerdicts.secure.Load(),
+			"bogus":         dnssecVerdicts.bogus.Load(),
+			"insecure":      dnssecVerdicts.insecure.Load(),
+			"indeterminate": dnssecVerdicts.indeterminate.Load(),
+			"mode":          dnssecMode.Load(),
+		},
 	}
 
 	// Cache the computed metrics, unless a query was recorded while they were
