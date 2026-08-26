@@ -93,7 +93,7 @@ func TestBogusVerdictsReachTheExportedCounter(t *testing.T) {
 	if !strings.Contains(exported, want) {
 		t.Errorf("the bogus counter is not exported as %q", want)
 	}
-	for _, verdict := range []string{"secure", "unknown"} {
+	for _, verdict := range []string{"secure", "insecure", "indeterminate"} {
 		if !strings.Contains(exported, `dnscrypt_proxy_dnssec_verdicts_total{verdict="`+verdict+`"}`) {
 			t.Errorf("the %s verdict is not exported", verdict)
 		}

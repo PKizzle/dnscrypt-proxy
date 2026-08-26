@@ -744,7 +744,8 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# TYPE dnscrypt_proxy_dnssec_verdicts_total counter\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"secure\"} %d\n", dnssecVerdicts.secure.Load()))
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"bogus\"} %d\n", dnssecVerdicts.bogus.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"unknown\"} %d\n", dnssecVerdicts.unknown.Load()))
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"insecure\"} %d\n", dnssecVerdicts.insecure.Load()))
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"indeterminate\"} %d\n", dnssecVerdicts.indeterminate.Load()))
 
 	return result.String()
 }

@@ -65,9 +65,15 @@ type PluginDNSSECValidate struct {
 // from logging refusals to making them can rest on how often a refusal would
 // have happened rather than on how quiet the log looked.
 var dnssecVerdicts struct {
-	secure  atomic.Uint64
-	bogus   atomic.Uint64
-	unknown atomic.Uint64
+	secure atomic.Uint64
+	bogus  atomic.Uint64
+	// insecure is the ordinary case for most of the internet: a zone that signs
+	// nothing. indeterminate is a fault on this side -- keys that did not
+	// arrive, a chain that could not be walked. Counted apart because they mean
+	// opposite things: one is the state of the world, the other is this
+	// resolver failing to check and saying nothing about it.
+	insecure      atomic.Uint64
+	indeterminate atomic.Uint64
 }
 
 func (plugin *PluginDNSSECValidate) Name() string {
@@ -196,17 +202,17 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	case dnssec.Bogus:
 		dnssecVerdicts.bogus.Add(1)
 	case dnssec.Indeterminate:
-		dnssecVerdicts.unknown.Add(1)
+		dnssecVerdicts.indeterminate.Add(1)
 		// Distinct from an unsigned zone, and worth saying so: the answer was
 		// served unvalidated because something in the way of checking it did
 		// not work -- a chain that could not be fetched, a key set that did not
 		// arrive. An unsigned zone is a fact about the zone and stays quiet;
 		// this is a fault on this side and would otherwise be invisible, since
 		// both reach the client the same way.
-		dlog.Infof("DNSSEC could not check [%s]: %v", qName, why)
+		dlog.Debugf("DNSSEC could not check [%s]: %v", qName, why)
 	default:
-		dnssecVerdicts.unknown.Add(1)
-		dlog.Infof("DNSSEC did not vouch for [%s]: %v", qName, why)
+		dnssecVerdicts.insecure.Add(1)
+		dlog.Debugf("DNSSEC did not vouch for [%s]: %v", qName, why)
 	}
 
 	if result != dnssec.Bogus {
