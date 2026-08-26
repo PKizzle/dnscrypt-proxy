@@ -58,51 +58,8 @@ var ErrNoSignature = fmt.Errorf("rrset carries no signature")
 // carry the same tag -- the tag is a checksum, not an identifier -- so a key
 // that fails is a reason to try the next one, not to conclude anything.
 func VerifyRRSet(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, now time.Time) (Result, error) {
-	if len(rrset) == 0 {
-		return Indeterminate, fmt.Errorf("no records to verify")
-	}
-	if len(sigs) == 0 {
-		return Indeterminate, ErrNoSignature
-	}
-	if len(keys) == 0 {
-		return Indeterminate, fmt.Errorf("no keys to verify against")
-	}
-
-	var lastErr error
-	for _, sig := range sigs {
-		if !covers(sig, rrset) {
-			continue
-		}
-		if !ValidAt(sig, now) {
-			lastErr = fmt.Errorf("signature by key %d is outside its validity", sig.KeyTag)
-			continue
-		}
-		for _, key := range keys {
-			if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag {
-				continue
-			}
-			// A key that is not a zone key must not sign a zone's records.
-			if key.Flags&dns.FlagZONE == 0 {
-				continue
-			}
-			// A fresh option set per call, never nil: Verify dereferences it
-			// without checking, and it writes a pooler into whatever it is
-			// given, so a shared one would be a data race between queries.
-			if err := sig.Verify(key, rrset, &dns.SignOption{}); err != nil {
-				lastErr = err
-				continue
-			}
-			return Secure, nil
-		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no key matches signature by key %d", sig.KeyTag)
-		}
-	}
-	if lastErr == nil {
-		return Indeterminate, ErrNoSignature
-	}
-	// Signatures were present and none of them held up.
-	return Bogus, lastErr
+	res, _, err := VerifyRRSetDetail(rrset, sigs, keys, now)
+	return res, err
 }
 
 // covers reports whether sig is a signature over this rrset -- same owner, same
@@ -113,6 +70,11 @@ func covers(sig *dns.RRSIG, rrset []dns.RR) bool {
 		return false
 	}
 	if sig.TypeCovered != dns.RRToType(rrset[0]) {
+		return false
+	}
+	// RFC 4035 section 5.3.1: a signature claiming more labels than the name it
+	// covers has cannot have been made over that name.
+	if int(sig.Labels) > CountLabels(h.Name) {
 		return false
 	}
 	// Every record of an RRset shares owner, class and type; a caller that
@@ -302,4 +264,90 @@ func GroupRRSets(rrs []dns.RR) []RRSet {
 		}
 	}
 	return sets
+}
+
+// CountLabels returns the number of labels in name, not counting the root.
+func CountLabels(name string) int {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	if name == "" {
+		return 0
+	}
+	return strings.Count(name, ".") + 1
+}
+
+// WildcardNextCloser reports whether sig covers an RRset that the zone
+// synthesized from a wildcard, and if so the name whose absence has to be
+// proved for that synthesis to have been legitimate.
+//
+// RFC 4035 section 5.3.3: a signature made over "*.example.com" verifies for
+// every name under example.com, so on its own it is evidence only that the
+// wildcard exists -- not that it was the right answer for this name. The zone
+// must also show that nothing closer to the name exists, which is the "next
+// closer" name: the queried name cut back to one label more than the wildcard
+// covers. Without that check a signature for a wildcard can be replayed as the
+// answer for a name that has a record of its own.
+func WildcardNextCloser(sig *dns.RRSIG, owner string) (string, bool) {
+	ownerLabels := CountLabels(owner)
+	if int(sig.Labels) >= ownerLabels {
+		return "", false
+	}
+	name := strings.ToLower(strings.TrimSuffix(owner, "."))
+	labels := strings.Split(name, ".")
+	// One label more than the closest encloser the signature vouches for.
+	keep := int(sig.Labels) + 1
+	if keep > len(labels) {
+		return "", false
+	}
+	return strings.Join(labels[len(labels)-keep:], ".") + ".", true
+}
+
+// VerifyRRSetDetail is VerifyRRSet, additionally reporting which signature
+// carried it, so that a caller can tell whether the answer was synthesized from
+// a wildcard and demand the proof that goes with it.
+func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, now time.Time) (Result, *dns.RRSIG, error) {
+	if len(rrset) == 0 {
+		return Indeterminate, nil, fmt.Errorf("no records to verify")
+	}
+	if len(sigs) == 0 {
+		return Indeterminate, nil, ErrNoSignature
+	}
+	if len(keys) == 0 {
+		return Indeterminate, nil, fmt.Errorf("no keys to verify against")
+	}
+
+	var lastErr error
+	for _, sig := range sigs {
+		if !covers(sig, rrset) {
+			continue
+		}
+		if !ValidAt(sig, now) {
+			lastErr = fmt.Errorf("signature by key %d is outside its validity", sig.KeyTag)
+			continue
+		}
+		for _, key := range keys {
+			if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag {
+				continue
+			}
+			if key.Flags&dns.FlagZONE == 0 {
+				continue
+			}
+			// RFC 4034 section 2.1.2: any other value means the key is not
+			// usable for DNSSEC, and must not be treated as though it were.
+			if key.Protocol != 3 {
+				continue
+			}
+			if err := sig.Verify(key, rrset, &dns.SignOption{}); err != nil {
+				lastErr = err
+				continue
+			}
+			return Secure, sig, nil
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no key matches signature by key %d", sig.KeyTag)
+		}
+	}
+	if lastErr == nil {
+		return Indeterminate, nil, ErrNoSignature
+	}
+	return Bogus, nil, lastErr
 }

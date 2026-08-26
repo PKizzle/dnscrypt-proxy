@@ -334,3 +334,88 @@ func TestGroupRRSetsDoesNotInventSignatures(t *testing.T) {
 		t.Fatal("the injected set was not grouped at all")
 	}
 }
+
+// RFC 4035 section 5.3.1: a signature claiming more labels than the name it
+// covers cannot have been made over that name.
+func TestSignatureClaimingMoreLabelsThanTheNameIsNotAccepted(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+	sig.Labels = 9 // far more than "www.example.test." has
+
+	if res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now); res == Secure {
+		t.Error("a signature claiming more labels than the owner name verified")
+	}
+}
+
+// RFC 4035 section 5.3.3: a signature over a wildcard verifies for every name
+// beneath it. Without noticing the expansion, a validator accepts a wildcard
+// signature as the answer for a name that has a record of its own -- which is a
+// forged answer that verifies.
+func TestWildcardExpansionIsReportedWithTheNameToDisprove(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+
+	// Signed the way a zone signs a wildcard: over "*.example.test.".
+	wildcard := []dns.RR{aRecord("*.example.test.", "192.0.2.1")}
+	sig := z.sign(wildcard, now.Add(-time.Hour), now.Add(time.Hour))
+	t.Logf("signature over the wildcard has Labels=%d", sig.Labels)
+
+	// Served the way a resolver returns it: the records and the signature both
+	// under the name that was asked, with only Labels betraying the expansion.
+	expanded := []dns.RR{aRecord("anything.example.test.", "192.0.2.1")}
+	sig.Hdr.Name = "anything.example.test."
+
+	res, verified, err := VerifyRRSetDetail(expanded, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+	if res != Secure {
+		t.Fatalf("a genuine wildcard answer did not verify: %v (%v) -- "+
+			"if the library does not reconstruct the wildcard owner, real "+
+			"wildcard answers would be refused under enforcement", res, err)
+	}
+	nextCloser, wasWildcard := WildcardNextCloser(verified, "anything.example.test.")
+	if !wasWildcard {
+		t.Fatal("a wildcard expansion went unnoticed, so no proof would be demanded for it")
+	}
+	if nextCloser != "anything.example.test." {
+		t.Errorf("next closer = %q, want anything.example.test.", nextCloser)
+	}
+}
+
+// The ordinary case must not be dragged into the wildcard path: a signature
+// made over the name itself demands no extra proof.
+func TestAnOrdinarySignatureIsNotTreatedAsAWildcard(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	if _, expanded := WildcardNextCloser(sig, "www.example.test."); expanded {
+		t.Error("a signature over the name itself was taken for a wildcard expansion")
+	}
+}
+
+// RFC 4034 section 2.1.2: protocol values other than 3 mean the key is not for
+// DNSSEC, and it must not be used as though it were.
+func TestKeyWithAWrongProtocolIsNotUsed(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	z.key.Protocol = 2
+	if res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now); res == Secure {
+		t.Error("a key with a non-DNSSEC protocol value was used to verify")
+	}
+}
+
+// RFC 9276 section 3.2 / RFC 5155 section 10.3: the hashing is per query and
+// the count is chosen by the zone, so it has to be bounded.
+func TestNSEC3IterationsAreBounded(t *testing.T) {
+	if h := NSEC3Hash("example.test.", 1, maxNSEC3Iterations+1, ""); h != "" {
+		t.Error("a zone asking for more iterations than the limit was hashed anyway")
+	}
+	if h := NSEC3Hash("example.test.", 1, 0, ""); h == "" {
+		t.Error("the ordinary case should still hash")
+	}
+}

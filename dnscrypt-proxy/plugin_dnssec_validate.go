@@ -265,7 +265,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	worst := dnssec.Secure
 	var worstErr error
 	for _, set := range dnssec.GroupRRSets(msg.Answer) {
-		res, err := plugin.judgeSet(set, chain, now)
+		res, err := plugin.judgeSet(set, chain, msg, now)
 		switch res {
 		case dnssec.Bogus:
 			// A forged set is not redeemed by a genuine one beside it.
@@ -290,7 +290,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 // vouch for any name. Probing instead asks the parent about names that are not
 // delegations at all, and depends on it returning a proof that says so; the
 // signer field states the same thing directly and is signed.
-func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
+func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, msg *dns.Msg, now time.Time) (dnssec.Result, error) {
 	if len(set.Sigs) == 0 {
 		// Nothing claims to have signed this. Whether that is a forgery or an
 		// ordinary unsigned answer depends on whether the zone holding the name
@@ -325,8 +325,19 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		default:
 			return dnssec.Indeterminate, signer.Why
 		}
-		res, err := dnssec.VerifyRRSet(set.Records, []*dns.RRSIG{sig}, signer.Keys, now)
+		res, verified, err := dnssec.VerifyRRSetDetail(set.Records, []*dns.RRSIG{sig}, signer.Keys, now)
 		if res == dnssec.Secure {
+			// RFC 4035 section 5.3.3: a signature made over a wildcard verifies
+			// for every name beneath it, so it is evidence that the wildcard
+			// exists rather than that it was the right answer here. The zone
+			// has to have shown that nothing closer to the name does exist.
+			if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
+				if !dnssec.CollectDenial(msg.Ns).ProvesNoCloserMatch(nextCloser) {
+					return dnssec.Bogus, fmt.Errorf(
+						"%s was answered from a wildcard in %s with no proof that %s does not exist",
+						set.Name, signer.Zone, nextCloser)
+				}
+			}
 			return dnssec.Secure, nil
 		}
 		lastErr = err

@@ -50,6 +50,12 @@ func NSEC3Hash(name string, algorithm uint8, iterations uint16, salt string) str
 	}
 	digest := sha1.Sum(append(wireName(name), saltBytes...)) // #nosec G401 -- RFC 5155 defines SHA-1 here
 	buf := digest[:]
+	if iterations > maxNSEC3Iterations {
+		// Refusing here rather than at each call site keeps the limit in one
+		// place: an empty hash is already how this reports "nothing can be
+		// concluded", and every caller already handles it.
+		return ""
+	}
 	for i := uint16(0); i < iterations; i++ {
 		next := sha1.Sum(append(buf, saltBytes...)) // #nosec G401 -- as above
 		buf = next[:]
@@ -372,4 +378,39 @@ func parentName(name string) string {
 		return "."
 	}
 	return strings.Join(labels[1:], ".") + "."
+}
+
+// maxNSEC3Iterations bounds the hashing a zone can ask a validator to do.
+//
+// RFC 9276 section 3.2 puts the useful number at zero and records that extra
+// iterations buy no meaningful protection; RFC 5155 section 10.3 already
+// allowed a validator to refuse to follow a zone that asks for too many. The
+// work is per query and chosen by whoever writes the zone, so an unbounded
+// count is a lever for spending this resolver's CPU rather than the attacker's.
+// Answers above the limit are treated as unproven rather than forged.
+const maxNSEC3Iterations = 100
+
+// ProvesNoCloserMatch reports whether the zone proved that nextCloser does not
+// exist, which is what makes an answer synthesized from a wildcard legitimate.
+//
+// RFC 4035 section 5.3.3 and RFC 5155 section 8.8: a wildcard signature covers
+// every name below the closest encloser, so it says nothing on its own about
+// which name should have been answered. Only the absence of anything closer
+// does that.
+func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
+	for _, rr := range d.NSEC {
+		if nsecCovers(rr, nextCloser) {
+			return true
+		}
+	}
+	for _, rr := range d.NSEC3 {
+		if rr.Iterations > maxNSEC3Iterations {
+			continue
+		}
+		hashed := NSEC3Hash(nextCloser, rr.Hash, rr.Iterations, rr.Salt)
+		if hashed != "" && nsec3Covers(rr, hashed) {
+			return true
+		}
+	}
+	return false
 }
