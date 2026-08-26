@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestParseValidationMode(t *testing.T) {
 	for _, tc := range []struct {
@@ -65,5 +69,29 @@ func TestIsInsecureZoneWithNoneConfigured(t *testing.T) {
 	plugin := &PluginDNSSECValidate{}
 	if plugin.isInsecureZone("anything.test.") {
 		t.Error("no zones configured should mean nothing is exempt")
+	}
+}
+
+// The move from logging refusals to making them rests on how often a refusal
+// would have happened, so a verdict that never reaches the counters is a
+// refusal nobody sees coming.
+func TestBogusVerdictsReachTheExportedCounter(t *testing.T) {
+	before := dnssecVerdicts.bogus.Load()
+	dnssecVerdicts.bogus.Add(1)
+	defer dnssecVerdicts.bogus.Store(before)
+
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	ui.metricsCollector.prometheusEnabled = true
+	exported := ui.metricsCollector.generatePrometheusMetrics()
+	want := fmt.Sprintf(`dnscrypt_proxy_dnssec_verdicts_total{verdict="bogus"} %d`, before+1)
+	if !strings.Contains(exported, want) {
+		t.Errorf("the bogus counter is not exported as %q", want)
+	}
+	for _, verdict := range []string{"secure", "unknown"} {
+		if !strings.Contains(exported, `dnscrypt_proxy_dnssec_verdicts_total{verdict="`+verdict+`"}`) {
+			t.Errorf("the %s verdict is not exported", verdict)
+		}
 	}
 }

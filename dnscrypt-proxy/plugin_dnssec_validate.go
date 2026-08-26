@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -59,11 +59,15 @@ type PluginDNSSECValidate struct {
 	insecureZones []string
 	anchors       []*dns.DS
 	fetcher       *dnssec.CachingFetcher
+}
 
-	mu      sync.Mutex
-	secure  uint64
-	bogus   uint64
-	unknown uint64
+// dnssecVerdicts counts what validation concluded, so that the decision to move
+// from logging refusals to making them can rest on how often a refusal would
+// have happened rather than on how quiet the log looked.
+var dnssecVerdicts struct {
+	secure  atomic.Uint64
+	bogus   atomic.Uint64
+	unknown atomic.Uint64
 }
 
 func (plugin *PluginDNSSECValidate) Name() string {
@@ -186,16 +190,14 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 
 	result, why := plugin.judge(msg, qName)
 
-	plugin.mu.Lock()
 	switch result {
 	case dnssec.Secure:
-		plugin.secure++
+		dnssecVerdicts.secure.Add(1)
 	case dnssec.Bogus:
-		plugin.bogus++
+		dnssecVerdicts.bogus.Add(1)
 	default:
-		plugin.unknown++
+		dnssecVerdicts.unknown.Add(1)
 	}
-	plugin.mu.Unlock()
 
 	if result != dnssec.Bogus {
 		// Secure answers are marked as such; anything else is served without a

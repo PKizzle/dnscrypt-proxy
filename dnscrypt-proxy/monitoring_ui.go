@@ -737,6 +737,15 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# TYPE dnscrypt_proxy_aes_hardware_support gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_aes_hardware_support %d\n", aesHW))
 
+	// Split by verdict rather than counted as one, because the three mean
+	// different things: bogus is the one that would be refused if validation
+	// were enforcing, and it is the only one worth alerting on.
+	result.WriteString("# HELP dnscrypt_proxy_dnssec_verdicts_total DNSSEC validation results by verdict\n")
+	result.WriteString("# TYPE dnscrypt_proxy_dnssec_verdicts_total counter\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"secure\"} %d\n", dnssecVerdicts.secure.Load()))
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"bogus\"} %d\n", dnssecVerdicts.bogus.Load()))
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"unknown\"} %d\n", dnssecVerdicts.unknown.Load()))
+
 	return result.String()
 }
 
