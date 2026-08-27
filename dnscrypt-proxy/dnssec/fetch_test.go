@@ -379,3 +379,51 @@ func TestStaleKeysDoNotEscapeSignatureChecking(t *testing.T) {
 		t.Error("an expired signature verified, so staleness would bypass the validity window")
 	}
 }
+
+// A key set that does not verify must not be kept. Answered from cache it
+// leaves every name below that zone unvalidated until it expires, and at the
+// root that is every name there is.
+func TestForgetZoneMakesTheNextWalkAskAgain(t *testing.T) {
+	z := newZone(t, "example.test.")
+	calls := 0
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		calls++
+		return msgWith(dns.RcodeSuccess, []dns.RR{z.key}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("upstream asked %d times, want 1 -- the set should have been cached", calls)
+	}
+
+	f.ForgetZone("example.test.")
+
+	if _, _, err := f.DNSKEY("example.test."); err != nil {
+		t.Fatalf("after forgetting: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("upstream asked %d times, want 2 -- the dropped set was answered from cache", calls)
+	}
+}
+
+// Part of a key set verifies as nothing: the signature covers the whole of it,
+// so a set missing a key fails exactly as a forged one does.
+func TestFetcherRefusesATruncatedKeySet(t *testing.T) {
+	z := newZone(t, "example.test.")
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		m := msgWith(dns.RcodeSuccess, []dns.RR{z.key}, nil)
+		m.Truncated = true
+		return m, nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, err := f.DNSKEY("example.test."); err == nil {
+		t.Error("a truncated key set was accepted as the whole of it")
+	}
+}

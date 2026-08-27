@@ -123,7 +123,13 @@
         .dnssec-insecure { color: #757575; }
         .dnssec-indeterminate { color: #ef6c00; font-weight: 600; }
         .dnssec-bogus { color: #c62828; font-weight: 700; }
-        #queries-table td:nth-child(7) { text-align: center; font-size: 1.1em; cursor: help; }
+        /* The verdict column: narrow, quiet, and readable at a glance. */
+        #queries-table td:nth-child(7) {
+            text-align: center;
+            font-size: 0.85em;
+            letter-spacing: 0.02em;
+            cursor: help;
+        }
     </style>
 </head>
 <body>
@@ -193,19 +199,19 @@
                     <span id="dnssec-mode">-</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-label" title="Signed, and the signatures held up">&#128274; Verified:</span>
+                    <span class="stat-label" title="Signed, and the signatures held up">Verified:</span>
                     <span id="dnssec-secure">-</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-label" title="The zone publishes no signatures, so there was nothing to check">&#128275; Unsigned:</span>
+                    <span class="stat-label" title="The zone publishes no signatures, so there was nothing to check">Unsigned:</span>
                     <span id="dnssec-insecure">-</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-label" title="Could not be checked: keys that did not arrive, a chain that could not be walked. Served unvalidated">&#10067; Unchecked:</span>
+                    <span class="stat-label" title="Could not be checked: keys that did not arrive, a chain that could not be walked. Served unvalidated">Unchecked:</span>
                     <span id="dnssec-indeterminate">-</span>
                 </div>
                 <div class="stat">
-                    <span class="stat-label" title="Signatures that did not hold up. Refused outright in enforce mode">&#9888; Failed:</span>
+                    <span class="stat-label" title="Signatures that did not hold up. Refused outright in enforce mode">Failed:</span>
                     <span id="dnssec-bogus">-</span>
                 </div>
                 <div class="stat">

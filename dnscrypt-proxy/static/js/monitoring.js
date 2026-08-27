@@ -271,7 +271,7 @@ function safeUpdateDashboard(data) {
                 row.insertCell(5).textContent = query.response_code || '-';
                 const dnssecCell = row.insertCell(6);
                 const verdict = describeDnssec(query.dnssec_verdict);
-                dnssecCell.textContent = verdict.icon;
+                dnssecCell.textContent = verdict.text;
                 dnssecCell.className = verdict.className;
                 // The reason is why a name will not resolve under enforce, so it
                 // belongs where someone looking at the row will find it.
@@ -585,6 +585,10 @@ setInterval(pollMetrics, 5000);
 
 // describeDnssec turns a verdict into what the table shows for it.
 //
+// A word rather than a symbol: these four have to be told apart at a glance in
+// a dense table, and read aloud by a screen reader. The colour is emphasis
+// only, so the meaning survives without it.
+//
 // The four are deliberately distinct. "Unsigned" is a fact about the zone and
 // the ordinary case for most of the internet; "unchecked" is this resolver
 // failing to check and is the one worth chasing; "failed" is the only one that
@@ -592,14 +596,14 @@ setInterval(pollMetrics, 5000);
 function describeDnssec(verdict) {
     switch (verdict) {
         case 'secure':
-            return { icon: '\u{1F512}', label: 'Verified', className: 'dnssec-secure' };
+            return { text: 'verified', label: 'Verified', className: 'dnssec-secure' };
         case 'insecure':
-            return { icon: '\u{1F513}', label: 'Unsigned zone', className: 'dnssec-insecure' };
+            return { text: 'unsigned', label: 'Unsigned zone', className: 'dnssec-insecure' };
         case 'indeterminate':
-            return { icon: '\u2753', label: 'Could not be checked', className: 'dnssec-indeterminate' };
+            return { text: 'unchecked', label: 'Could not be checked', className: 'dnssec-indeterminate' };
         case 'bogus':
-            return { icon: '\u26A0', label: 'Signature did not hold up', className: 'dnssec-bogus' };
+            return { text: 'failed', label: 'Signature did not hold up', className: 'dnssec-bogus' };
         default:
-            return { icon: '\u2013', label: 'Validation is switched off', className: '' };
+            return { text: '-', label: 'Validation is switched off', className: '' };
     }
 }

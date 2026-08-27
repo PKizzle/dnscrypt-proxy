@@ -95,6 +95,14 @@ func AncestorZones(name string) []string {
 // wants: stripping a DS makes a signed zone look unsigned. Proving the absence
 // of a DS needs the denial-of-existence records from the parent, so a caller
 // that must not be downgraded checks DSProven before believing Insecure.
+// forget drops a zone from a fetcher that keeps anything, so a set that did not
+// verify is asked for again rather than answered from cache.
+func forget(f Fetcher, zone string) {
+	if c, ok := f.(interface{ ForgetZone(string) }); ok {
+		c.ForgetZone(zone)
+	}
+}
+
 func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainResult {
 	zones := AncestorZones(zone)
 
@@ -104,6 +112,10 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 		return ChainResult{Status: Indeterminate, Zone: ".", Why: fmt.Errorf("fetch root keys: %w", err)}
 	}
 	if res, err := VerifyDNSKEYs(keys, sigs, anchors, now); res != Secure {
+		// Held keys that do not verify are worse than none: kept, they answer
+		// every walk from cache and leave everything below unvalidated until
+		// they expire. At the root that is every name there is.
+		forget(f, ".")
 		return ChainResult{Status: res, Zone: ".", Why: fmt.Errorf("root key set: %w", err)}
 	}
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
@@ -178,6 +190,9 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 			// A key set that cannot be used stops the walk without condemning
 			// the zone: everything at or below is served unvalidated, which is
 			// what an unsigned zone gets and what RFC 6840 section 5.2 asks for.
+			// It is dropped rather than kept, so the next walk asks again
+			// instead of meeting the same answer from cache.
+			forget(f, child)
 			return ChainResult{Status: res, Zone: child, Why: fmt.Errorf("key set for %s: %w", child, err)}
 		}
 		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}

@@ -143,6 +143,11 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 	if msg.Rcode != dns.RcodeSuccess {
 		return fall(fmt.Errorf("DNSKEY %s: rcode %d", zone, msg.Rcode))
 	}
+	if msg.Truncated {
+		// Part of a key set verifies as nothing: the signature is over the whole
+		// of it, so a set missing a key fails exactly as a forged one does.
+		return fall(fmt.Errorf("DNSKEY %s: truncated", zone))
+	}
 
 	var keys []*dns.DNSKEY
 	var sigs []*dns.RRSIG
@@ -241,6 +246,20 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, denial: denial, expires: f.now().Add(ttlOf(records))}
 	f.mu.Unlock()
 	return dss, sigs, denial, nil
+}
+
+// ForgetZone drops what is held for one zone, so the next walk asks again.
+//
+// A key set that does not verify must not be kept. It would otherwise be
+// answered from the cache for as long as its lifetime, and past it under the
+// stale fallback, so a single bad response could leave every name below that
+// zone unvalidated for hours -- and at the root, every name there is.
+func (f *CachingFetcher) ForgetZone(zone string) {
+	zone = canonicalName(zone)
+	f.mu.Lock()
+	delete(f.keys, zone)
+	delete(f.dss, zone)
+	f.mu.Unlock()
 }
 
 // Forget drops everything cached, for a reload.
