@@ -312,3 +312,46 @@ func TestBuildChainWillNotGuessWhenTheParentSettlesNothing(t *testing.T) {
 		t.Error("keys were handed to a name that may belong to another zone")
 	}
 }
+
+// A zone cut can sit below a label that is not one. Stopping the walk at the
+// first ordinary name hands the signed zone's keys to a child zone further
+// down, and that child's unsigned answers are then refused as forged.
+//
+// This is the shape of a CDN name under a signed corporate zone --
+// "f.c2r.ts.cdn.office.net", where office.net signs, "cdn" is an ordinary name
+// inside it, and "ts.cdn" is delegated to an unsigned zone. Refusing it takes
+// the CDN off the network for everyone behind this resolver.
+func TestBuildChainFindsADelegationBelowAnOrdinaryName(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	// "cdn.example.test." is a plain name inside the signed zone...
+	h.notACut["cdn.example.test."] = true
+	// ...and the zone below it is delegated, and unsigned.
+	h.unsigned["ts.cdn.example.test."] = true
+
+	res := BuildChain(h, "f.ts.cdn.example.test.", h.anchors(), h.now)
+	if res.Status == Secure {
+		t.Fatal("the walk stopped above the delegation and claimed the parent signs for it")
+	}
+	if res.Status != Insecure {
+		t.Errorf("status = %v (%v), want insecure", res.Status, res.Why)
+	}
+	if len(res.Keys) != 0 {
+		t.Error("the signed parent's keys were carried into an unsigned child zone")
+	}
+}
+
+// The walk must still reach the deepest signed zone when the labels above it
+// are ordinary names, rather than stopping at the first of them.
+func TestBuildChainWalksPastOrdinaryNamesToTheSignedZone(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	h.notACut["a.example.test."] = true
+	h.notACut["b.a.example.test."] = true
+
+	res := BuildChain(h, "b.a.example.test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("status = %v (%v), want secure", res.Status, res.Why)
+	}
+	if res.Zone != "example.test." {
+		t.Errorf("zone = %q, want example.test.", res.Zone)
+	}
+}

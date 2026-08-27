@@ -154,9 +154,13 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
 				return current
 			case denial.ProvesNotADelegation(child):
-				// Shown to be an ordinary name inside the zone reached so far,
-				// so that zone's keys are the ones that sign it.
-				return current
+				// An ordinary name inside the zone reached so far. The walk
+				// carries on rather than stopping here: a label further down
+				// can still be a zone cut, and stopping at the first one that
+				// is not would hand this zone's keys to a child zone below it
+				// and refuse that zone's unsigned answers as forged. A CDN
+				// name three labels below a signed zone is exactly that shape.
+				continue
 			default:
 				// The parent offered something, but nothing that settles which
 				// of the two this is. Carrying on would hand its keys to what
