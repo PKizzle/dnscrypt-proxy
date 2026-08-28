@@ -500,7 +500,7 @@ func cnameChainTerminal(qName string, sets []dnssec.RRSet) (terminal string, fol
 	terminal = qName
 	seen := map[string]bool{}
 	for {
-		key := strings.ToLower(terminal)
+		key := dnsNameKey(terminal)
 		if seen[key] {
 			return "", false, fmt.Errorf("CNAME loop at %s", terminal)
 		}
@@ -508,7 +508,7 @@ func cnameChainTerminal(qName string, sets []dnssec.RRSet) (terminal string, fol
 
 		var cnames []*dns.CNAME
 		for _, set := range sets {
-			if set.Type != dns.TypeCNAME || !dns.EqualName(set.Name, terminal) {
+			if set.Type != dns.TypeCNAME || !sameDNSName(set.Name, terminal) {
 				continue
 			}
 			for _, rr := range set.Records {
@@ -530,9 +530,24 @@ func cnameChainTerminal(qName string, sets []dnssec.RRSet) (terminal string, fol
 	}
 }
 
+// dnsNameKey matches the internal query-name representation: query plugins
+// deliberately retain names without a trailing root label, while names in DNS
+// RRs are fully qualified. The vendored DNS library's EqualName requires two
+// fully-qualified inputs and panics when given the former. DNSCrypt only
+// accepts ASCII query names (NormalizeQName), and this library does not
+// support escaped presentation names, so case-folding and one trailing root
+// label are the complete DNS-name canonicalization needed here.
+func dnsNameKey(name string) string {
+	return strings.ToLower(strings.TrimSuffix(name, "."))
+}
+
+func sameDNSName(a, b string) bool {
+	return dnsNameKey(a) == dnsNameKey(b)
+}
+
 func hasRRSet(sets []dnssec.RRSet, name string, rrtype uint16) bool {
 	for _, set := range sets {
-		if set.Type == rrtype && dns.EqualName(set.Name, name) {
+		if set.Type == rrtype && sameDNSName(set.Name, name) {
 			return true
 		}
 	}

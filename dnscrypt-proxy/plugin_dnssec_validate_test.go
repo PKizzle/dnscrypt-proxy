@@ -103,6 +103,28 @@ func TestParseValidationModeRejectsNonsense(t *testing.T) {
 	}
 }
 
+// Query plugins store qName without a trailing dot, whereas decoded DNS RRs
+// carry fully-qualified owner names. The CNAME walk must bridge those two
+// representations without calling dns.EqualName, whose FQDN-only contract
+// would panic on the normalized query name.
+func TestCNAMEChainTerminalAcceptsNormalizedQueryName(t *testing.T) {
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "alias.example.", Class: dns.ClassINET},
+		CNAME: rdata.CNAME{Target: "target.example."},
+	}
+	terminal, followed, err := cnameChainTerminal("alias.example", []dnssec.RRSet{{
+		Name:    "alias.example.",
+		Type:    dns.TypeCNAME,
+		Records: []dns.RR{cname},
+	}})
+	if err != nil {
+		t.Fatalf("cnameChainTerminal() = error %v", err)
+	}
+	if !followed || terminal != "target.example." {
+		t.Fatalf("cnameChainTerminal() = (%q, followed=%v), want (target.example., true)", terminal, followed)
+	}
+}
+
 func TestDNSSECEnforceRejectsOnlyValidationFailuresWithoutCD(t *testing.T) {
 	plugin := &PluginDNSSECValidate{mode: ValidationEnforce}
 	withoutCD := dns.NewMsg("example.test.", dns.TypeA)
