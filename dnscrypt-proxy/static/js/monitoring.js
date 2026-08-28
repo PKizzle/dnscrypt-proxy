@@ -94,12 +94,25 @@ function safeUpdateDashboard(data) {
             loadingIndicator.style.display = 'none';
         }
 
+        // A browser-facing request carries fleet totals when peers are
+        // configured. Summary cards must use them: reading the local fields
+        // here made a healthy pod conceal another pod's DNSSEC failures.
+        // Tables below stay local because their rows cannot be meaningfully
+        // merged without losing which instance saw them.
+        const fleetTotals = data.fleet && data.fleet.totals ? data.fleet.totals : null;
+        const summary = fleetTotals || data;
+        const fleetLabel = fleetTotals
+            ? `fleet: ${fleetTotals.instances_reachable || 0}/${fleetTotals.instances || 0} reachable`
+            : null;
+        updateElementText('overview', fleetLabel ? `Overview (${fleetLabel})` : 'Overview');
+        updateElementText('recent-queries', fleetLabel ? 'Recent Queries (this instance)' : 'Recent Queries');
+
         // Update overview stats with null checks
-        const totalQueries = data.total_queries !== undefined ? data.total_queries : 0;
-        const blockedQueries = data.blocked_queries !== undefined ? data.blocked_queries : 0;
-        const qps = data.queries_per_second !== undefined ? data.queries_per_second : 0;
+        const totalQueries = summary.total_queries !== undefined ? summary.total_queries : 0;
+        const blockedQueries = summary.blocked_queries !== undefined ? summary.blocked_queries : 0;
+        const qps = summary.queries_per_second !== undefined ? summary.queries_per_second : 0;
         const uptime = data.uptime_seconds !== undefined ? data.uptime_seconds : 0;
-        const avgResponseTime = data.avg_response_time !== undefined ? data.avg_response_time : 0;
+        const avgResponseTime = summary.avg_response_time !== undefined ? summary.avg_response_time : 0;
 
         updateElementText('total-queries', formatNumber(totalQueries));
         updateElementText('blocked-queries', formatNumber(blockedQueries));
@@ -121,10 +134,11 @@ function safeUpdateDashboard(data) {
         // DNSSEC summary. The share is of answers that could be judged at all --
         // counting unsigned zones in the denominator would report a resolver
         // that validates everything it can as mostly failing.
-        const dnssec = data.dnssec || {};
+        const dnssec = summary.dnssec || data.dnssec || {};
         const secure = dnssec.secure || 0;
         const bogus = dnssec.bogus || 0;
         const indeterminate = dnssec.indeterminate || 0;
+        updateElementText('dnssec', fleetLabel ? `DNSSEC (${fleetLabel})` : 'DNSSEC');
         updateElementText('dnssec-mode', dnssec.mode || 'off');
         updateElementText('dnssec-secure', secure.toLocaleString());
         updateElementText('dnssec-insecure', (dnssec.insecure || 0).toLocaleString());
@@ -142,9 +156,9 @@ function safeUpdateDashboard(data) {
             indetEl.className = indeterminate > 0 ? 'dnssec-indeterminate' : '';
         }
 
-        const cacheHitRatio = data.cache_hit_ratio !== undefined ? data.cache_hit_ratio : 0;
-        const cacheHits = data.cache_hits !== undefined ? data.cache_hits : 0;
-        const cacheMisses = data.cache_misses !== undefined ? data.cache_misses : 0;
+        const cacheHitRatio = summary.cache_hit_ratio !== undefined ? summary.cache_hit_ratio : 0;
+        const cacheHits = summary.cache_hits !== undefined ? summary.cache_hits : 0;
+        const cacheMisses = summary.cache_misses !== undefined ? summary.cache_misses : 0;
         const cacheStats = data.cache_stats || {};
 
         updateElementText('cache-hit-ratio', formatPercent(cacheHitRatio));

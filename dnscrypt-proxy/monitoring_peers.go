@@ -282,6 +282,17 @@ func sumMetrics(instances []peerMetrics) map[string]any {
 		}
 		totals[key] = sum
 	}
+	cacheHits, _ := toFloat(totals["cache_hits"])
+	cacheMisses, _ := toFloat(totals["cache_misses"])
+	if cacheHits+cacheMisses > 0 {
+		totals["cache_hit_ratio"] = cacheHits / (cacheHits + cacheMisses)
+	} else {
+		totals["cache_hit_ratio"] = float64(0)
+	}
+
+	if dnssec, present := sumDNSSEC(instances); present {
+		totals["dnssec"] = dnssec
+	}
 
 	// Queries per second add up: each instance measures its own share of a rate
 	// they are serving between them.
@@ -326,6 +337,51 @@ func sumMetrics(instances []peerMetrics) map[string]any {
 	}
 	totals["instances_reachable"] = reachable
 	return totals
+}
+
+// sumDNSSEC adds verdict counters across the peers. They are counters, not
+// rates, so summing them is meaningful; the verified share is rebuilt by the
+// page from those sums. A mode disagreement is reported instead of choosing
+// whichever pod happened to answer the browser's request.
+func sumDNSSEC(instances []peerMetrics) (map[string]any, bool) {
+	totals := map[string]any{
+		"secure":        float64(0),
+		"bogus":         float64(0),
+		"insecure":      float64(0),
+		"indeterminate": float64(0),
+	}
+	modes := map[string]bool{}
+	present := false
+	for _, inst := range instances {
+		if !inst.Reachable {
+			continue
+		}
+		dnssec, ok := inst.Metrics["dnssec"].(map[string]any)
+		if !ok {
+			continue
+		}
+		present = true
+		for _, verdict := range []string{"secure", "bogus", "insecure", "indeterminate"} {
+			if n, ok := toFloat(dnssec[verdict]); ok {
+				current, _ := toFloat(totals[verdict])
+				totals[verdict] = current + n
+			}
+		}
+		if mode, ok := dnssec["mode"].(string); ok && mode != "" {
+			modes[mode] = true
+		}
+	}
+	if !present {
+		return nil, false
+	}
+	if len(modes) == 1 {
+		for mode := range modes {
+			totals["mode"] = mode
+		}
+	} else {
+		totals["mode"] = "mixed"
+	}
+	return totals, true
 }
 
 func toFloat(v any) (float64, bool) {

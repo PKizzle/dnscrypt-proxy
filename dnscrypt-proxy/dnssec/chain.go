@@ -121,11 +121,18 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
 
 	for _, child := range zones[1:] {
-		dss, dsSigs, denial, err := f.DS(child)
+		dss, _, denial, err, invalid := verifiedDelegationSigners(f, child, current, now)
 		if err != nil {
+			if invalid {
+				return ChainResult{
+					Status: Bogus, Zone: current.Zone,
+					Why: fmt.Errorf("delegation signer for %s is not signed by %s: %w", child, current.Zone, err),
+				}
+			}
 			return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch DS for %s: %w", child, err)}
 		}
 		if len(dss) == 0 {
+			denial = denial.Verified(current.Keys, current.Zone, now)
 			// No delegation signer has two very different meanings, and reading
 			// the wrong one costs either coverage or correctness.
 			//
@@ -148,8 +155,10 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 			case denial.Empty():
 				// Nothing was offered to tell the two apart. Descending on the
 				// parent's keys would refuse a genuinely unsigned zone for
-				// carrying no signature, so this stays where it was.
-				current.Status = Insecure
+				// carrying no signature, so this stays where it was and says that
+				// nothing could be concluded. It is not an unsigned delegation:
+				// no signed proof established one.
+				current.Status = Indeterminate
 				current.Keys = nil
 				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
 				return current
@@ -167,22 +176,10 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				// may be a child zone and then refuse that zone's unsigned
 				// answers as forged -- which is what a reverse-DNS delegation
 				// under an opt-out span looks like from here.
-				current.Status = Insecure
+				current.Status = Indeterminate
 				current.Keys = nil
 				current.Why = fmt.Errorf("%s: nothing shown either way about a delegation there", child)
 				return current
-			}
-		}
-
-		// The DS set is the parent's data, so the parent's keys must sign it.
-		dsSet := make([]dns.RR, 0, len(dss))
-		for _, ds := range dss {
-			dsSet = append(dsSet, ds)
-		}
-		if res, err := VerifyRRSet(dsSet, dsSigs, current.Keys, now); res != Secure {
-			return ChainResult{
-				Status: Bogus, Zone: current.Zone,
-				Why: fmt.Errorf("delegation signer for %s is not signed by %s: %w", child, current.Zone, err),
 			}
 		}
 
@@ -202,6 +199,42 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
 	}
 	return current
+}
+
+// verifiedDelegationSigners fetches and authenticates the parent-side DS RRset
+// before allowing it into the chain cache. A delivered but invalid DS response
+// is not a network failure, so CachingFetcher cannot distinguish it from a
+// valid response on its own. Retrying after dropping that entry matters with a
+// pool of encrypted recursive upstreams: one stale or malformed response must
+// not poison every name below a TLD for its TTL. It never trusts the retry
+// blindly; after the bounded attempts an invalid signed delegation remains
+// Bogus, as RFC 4035 requires.
+func verifiedDelegationSigners(f Fetcher, child string, parent ChainResult, now time.Time) ([]*dns.DS, []*dns.RRSIG, Denial, error, bool) {
+	var lastErr error
+	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+		dss, sigs, denial, err := f.DS(child)
+		if err != nil {
+			return nil, nil, Denial{}, err, false
+		}
+		if len(dss) == 0 {
+			return dss, sigs, denial, nil, false
+		}
+
+		dsSet := make([]dns.RR, 0, len(dss))
+		for _, ds := range dss {
+			dsSet = append(dsSet, ds)
+		}
+		if res, err := VerifyRRSet(dsSet, signaturesFromZone(sigs, parent.Zone), parent.Keys, now); res == Secure {
+			return dss, sigs, denial, nil, false
+		} else {
+			lastErr = err
+		}
+
+		// Do not let a reply which failed authentication survive in a cache. The
+		// next attempt must reach an upstream again rather than re-read it.
+		forget(f, child)
+	}
+	return nil, nil, Denial{}, lastErr, true
 }
 
 // WithinZone reports whether name is the zone itself or sits below it.

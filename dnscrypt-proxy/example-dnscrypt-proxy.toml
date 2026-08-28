@@ -227,7 +227,7 @@ keepalive = 30
 ## mode:
 ##   off      - do nothing (default)
 ##   log      - judge every answer and report, but serve it either way
-##   enforce  - refuse an answer whose signatures do not hold up (SERVFAIL)
+##   enforce  - return SERVFAIL if validation fails or cannot complete
 ##
 ## Run in `log` first and read what it says about the traffic you actually
 ## have. Enforcing a validator that has never run is how a resolver goes dark.

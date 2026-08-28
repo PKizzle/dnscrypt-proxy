@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -30,7 +31,7 @@ const (
 	// The state to run in first: it says what enforcing would have refused,
 	// against real traffic, before anything is refused.
 	ValidationLog
-	// ValidationEnforce refuses an answer whose signatures do not hold up.
+	// ValidationEnforce returns SERVFAIL when validation fails or cannot finish.
 	ValidationEnforce
 )
 
@@ -119,7 +120,7 @@ func (plugin *PluginDNSSECValidate) Init(proxy *Proxy) error {
 	case ValidationLog:
 		dlog.Notice("DNSSEC validation is reporting only; answers are served either way")
 	case ValidationEnforce:
-		dlog.Notice("DNSSEC validation is enforced; answers that fail are refused")
+		dlog.Notice("DNSSEC validation is enforced; failed validation returns SERVFAIL")
 	}
 	if len(plugin.insecureZones) > 0 {
 		dlog.Noticef("DNSSEC validation is disabled for %v", plugin.insecureZones)
@@ -144,6 +145,9 @@ func (plugin *PluginDNSSECValidate) resolveInternally(proxy *Proxy, qname string
 	}
 	msg.RecursionDesired = true
 	msg.Security = true // ask for the signatures; without DO there is nothing to check
+	// RFC 6840 section 5.9 recommends CD on upstream validation queries so an
+	// upstream validator returns the DNSSEC material we must verify ourselves.
+	msg.CheckingDisabled = true
 	msg.UDPSize = uint16(MaxDNSPacketSize)
 
 	if err := msg.Pack(); err != nil {
@@ -228,22 +232,51 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		dlog.Debugf("DNSSEC did not vouch for [%s]: %v", qName, why)
 	}
 
-	if result != dnssec.Bogus {
+	if !plugin.mustReject(result, clientCheckingDisabled(pluginsState)) {
 		// Secure answers are marked as such; anything else is served without a
-		// claim either way, which is what an unsigned zone deserves.
+		// claim either way. In log mode that also includes a result which
+		// enforcement would have rejected; in enforce mode a CD client receives
+		// the upstream response as RFC 4035 section 5.5 requires.
 		msg.AuthenticatedData = result == dnssec.Secure
+		if plugin.mode == ValidationLog && (result == dnssec.Bogus || result == dnssec.Indeterminate) {
+			dlog.Warnf("DNSSEC would return SERVFAIL for [%s]: %v", qName, why)
+		}
 		return nil
 	}
 
-	if plugin.mode == ValidationLog {
-		dlog.Warnf("DNSSEC would refuse [%s]: %v", qName, why)
-		msg.AuthenticatedData = false
-		return nil
-	}
-	dlog.Warnf("DNSSEC refused [%s]: %v", qName, why)
+	dlog.Warnf("DNSSEC returned SERVFAIL for [%s]: %v", qName, why)
+	edeCode := dnssecFailureEDE(result, why)
+	failure := DNSSECFailureResponseFromMessage(pluginsState.questionMsg, edeCode)
+	restoreDNSSECClientBits(pluginsState, failure)
+	pluginsState.synthResponse = failure
 	pluginsState.action = PluginsActionReject
 	pluginsState.returnCode = PluginsReturnCodeServFail
 	return nil
+}
+
+// dnssecFailureEDE preserves the reason a validator had to return SERVFAIL.
+// RFC 9276 section 3.2 specifically asks for EDE 27 after an authenticated
+// NSEC3 proof exceeds a resolver's iteration policy; describing that as
+// generic DNSSEC Bogus wrongly blames the zone's signatures.
+func dnssecFailureEDE(result dnssec.Result, why error) uint16 {
+	if errors.Is(why, dnssec.ErrUnsupportedNSEC3Iterations) {
+		return dns.ExtendedErrorUnsupportedNSEC3IterValue
+	}
+	if result == dnssec.Indeterminate {
+		return dns.ExtendedErrorDNSSECIndeterminate
+	}
+	return dns.ExtendedErrorDNSBogus
+}
+
+// mustReject follows RFC 4035 section 5.5: when a validating server cannot
+// validate an answer, it returns SERVFAIL unless the original query carried
+// CD. "Indeterminate" is therefore useful in log mode but is not safe to
+// serve as a validated answer in enforce mode.
+func (plugin *PluginDNSSECValidate) mustReject(result dnssec.Result, checkingDisabled bool) bool {
+	if plugin.mode != ValidationEnforce || checkingDisabled {
+		return false
+	}
+	return result == dnssec.Bogus || result == dnssec.Indeterminate
 }
 
 // judge decides what an answer is worth.
@@ -263,25 +296,36 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 			// delegation saying so was itself genuine is what the denial proofs
 			// decide, and that is checked where the delegation is read.
 			return dnssec.Insecure, nil
+		case dnssec.Bogus:
+			return dnssec.Bogus, chain.Why
 		default:
 			// A chain that could not be built is not evidence that an answer is
 			// forged. Refusing here would take the resolver down whenever the
 			// path to the root is unreachable.
 			return dnssec.Indeterminate, chain.Why
 		}
-		denial := dnssec.CollectDenial(msg.Ns)
+		denial := dnssec.CollectDenial(msg.Ns).Verified(chain.Keys, chain.Zone, now)
 		if denial.Empty() {
 			return dnssec.Bogus, fmt.Errorf("a signed zone answered nothing and proved nothing")
 		}
 		qtype := dns.RRToType(msg.Question[0])
 		if msg.Rcode == dns.RcodeNameError {
 			if denial.ProvesNameError(qName, chain.Zone) {
-				return dnssec.Secure, nil
+				return plugin.judgeNegativeAuthority(msg, chain, now)
+			}
+			if denial.HasOnlyUnsupportedNSEC3Iterations() {
+				return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 			}
 			return dnssec.Bogus, fmt.Errorf("no proof that %s does not exist", qName)
 		}
 		if denial.ProvesNoData(qName, qtype) {
-			return dnssec.Secure, nil
+			return plugin.judgeNegativeAuthority(msg, chain, now)
+		}
+		if denial.ProvesWildcardNoData(qName, chain.Zone, qtype) {
+			return plugin.judgeNegativeAuthority(msg, chain, now)
+		}
+		if denial.HasOnlyUnsupportedNSEC3Iterations() {
+			return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 		}
 		return dnssec.Bogus, fmt.Errorf("no proof that %s holds no record of this type", qName)
 	}
@@ -299,7 +343,52 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	var chain dnssec.ChainResult
 	worst := dnssec.Secure
 	var worstErr error
-	for _, set := range dnssec.GroupRRSets(msg.Answer) {
+	sets := dnssec.GroupRRSets(msg.Answer)
+	dnames := make([]validatedDNAME, 0)
+
+	// RFC 4035 section 3.2.3 permits an unsigned CNAME only when it is
+	// demonstrably synthesized from an authenticated DNAME in this response.
+	// Validate DNAME sets first so the CNAME exception cannot be used to slip a
+	// forged alias past an otherwise secure zone.
+	for _, set := range sets {
+		if set.Type != dns.TypeDNAME {
+			continue
+		}
+		res, err := plugin.judgeSet(set, chain, msg, now)
+		switch res {
+		case dnssec.Bogus:
+			return res, err
+		case dnssec.Indeterminate:
+			worst, worstErr = res, err
+		case dnssec.Insecure:
+			if worst != dnssec.Indeterminate {
+				worst, worstErr = res, err
+			}
+		}
+		for _, rr := range set.Records {
+			if dname, ok := rr.(*dns.DNAME); ok {
+				dnames = append(dnames, validatedDNAME{record: dname, result: res, err: err})
+			}
+		}
+	}
+
+	for _, set := range sets {
+		if set.Type == dns.TypeDNAME {
+			continue
+		}
+		if res, err, synthesized := synthesizedCNAMEFromDNAME(set, dnames); synthesized {
+			switch res {
+			case dnssec.Bogus:
+				return res, err
+			case dnssec.Indeterminate:
+				worst, worstErr = res, err
+			case dnssec.Insecure:
+				if worst != dnssec.Indeterminate {
+					worst, worstErr = res, err
+				}
+			}
+			continue
+		}
 		res, err := plugin.judgeSet(set, chain, msg, now)
 		switch res {
 		case dnssec.Bogus:
@@ -313,18 +402,231 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 			}
 		}
 	}
+
+	// A CNAME is not the requested data (except for QTYPE=CNAME itself). If
+	// its target answered negatively, the authority proof is part of the
+	// response that AD would vouch for and has to be checked too. Without this,
+	// a signed alias plus an unsigned or forged target NODATA response is marked
+	// secure merely because the alias happened to validate.
+	if qtype := dns.RRToType(msg.Question[0]); qtype != dns.TypeCNAME && qtype != dns.TypeANY {
+		res, err := plugin.judgeCNAMEChainTerminal(msg, qName, qtype, sets, chain, now)
+		switch res {
+		case dnssec.Bogus:
+			return res, err
+		case dnssec.Indeterminate:
+			worst, worstErr = res, err
+		case dnssec.Insecure:
+			if worst != dnssec.Indeterminate {
+				worst, worstErr = res, err
+			}
+		}
+	}
 	return worst, worstErr
 }
 
-// judgeSet checks one RRset against the zone that signed it.
+// judgeNegativeAuthority authenticates the non-denial Authority RRsets that
+// are relevant to a negative answer. NSEC/NSEC3 were checked by the denial
+// routines; SOA controls negative-cache lifetime and must not be allowed to
+// remain an unvalidated claim under an AD response. RFC 4035 section 3.2.3
+// requires relevant negative Authority RRsets to be authentic.
 //
-// The signer is taken from the signature rather than found by probing for a
-// delegation at each ancestor of the name. RFC 4035 section 5.3.1 names the
-// RRSIG's signer field as the zone whose keys are to be used, subject to that
-// zone actually containing the RRset -- without which any zone could offer to
-// vouch for any name. Probing instead asks the parent about names that are not
-// delegations at all, and depends on it returning a proof that says so; the
-// signer field states the same thing directly and is signed.
+// Some recursive upstreams omit SOA despite returning a usable denial proof,
+// so absence is not promoted to a new validation failure here. If one is
+// supplied, however, its RRSIG must verify.
+func (plugin *PluginDNSSECValidate) judgeNegativeAuthority(msg *dns.Msg, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
+	for _, set := range dnssec.GroupRRSets(msg.Ns) {
+		if set.Type != dns.TypeSOA {
+			continue
+		}
+		if res, err := plugin.judgeSet(set, chain, msg, now); res != dnssec.Secure {
+			return res, err
+		}
+	}
+	return dnssec.Secure, nil
+}
+
+// judgeCNAMEChainTerminal authenticates the final negative answer behind a
+// CNAME chain. RFC 4035 section 3.2.3 permits AD only when all answer RRsets
+// and relevant negative authority RRsets are authentic. It returns Secure
+// without further work when the answer contains no chain from qname, or when
+// the chain terminates in the requested RRset.
+func (plugin *PluginDNSSECValidate) judgeCNAMEChainTerminal(msg *dns.Msg, qName string, qtype uint16, sets []dnssec.RRSet, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
+	terminal, followed, err := cnameChainTerminal(qName, sets)
+	if err != nil {
+		return dnssec.Bogus, err
+	}
+	if !followed || hasRRSet(sets, terminal, qtype) {
+		return dnssec.Secure, nil
+	}
+	// A CNAME-only response is a legitimate intermediate positive response: a
+	// client or recursive upstream may continue with the target separately. It
+	// becomes a negative answer only when it carries NXDOMAIN or authenticated
+	// denial material for the terminal name.
+	if msg.Rcode != dns.RcodeNameError && !hasSOA(msg.Ns) && dnssec.CollectDenial(msg.Ns).Empty() {
+		return dnssec.Secure, nil
+	}
+
+	owner := plugin.chainFor(terminal, chain, now)
+	switch owner.Status {
+	case dnssec.Secure:
+	case dnssec.Insecure:
+		return dnssec.Insecure, owner.Why
+	case dnssec.Bogus:
+		return dnssec.Bogus, owner.Why
+	default:
+		return dnssec.Indeterminate, owner.Why
+	}
+
+	denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
+	if msg.Rcode == dns.RcodeNameError {
+		if denial.ProvesNameError(terminal, owner.Zone) {
+			return plugin.judgeNegativeAuthority(msg, owner, now)
+		}
+		return dnssec.Bogus, fmt.Errorf("no proof that CNAME target %s does not exist", terminal)
+	}
+	if denial.ProvesNoData(terminal, qtype) || denial.ProvesWildcardNoData(terminal, owner.Zone, qtype) {
+		return plugin.judgeNegativeAuthority(msg, owner, now)
+	}
+	if denial.HasOnlyUnsupportedNSEC3Iterations() {
+		return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
+	}
+	return dnssec.Bogus, fmt.Errorf("no proof that CNAME target %s holds no record of type %s", terminal, dns.TypeToString[qtype])
+}
+
+// cnameChainTerminal follows the CNAME RRsets actually included in an answer.
+// A CNAME RRset has one target; multiple targets or a loop cannot be a
+// meaningful answer and must not be redeemed by a signed unrelated RRset.
+func cnameChainTerminal(qName string, sets []dnssec.RRSet) (terminal string, followed bool, err error) {
+	terminal = qName
+	seen := map[string]bool{}
+	for {
+		key := strings.ToLower(terminal)
+		if seen[key] {
+			return "", false, fmt.Errorf("CNAME loop at %s", terminal)
+		}
+		seen[key] = true
+
+		var cnames []*dns.CNAME
+		for _, set := range sets {
+			if set.Type != dns.TypeCNAME || !dns.EqualName(set.Name, terminal) {
+				continue
+			}
+			for _, rr := range set.Records {
+				cname, ok := rr.(*dns.CNAME)
+				if !ok {
+					return "", false, fmt.Errorf("CNAME RRset at %s contains %T", terminal, rr)
+				}
+				cnames = append(cnames, cname)
+			}
+		}
+		if len(cnames) == 0 {
+			return terminal, followed, nil
+		}
+		if len(cnames) != 1 {
+			return "", false, fmt.Errorf("CNAME RRset at %s has %d targets", terminal, len(cnames))
+		}
+		followed = true
+		terminal = cnames[0].Target
+	}
+}
+
+func hasRRSet(sets []dnssec.RRSet, name string, rrtype uint16) bool {
+	for _, set := range sets {
+		if set.Type == rrtype && dns.EqualName(set.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSOA(rrs []dns.RR) bool {
+	for _, rr := range rrs {
+		if dns.RRToType(rr) == dns.TypeSOA {
+			return true
+		}
+	}
+	return false
+}
+
+type validatedDNAME struct {
+	record *dns.DNAME
+	result dnssec.Result
+	err    error
+}
+
+// synthesizedCNAMEFromDNAME recognizes the CNAME generated by DNAME
+// substitution. It accepts no unsigned CNAME merely because a DNAME happened
+// to be present: owner and target must be the exact replacement RFC 6672
+// defines, and the DNAME's own validation result is inherited.
+func synthesizedCNAMEFromDNAME(set dnssec.RRSet, dnames []validatedDNAME) (dnssec.Result, error, bool) {
+	if set.Type != dns.TypeCNAME || len(set.Sigs) != 0 || len(set.Records) != 1 {
+		return dnssec.Indeterminate, nil, false
+	}
+	cname, ok := set.Records[0].(*dns.CNAME)
+	if !ok {
+		return dnssec.Indeterminate, nil, false
+	}
+	for _, candidate := range dnames {
+		if !dnameAppliesToName(candidate.record, cname.Header().Name) {
+			continue
+		}
+		if dnameSynthesizesCNAME(candidate.record, cname) {
+			return candidate.result, candidate.err, true
+		}
+		if candidate.result == dnssec.Secure {
+			return dnssec.Bogus, fmt.Errorf(
+				"unsigned CNAME %s is not the synthesis of secure DNAME %s",
+				cname.Header().Name, candidate.record.Header().Name), true
+		}
+		return candidate.result, candidate.err, true
+	}
+	return dnssec.Indeterminate, nil, false
+}
+
+func dnameSynthesizesCNAME(dname *dns.DNAME, cname *dns.CNAME) bool {
+	if !dnameAppliesToName(dname, cname.Header().Name) {
+		return false
+	}
+	ownerName := strings.TrimSuffix(strings.ToLower(dname.Header().Name), ".")
+	ownerLabels := strings.Split(ownerName, ".")
+	cnameName := strings.TrimSuffix(strings.ToLower(cname.Header().Name), ".")
+	cnameLabels := strings.Split(cnameName, ".")
+	prefix := cnameLabels[:len(cnameLabels)-len(ownerLabels)]
+	target := strings.TrimSuffix(strings.ToLower(dname.Target), ".")
+	expectedLabels := append(prefix, strings.Split(target, ".")...)
+	expected := "."
+	if target != "" {
+		expected = strings.Join(expectedLabels, ".") + "."
+	}
+	return dns.EqualName(cname.Target, expected)
+}
+
+func dnameAppliesToName(dname *dns.DNAME, name string) bool {
+	ownerName := strings.TrimSuffix(strings.ToLower(dname.Header().Name), ".")
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	if ownerName == "" || name == "" {
+		return false
+	}
+	ownerLabels := strings.Split(ownerName, ".")
+	nameLabels := strings.Split(name, ".")
+	if len(nameLabels) <= len(ownerLabels) {
+		return false
+	}
+	for i := range ownerLabels {
+		if nameLabels[len(nameLabels)-len(ownerLabels)+i] != ownerLabels[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// judgeSet checks one RRset against the authenticated zone containing it.
+//
+// RFC 4035 section 5.3.1 requires the RRSIG Signer's Name to be the zone that
+// contains the RRset, not merely an ancestor of its owner. A parent can sign
+// arbitrary bytes with its own key; accepting that signature below a delegated
+// child would let it impersonate the child. The chain walk establishes the
+// actual containing zone and the RRSIG must name that exact zone.
 func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, msg *dns.Msg, now time.Time) (dnssec.Result, error) {
 	if len(set.Sigs) == 0 {
 		// Nothing claims to have signed this. Whether that is a forgery or an
@@ -337,40 +639,45 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 				owner.Zone, dns.TypeToString[set.Type], set.Name)
 		case dnssec.Insecure:
 			return dnssec.Insecure, owner.Why
+		case dnssec.Bogus:
+			return dnssec.Bogus, owner.Why
 		default:
 			return dnssec.Indeterminate, owner.Why
 		}
 	}
 
+	owner := plugin.chainFor(set.Name, chain, now)
+	switch owner.Status {
+	case dnssec.Secure:
+	case dnssec.Insecure:
+		return dnssec.Insecure, owner.Why
+	case dnssec.Bogus:
+		return dnssec.Bogus, owner.Why
+	default:
+		return dnssec.Indeterminate, owner.Why
+	}
+
 	var lastErr error
 	for _, sig := range set.Sigs {
-		// A signature naming a zone that does not contain the record it covers
-		// is not evidence about that record, whoever signed it.
-		if !dnssec.WithinZone(set.Name, sig.SignerName) {
-			lastErr = fmt.Errorf("%s does not lie within %s, which signed for it", set.Name, sig.SignerName)
+		if !dns.EqualName(owner.Zone, sig.SignerName) {
+			lastErr = fmt.Errorf("%s belongs to %s, not %s", set.Name, owner.Zone, sig.SignerName)
 			continue
 		}
-		signer := plugin.chainFor(sig.SignerName, chain, now)
-		switch signer.Status {
-		case dnssec.Secure:
-		case dnssec.Insecure:
-			// The zone that signed is not itself vouched for by its parent, so
-			// the signature proves nothing about authenticity.
-			return dnssec.Insecure, signer.Why
-		default:
-			return dnssec.Indeterminate, signer.Why
-		}
-		res, verified, err := dnssec.VerifyRRSetDetail(set.Records, []*dns.RRSIG{sig}, signer.Keys, now)
+		res, verified, err := dnssec.VerifyRRSetDetail(set.Records, []*dns.RRSIG{sig}, owner.Keys, now)
 		if res == dnssec.Secure {
 			// RFC 4035 section 5.3.3: a signature made over a wildcard verifies
 			// for every name beneath it, so it is evidence that the wildcard
 			// exists rather than that it was the right answer here. The zone
 			// has to have shown that nothing closer to the name does exist.
 			if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
-				if !dnssec.CollectDenial(msg.Ns).ProvesNoCloserMatch(nextCloser) {
+				denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
+				if !denial.ProvesNoCloserMatch(nextCloser) {
+					if denial.HasOnlyUnsupportedNSEC3Iterations() {
+						return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
+					}
 					return dnssec.Bogus, fmt.Errorf(
 						"%s was answered from a wildcard in %s with no proof that %s does not exist",
-						set.Name, signer.Zone, nextCloser)
+						set.Name, owner.Zone, nextCloser)
 				}
 			}
 			return dnssec.Secure, nil
@@ -424,7 +731,17 @@ func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg
 	}
 	pluginsState.sessionData[dnssecClientWantedKey] = msg.Security
 	pluginsState.sessionData[dnssecClientAskedADKey] = msg.AuthenticatedData
+	pluginsState.sessionData[dnssecClientCheckingDisabledKey] = msg.CheckingDisabled
+	// RFC 4035 section 4.6 requires a resolver to clear AD in an outgoing
+	// query. The client bit is only a request to receive our verdict; sending
+	// it upstream lets a buggy server reflect a client-controlled assertion.
+	msg.AuthenticatedData = false
 	msg.Security = true
+	// RFC 6840 section 5.9 recommends CD on every upstream query. We validate
+	// the raw response locally, so an upstream validator must not replace it
+	// with SERVFAIL first. Keep the client's original bit separately and put it
+	// back before replying.
+	msg.CheckingDisabled = true
 	if msg.UDPSize == 0 || msg.UDPSize < 1232 {
 		// Signatures do not fit in 512 bytes. Without room for them the answer
 		// comes back truncated and there is nothing to verify.
@@ -438,6 +755,10 @@ const dnssecClientWantedKey = "dnssec_client_wanted"
 
 // dnssecClientAskedADKey records whether the client asked for the verdict alone.
 const dnssecClientAskedADKey = "dnssec_client_asked_ad"
+
+// dnssecClientCheckingDisabledKey keeps the client's CD bit while the proxy
+// sets CD on its own upstream query to retrieve raw material for validation.
+const dnssecClientCheckingDisabledKey = "dnssec_client_checking_disabled"
 
 // dnssecVerdictKey and dnssecReasonKey carry what validation concluded about an
 // answer, and why, to whatever reports on the query afterwards. The wire has
@@ -535,6 +856,7 @@ func (plugin *PluginDNSSECStrip) Eval(pluginsState *PluginsState, msg *dns.Msg) 
 // section 5.8 reserves it for clients that set DO or AD; to anything else it is
 // a bit that was not requested and cannot be acted on.
 func stripDNSSECForClient(pluginsState *PluginsState, msg *dns.Msg) {
+	restoreDNSSECClientBits(pluginsState, msg)
 	wanted, _ := pluginsState.sessionData[dnssecClientWantedKey].(bool)
 	askedForVerdict, _ := pluginsState.sessionData[dnssecClientAskedADKey].(bool)
 	if !wanted {
@@ -543,4 +865,25 @@ func stripDNSSECForClient(pluginsState *PluginsState, msg *dns.Msg) {
 	if !wanted && !askedForVerdict {
 		msg.AuthenticatedData = false
 	}
+}
+
+// restoreDNSSECClientBits removes the two upstream-only query mutations from
+// a client-facing reply. RFC 3225 section 3 requires DO to be copied from the
+// client query, while RFC 4035 section 3.2.2 says the same for CD. The
+// validator sets both on its upstream query so it can obtain unfiltered DNSSEC
+// material; neither change may leak back to the client.
+func restoreDNSSECClientBits(pluginsState *PluginsState, msg *dns.Msg) {
+	if wanted, ok := pluginsState.sessionData[dnssecClientWantedKey].(bool); ok {
+		msg.Security = wanted
+	}
+	if checkingDisabled, ok := pluginsState.sessionData[dnssecClientCheckingDisabledKey].(bool); ok {
+		msg.CheckingDisabled = checkingDisabled
+	}
+}
+
+func clientCheckingDisabled(pluginsState *PluginsState) bool {
+	if checkingDisabled, ok := pluginsState.sessionData[dnssecClientCheckingDisabledKey].(bool); ok {
+		return checkingDisabled
+	}
+	return pluginsState.questionMsg != nil && pluginsState.questionMsg.CheckingDisabled
 }

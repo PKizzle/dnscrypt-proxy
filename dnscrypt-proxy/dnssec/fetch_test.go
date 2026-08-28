@@ -102,16 +102,19 @@ func TestFetcherReportsAnAbsentDelegationSignerAsEmpty(t *testing.T) {
 	}
 }
 
-// A name that does not exist is not an unsigned zone. Reporting it as one would
-// let a typo -- or a forged NXDOMAIN -- read as a downgrade.
-func TestFetcherDistinguishesNoSuchNameFromNoSigner(t *testing.T) {
+// A name error is not an unsigned delegation. Its denial proof is passed to
+// the chain, which can establish that the label is not a zone cut only after
+// verifying it with the parent key.
+func TestFetcherKeepsANameErrorProofForTheChain(t *testing.T) {
+	proof := nsec("a.", "z.", dns.TypeNSEC, dns.TypeRRSIG)
 	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
-		return msgWith(dns.RcodeNameError, nil, nil), nil
+		return msgWith(dns.RcodeNameError, nil, []dns.RR{proof}), nil
 	}}
 	f := NewCachingFetcher(rec.fn)
 
-	if _, _, _, err := f.DS("nope.test."); err == nil {
-		t.Error("DS() for a nonexistent name should be an error, not an unsigned delegation")
+	dss, _, denial, err := f.DS("nope.")
+	if err != nil || len(dss) != 0 || len(denial.NSEC) != 1 {
+		t.Fatalf("DS() = %d signers, %d NSEC, err %v; want a usable negative proof", len(dss), len(denial.NSEC), err)
 	}
 }
 
@@ -425,5 +428,20 @@ func TestFetcherRefusesATruncatedKeySet(t *testing.T) {
 
 	if _, _, err := f.DNSKEY("example.test."); err == nil {
 		t.Error("a truncated key set was accepted as the whole of it")
+	}
+}
+
+// A partial delegation response can omit either a DS or the proof that it is
+// absent. It cannot be read as a complete answer to the chain walk.
+func TestFetcherRefusesATruncatedDSSet(t *testing.T) {
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		m := msgWith(dns.RcodeSuccess, nil, nil)
+		m.Truncated = true
+		return m, nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	if _, _, _, err := f.DS("example.test."); err == nil {
+		t.Error("a truncated DS response was accepted as complete")
 	}
 }

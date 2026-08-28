@@ -171,10 +171,10 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 
 // DS returns the delegation signers the parent of zone publishes for it.
 //
-// An empty result with no error means the parent published none, which the
-// chain reads as an unsigned delegation. NXDOMAIN is deliberately not treated
-// that way: a name that does not exist is not a zone that is merely unsigned,
-// and reporting it as one would turn a typo into a silent downgrade.
+// An empty result with no error means the parent published no DS. The chain
+// distinguishes an authenticated proof that the name is not a delegation from
+// one that it is an unsigned delegation; it must never infer the latter just
+// because a DS lookup returned NXDOMAIN.
 func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	zone = canonicalName(zone)
 
@@ -206,9 +206,19 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	switch msg.Rcode {
 	case dns.RcodeSuccess:
 	case dns.RcodeNameError:
-		return nil, nil, Denial{}, fmt.Errorf("DS %s: the name does not exist", zone)
+		// A name error can be useful evidence: a signed NSEC/NSEC3 proof may
+		// establish that this label is not a zone cut, allowing the walk to
+		// retain the parent keys and validate the original negative answer.
+		// Authentication is deliberately deferred to BuildChain, which has the
+		// parent keys. Without that proof it remains Indeterminate, never an
+		// unsigned delegation.
 	default:
 		return fall(fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode))
+	}
+	if msg.Truncated {
+		// A partial DS response can omit the signer or the denial that explains
+		// its absence. Either mistake changes the result of the chain walk.
+		return fall(fmt.Errorf("DS %s: truncated", zone))
 	}
 
 	var dss []*dns.DS

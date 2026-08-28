@@ -37,8 +37,14 @@ func newZone(t *testing.T, name string) *zone {
 
 // sign returns a signature over rrset, valid in the window given.
 func (z *zone) sign(rrset []dns.RR, inception, expiration time.Time) *dns.RRSIG {
+	return z.signAs(z.name, rrset, inception, expiration)
+}
+
+// signAs creates a cryptographically genuine signature while letting a test
+// exercise the RRSIG Signer's Name validation separately.
+func (z *zone) signAs(signerName string, rrset []dns.RR, inception, expiration time.Time) *dns.RRSIG {
 	z.t.Helper()
-	sig := dns.NewRRSIG(z.name, z.key.Algorithm, z.key.KeyTag(),
+	sig := dns.NewRRSIG(signerName, z.key.Algorithm, z.key.KeyTag(),
 		uint32(inception.Unix()), uint32(expiration.Unix()))
 	if err := sig.Sign(z.priv, rrset, &dns.SignOption{}); err != nil {
 		z.t.Fatalf("sign rrset for %s: %v", z.name, err)
@@ -156,6 +162,21 @@ func TestVerifyDNSKEYsAcceptsAnAnchoredSet(t *testing.T) {
 	res, err := VerifyDNSKEYs(keys, []*dns.RRSIG{sig}, []*dns.DS{ds}, now)
 	if res != Secure {
 		t.Fatalf("VerifyDNSKEYs() = %v (%v), want secure", res, err)
+	}
+}
+
+// RFC 4035 section 5.3.1 requires the signer name to be the zone containing
+// the DNSKEY RRset, even if the bytes happen to verify under an anchored key.
+func TestVerifyDNSKEYsRejectsASignatureFromAnotherZone(t *testing.T) {
+	z := newZone(t, "example.test.")
+	keys := []*dns.DNSKEY{z.key}
+	rrset := []dns.RR{z.key}
+	now := time.Now()
+	sig := z.signAs("other.test.", rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	res, _ := VerifyDNSKEYs(keys, []*dns.RRSIG{sig}, []*dns.DS{z.key.ToDS(dns.SHA256)}, now)
+	if res != Bogus {
+		t.Fatalf("VerifyDNSKEYs() with another signer zone = %v, want bogus", res)
 	}
 }
 

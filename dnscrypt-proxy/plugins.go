@@ -314,7 +314,7 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 				pluginsGlobals.RUnlock()
 				return packet, err
 			}
-			if pluginsState.action == PluginsActionReject {
+			if pluginsState.action == PluginsActionReject && pluginsState.synthResponse == nil {
 				synth := RefusedResponseFromMessage(
 					&msg,
 					pluginsGlobals.refusedCodeInResponses,
@@ -378,7 +378,7 @@ func (pluginsState *PluginsState) ApplyResponsePlugins(
 				pluginsGlobals.RUnlock()
 				return packet, err
 			}
-			if pluginsState.action == PluginsActionReject {
+			if pluginsState.action == PluginsActionReject && pluginsState.synthResponse == nil {
 				synth := RefusedResponseFromMessage(
 					&msg,
 					pluginsGlobals.refusedCodeInResponses,

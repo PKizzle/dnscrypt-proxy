@@ -27,6 +27,45 @@ type hierarchy struct {
 	unproven map[string]bool
 }
 
+// tamperedHierarchy removes the RRSIG from one denial. It models an upstream
+// that sends a plausible NSEC but not the signed proof the chain requires.
+type tamperedHierarchy struct {
+	*hierarchy
+	unsignedProof string
+}
+
+func (h tamperedHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	dss, sigs, denial, err := h.hierarchy.DS(zoneName)
+	if zoneName == h.unsignedProof {
+		denial.sigs = nil
+	}
+	return dss, sigs, denial, err
+}
+
+// flakyDelegationHierarchy returns one invalid signed DS response, then the
+// real parent-signed one. It models a single inconsistent recursive upstream
+// in a pool; the validator must re-fetch rather than retain that response as
+// the fate of the whole child zone.
+type flakyDelegationHierarchy struct {
+	*hierarchy
+	zone  string
+	calls int
+}
+
+func (h *flakyDelegationHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if zoneName != h.zone {
+		return h.hierarchy.DS(zoneName)
+	}
+	h.calls++
+	if h.calls != 1 {
+		return h.hierarchy.DS(zoneName)
+	}
+	h.brokenDS[zoneName] = true
+	dss, sigs, denial, err := h.hierarchy.DS(zoneName)
+	delete(h.brokenDS, zoneName)
+	return dss, sigs, denial, err
+}
+
 func newHierarchy(t *testing.T, names ...string) *hierarchy {
 	t.Helper()
 	h := &hierarchy{
@@ -59,28 +98,37 @@ func (h *hierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error)
 	return keys, []*dns.RRSIG{sig}, nil
 }
 
-// nsecProving builds the denial a parent offers in place of a DS: the types
-// present at that name decide whether there is a delegation there at all.
-func nsecProving(name string, types ...uint16) Denial {
-	return Denial{NSEC: []*dns.NSEC{{
+// nsecProving builds the signed denial a parent offers in place of a DS: the
+// types present at that name decide whether there is a delegation there at all.
+func (h *hierarchy) nsecProving(name string, types ...uint16) Denial {
+	rr := &dns.NSEC{
 		Hdr:  dns.Header{Name: name, Class: dns.ClassINET, TTL: 300},
 		NSEC: rdata.NSEC{NextDomain: "\\000." + name, TypeBitMap: types},
-	}}}
+	}
+	ancestors := AncestorZones(name)
+	for i := len(ancestors) - 2; i >= 0; i-- {
+		if parent := h.zones[ancestors[i]]; parent != nil {
+			sig := parent.sign([]dns.RR{rr}, h.now.Add(-time.Hour), h.now.Add(time.Hour))
+			return Denial{NSEC: []*dns.NSEC{rr}, sigs: []*dns.RRSIG{sig}}
+		}
+	}
+	h.t.Fatalf("no parent zone available to sign denial for %s", name)
+	return Denial{}
 }
 
 func (h *hierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	if h.unproven[zoneName] {
 		// Something came back, but nothing that settles whether anything is
 		// delegated here -- an opt-out span, or a proof about another name.
-		return nil, nil, nsecProving("other."+zoneName, dns.TypeA), nil
+		return nil, nil, h.nsecProving("other."+zoneName, dns.TypeA), nil
 	}
 	if h.notACut[zoneName] {
 		// A name inside its parent: records, but nothing delegated.
-		return nil, nil, nsecProving(zoneName, dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC), nil
+		return nil, nil, h.nsecProving(zoneName, dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC), nil
 	}
 	if h.unsigned[zoneName] {
 		// A real delegation the parent does not sign for.
-		return nil, nil, nsecProving(zoneName, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC), nil
+		return nil, nil, h.nsecProving(zoneName, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC), nil
 	}
 	z, ok := h.zones[zoneName]
 	if !ok {
@@ -164,6 +212,39 @@ func TestBuildChainStopsAtAnUnsignedDelegation(t *testing.T) {
 	}
 }
 
+// A signed NXDOMAIN answer to a DS lookup proves that a label is not a zone
+// cut; it is not an unsigned delegation. The chain must retain the parent's
+// keys so it can authenticate the original negative response.
+func TestBuildChainWalksPastASignedNameErrorForDS(t *testing.T) {
+	root := newZone(t, ".")
+	now := time.Now()
+	proof := &dns.NSEC{
+		Hdr:  dns.Header{Name: "a.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "z.", TypeBitMap: []uint16{dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	proofSig := root.sign([]dns.RR{proof}, now.Add(-time.Hour), now.Add(time.Hour))
+	rootSig := root.sign([]dns.RR{root.key}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	f := NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch qtype {
+		case dns.TypeDNSKEY:
+			if canonicalName(qname) == "." {
+				return msgWith(dns.RcodeSuccess, []dns.RR{root.key, rootSig}, nil), nil
+			}
+		case dns.TypeDS:
+			if canonicalName(qname) == "kolbergs-nas." {
+				return msgWith(dns.RcodeNameError, nil, []dns.RR{proof, proofSig}), nil
+			}
+		}
+		return nil, fmt.Errorf("unexpected %s/%d", qname, qtype)
+	})
+
+	res := BuildChain(f, "kolbergs-nas.", []*dns.DS{root.key.ToDS(dns.SHA256)}, now)
+	if res.Status != Secure || res.Zone != "." || len(res.Keys) != 1 {
+		t.Fatalf("BuildChain() = %v at %q (%v), want root secure", res.Status, res.Zone, res.Why)
+	}
+}
+
 // The delegation is the parent's statement about the child. A DS the parent did
 // not sign is not that statement, whoever else signed it.
 func TestBuildChainRejectsADelegationTheParentDidNotSign(t *testing.T) {
@@ -173,6 +254,18 @@ func TestBuildChainRejectsADelegationTheParentDidNotSign(t *testing.T) {
 	res := BuildChain(h, "example.test.", h.anchors(), h.now)
 	if res.Status != Bogus {
 		t.Fatalf("BuildChain() = %v (%v), want bogus", res.Status, res.Why)
+	}
+}
+
+func TestBuildChainRefetchesAnInvalidDelegationSigner(t *testing.T) {
+	h := newHierarchy(t, ".", "test.")
+	f := &flakyDelegationHierarchy{hierarchy: h, zone: "test."}
+	res := BuildChain(f, "test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("BuildChain() = %v (%v), want secure after refetch", res.Status, res.Why)
+	}
+	if f.calls != 2 {
+		t.Fatalf("DS calls = %d, want 2 (invalid response then refetch)", f.calls)
 	}
 }
 
@@ -264,6 +357,22 @@ func TestBuildChainStillStopsAtAGenuinelyUnsignedDelegation(t *testing.T) {
 	}
 }
 
+// The NSEC which makes an absent DS an unsigned delegation has to be signed
+// by the parent. Without that check, an upstream can manufacture a downgrade
+// for any signed child simply by removing its DS and attaching a made-up NSEC.
+func TestBuildChainDoesNotTrustAnUnsignedNoDSProof(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	h.unsigned["example.test."] = true
+
+	res := BuildChain(tamperedHierarchy{hierarchy: h, unsignedProof: "example.test."}, "example.test.", h.anchors(), h.now)
+	if res.Status != Indeterminate {
+		t.Fatalf("BuildChain() = %v (%v), want indeterminate", res.Status, res.Why)
+	}
+	if len(res.Keys) != 0 {
+		t.Error("keys were kept after an unverifiable delegation proof")
+	}
+}
+
 // RFC 4035 section 5.3.1: a signature is only evidence about a record if the
 // zone that signed it is the zone that contains the record. Without that check,
 // a signature naming any zone the attacker controls would be accepted for any
@@ -305,8 +414,8 @@ func TestBuildChainWillNotGuessWhenTheParentSettlesNothing(t *testing.T) {
 	if res.Status == Secure {
 		t.Fatal("the walk carried on into a name nothing was shown about")
 	}
-	if res.Status != Insecure {
-		t.Errorf("status = %v, want insecure", res.Status)
+	if res.Status != Indeterminate {
+		t.Errorf("status = %v, want indeterminate", res.Status)
 	}
 	if len(res.Keys) != 0 {
 		t.Error("keys were handed to a name that may belong to another zone")

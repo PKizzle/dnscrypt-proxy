@@ -60,7 +60,11 @@ func EmptyResponseFromMessage(srcMsg *dns.Msg) *dns.Msg {
 	dstMsg.Response = true
 	dstMsg.RecursionAvailable = true
 	dstMsg.RecursionDesired = srcMsg.RecursionDesired
-	dstMsg.CheckingDisabled = false
+	// RFC 4035 section 5.5 makes the CD bit consequential for a validation
+	// failure: a client that set it is entitled to the complete response. Keep
+	// it on every synthesized response instead of accidentally changing that
+	// client request into a validating one.
+	dstMsg.CheckingDisabled = srcMsg.CheckingDisabled
 	dstMsg.AuthenticatedData = false
 	if srcMsg.UDPSize > 0 {
 		dstMsg.UDPSize = srcMsg.UDPSize
@@ -146,6 +150,19 @@ func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, 
 		}
 	}
 
+	return dstMsg
+}
+
+// DNSSECFailureResponseFromMessage returns the response RFC 4035 section 5.5
+// requires when validation fails for a client that did not disable checking.
+// This deliberately does not use the generic blocked-query response: an HINFO
+// answer or REFUSED would hide a DNSSEC validation failure from the client.
+func DNSSECFailureResponseFromMessage(srcMsg *dns.Msg, edeCode uint16) *dns.Msg {
+	dstMsg := EmptyResponseFromMessage(srcMsg)
+	dstMsg.Rcode = dns.RcodeServerFailure
+	if dstMsg.UDPSize > 0 {
+		dstMsg.Pseudo = append(dstMsg.Pseudo, &dns.EDE{InfoCode: edeCode})
+	}
 	return dstMsg
 }
 

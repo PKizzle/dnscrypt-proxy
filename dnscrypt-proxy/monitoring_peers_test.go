@@ -28,6 +28,44 @@ func TestSumMetricsAddsCounters(t *testing.T) {
 	}
 }
 
+func TestSumMetricsAddsDNSSECVerdicts(t *testing.T) {
+	totals := sumMetrics([]peerMetrics{
+		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{
+			"mode": "log", "secure": float64(10), "insecure": float64(20),
+			"indeterminate": float64(1), "bogus": float64(0),
+		}}},
+		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{
+			"mode": "log", "secure": float64(30), "insecure": float64(40),
+			"indeterminate": float64(2), "bogus": float64(3),
+		}}},
+	})
+	dnssec, ok := totals["dnssec"].(map[string]any)
+	if !ok {
+		t.Fatal("fleet totals omit DNSSEC")
+	}
+	for verdict, want := range map[string]float64{
+		"secure": 40, "insecure": 60, "indeterminate": 3, "bogus": 3,
+	} {
+		if got, _ := toFloat(dnssec[verdict]); got != want {
+			t.Errorf("%s = %v, want %v", verdict, dnssec[verdict], want)
+		}
+	}
+	if mode, _ := dnssec["mode"].(string); mode != "log" {
+		t.Errorf("mode = %q, want log", mode)
+	}
+}
+
+func TestSumMetricsReportsMixedDNSSECModes(t *testing.T) {
+	totals := sumMetrics([]peerMetrics{
+		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{"mode": "log"}}},
+		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{"mode": "enforce"}}},
+	})
+	dnssec := totals["dnssec"].(map[string]any)
+	if mode, _ := dnssec["mode"].(string); mode != "mixed" {
+		t.Errorf("mode = %q, want mixed", mode)
+	}
+}
+
 // An average cannot be averaged: an instance that answered ten queries must not
 // weigh as much as one that answered ten thousand.
 func TestSumMetricsWeightsTheAverageByQueries(t *testing.T) {

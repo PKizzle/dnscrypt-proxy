@@ -23,6 +23,11 @@ func validateQuery(query []byte) bool {
 
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
+	// Query plugins may have enabled DO and CD solely to obtain material for
+	// local validation. Synthesized answers bypass the normal response-plugin
+	// chain, so restore the client's bits at this common exit point as well.
+	// The helper is a no-op unless DNSSEC validation saved the original values.
+	restoreDNSSECClientBits(pluginsState, synth)
 	if err := validateResponseForQuery(pluginsState.questionMsg, synth); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		return nil, err

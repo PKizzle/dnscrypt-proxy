@@ -3,10 +3,18 @@ package dnssec
 import (
 	"crypto/sha1"
 	"encoding/base32"
+	"errors"
 	"strings"
+	"time"
 
 	"codeberg.org/miekg/dns"
 )
+
+// ErrUnsupportedNSEC3Iterations says that a signed denial was understood and
+// authenticated, but deliberately not processed because its iteration count
+// exceeds this validator's resource limit. RFC 9276 section 3.2 assigns EDE
+// code 27 to that distinct case; it is not evidence that the zone forged data.
+var ErrUnsupportedNSEC3Iterations = errors.New("unsupported NSEC3 iterations")
 
 // This file proves that something is absent.
 //
@@ -67,6 +75,9 @@ func hexDecode(s string) ([]byte, error) {
 	// A zero-length salt is written as "-".
 	if s == "-" || s == "" {
 		return nil, nil
+	}
+	if len(s)%2 != 0 {
+		return nil, errBadHex
 	}
 	out := make([]byte, len(s)/2)
 	for i := 0; i < len(out); i++ {
@@ -184,6 +195,8 @@ func coversType(bitmap []uint16, rrtype uint16) bool {
 type Denial struct {
 	NSEC  []*dns.NSEC
 	NSEC3 []*dns.NSEC3
+	sigs  []*dns.RRSIG
+	zone  string
 }
 
 // CollectDenial picks the denial records out of an authority section.
@@ -195,13 +208,121 @@ func CollectDenial(rrs []dns.RR) Denial {
 			d.NSEC = append(d.NSEC, v)
 		case *dns.NSEC3:
 			d.NSEC3 = append(d.NSEC3, v)
+		case *dns.RRSIG:
+			if v.TypeCovered == dns.TypeNSEC || v.TypeCovered == dns.TypeNSEC3 {
+				d.sigs = append(d.sigs, v)
+			}
 		}
 	}
 	return d
 }
 
+// Verified returns only denial records whose signatures verify with keys from
+// zone. An NSEC or NSEC3 is data from the upstream just like an address is;
+// using it without its RRSIG turns a forged negative reply into a secure one,
+// or lets a forged missing DS downgrade a signed child to unsigned.
+//
+// The signer name is checked as well as the cryptographic signature. The key
+// has already been tied to zone by the chain, and an RRSIG over the zone's own
+// denial must name that zone as its signer.
+func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial {
+	all := make([]dns.RR, 0, len(d.NSEC)+len(d.NSEC3)+len(d.sigs))
+	for _, rr := range d.NSEC {
+		all = append(all, rr)
+	}
+	for _, rr := range d.NSEC3 {
+		all = append(all, rr)
+	}
+	for _, sig := range d.sigs {
+		if dns.EqualName(sig.SignerName, zone) {
+			all = append(all, sig)
+		}
+	}
+
+	verified := Denial{zone: canonicalName(zone)}
+	for _, set := range GroupRRSets(all) {
+		if set.Type != dns.TypeNSEC && set.Type != dns.TypeNSEC3 {
+			continue
+		}
+		// RFC 4035 section 5.3.1 requires the signer to name the zone
+		// containing the RRset. Checking the signer name alone is insufficient:
+		// a zone key can cryptographically sign arbitrary wire data.
+		if !WithinZone(set.Name, zone) {
+			continue
+		}
+		if res, err := VerifyRRSet(set.Records, set.Sigs, keys, now); res != Secure || err != nil {
+			continue
+		}
+		if set.Type == dns.TypeNSEC && !hasExactNSECSignature(set, keys, now) {
+			// RFC 4035 section 5.4: a matching NSEC establishes that wildcard
+			// expansion was not used only when the signer recorded the same
+			// label count as the NSEC owner. A valid wildcard-expanded NSEC is
+			// not a statement about an exact existing owner, so it must not be
+			// used as any kind of denial proof.
+			continue
+		}
+		for _, rr := range set.Records {
+			switch rr := rr.(type) {
+			case *dns.NSEC:
+				verified.NSEC = append(verified.NSEC, rr)
+			case *dns.NSEC3:
+				// RFC 5155 section 8.2: only flag values 0 and 1 are valid
+				// NSEC3 denial proofs. Unknown flag bits must not be used to
+				// establish absence or a downgrade.
+				if rr.Flags != 0 && rr.Flags != 1 {
+					continue
+				}
+				verified.NSEC3 = append(verified.NSEC3, rr)
+			}
+		}
+	}
+	return verified
+}
+
+// hasExactNSECSignature checks the label-count part of RFC 4035 section 5.4.
+// VerifyRRSet accepts a valid wildcard signature by design; a non-wildcard
+// NSEC with fewer labels was expanded and proves no exact owner exists. An
+// NSEC whose *actual* owner is a wildcard is different: RFC 4034 encodes its
+// label count without the wildcard label, and RFC 4035 appendix B.7 uses that
+// record to prove wildcard NODATA. Inspect every usable signature rather than
+// relying on whichever valid one VerifyRRSet finds first.
+func hasExactNSECSignature(set RRSet, keys []*dns.DNSKEY, now time.Time) bool {
+	for _, sig := range set.Sigs {
+		labels := CountLabels(set.Name)
+		exactWildcardOwner := strings.HasPrefix(canonicalName(set.Name), "*.") && int(sig.Labels) == labels-1
+		if int(sig.Labels) != labels && !exactWildcardOwner {
+			continue
+		}
+		if res, _ := VerifyRRSet(set.Records, []*dns.RRSIG{sig}, keys, now); res == Secure {
+			return true
+		}
+	}
+	return false
+}
+
 // Empty reports whether nothing was offered.
 func (d Denial) Empty() bool { return len(d.NSEC) == 0 && len(d.NSEC3) == 0 }
+
+// HasOnlyUnsupportedNSEC3Iterations reports whether every authenticated
+// denial proof supplied by the zone is an NSEC3 record over our iteration
+// limit. It is deliberately narrower than "contains": a normal NSEC/NSEC3
+// proof that fails to establish the queried absence remains Bogus, even if an
+// unrelated high-iteration NSEC3 record accompanied it.
+func (d Denial) HasOnlyUnsupportedNSEC3Iterations() bool {
+	if len(d.NSEC) != 0 || len(d.NSEC3) == 0 {
+		return false
+	}
+	for _, rr := range d.NSEC3 {
+		// RFC 5155 section 8.1 requires an unknown hash type to be ignored.
+		// EDE 27 is only accurate when iterations, rather than the algorithm,
+		// is the reason this validator declined the otherwise authenticated
+		// proof.
+		if rr.Hash != 1 || rr.Iterations <= maxNSEC3Iterations {
+			return false
+		}
+	}
+	return true
+}
 
 // ProvesNoData reports whether the zone proved that name exists but holds no
 // record of rrtype.
@@ -215,7 +336,10 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			continue
 		}
-		if coversType(rr.TypeBitMap, rrtype) || coversType(rr.TypeBitMap, dns.TypeCNAME) {
+		if coversType(rr.TypeBitMap, rrtype) ||
+			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
+			coversType(rr.TypeBitMap, dns.TypeDNAME) ||
+			(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
 			return false
 		}
 		return true
@@ -225,12 +349,46 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 		if hashed == "" || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
 			continue
 		}
-		if coversType(rr.TypeBitMap, rrtype) || coversType(rr.TypeBitMap, dns.TypeCNAME) {
+		if coversType(rr.TypeBitMap, rrtype) ||
+			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
+			coversType(rr.TypeBitMap, dns.TypeDNAME) ||
+			(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
 			return false
 		}
 		return true
 	}
 	return false
+}
+
+// ProvesWildcardNoData reports whether a wildcard matched name but did not
+// hold rrtype. This is not an NXDOMAIN: the closest-encloser proof says the
+// queried name is absent, while the matching wildcard NSEC/NSEC3 says the
+// wildcard does exist and omits the requested type.
+//
+// RFC 4035 appendix B.7 and RFC 5155 section 7.2.5 require both parts. In
+// particular, accepting only the first would turn a nonexistent name into a
+// secure NODATA even when no wildcard exists; accepting only the second would
+// let a wildcard be used below a closer existing name.
+func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
+	if len(d.NSEC) > 0 {
+		for _, rr := range d.NSEC {
+			if !d.nsecMayProveAbsence(rr, name) {
+				continue
+			}
+			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
+			if closest != "" && d.ProvesNoData("*."+closest, rrtype) {
+				return true
+			}
+		}
+		return false
+	}
+
+	closest, ok := d.closestEncloser(name, zone)
+	if !ok {
+		return false
+	}
+	nextCloser := nextCloserName(name, closest)
+	return nextCloser != "" && d.covered(nextCloser) && d.ProvesNoData("*."+closest, rrtype)
 }
 
 // ProvesNoDS reports whether the zone proved that name is delegated without a
@@ -270,7 +428,7 @@ func (d Denial) ProvesNoDS(name string) bool {
 			continue
 		}
 		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) {
+		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
 			return true
 		}
 	}
@@ -286,23 +444,23 @@ func (d Denial) ProvesNoDS(name string) bool {
 // a denial that ignores the wildcard denies something the zone would actually
 // have answered.
 func (d Denial) ProvesNameError(name, zone string) bool {
-	wildcard := "*." + canonicalName(zone)
-
 	if len(d.NSEC) > 0 {
-		covered, wildcardDenied := false, false
 		for _, rr := range d.NSEC {
-			if nsecCovers(rr, name) {
-				covered = true
+			if !d.nsecMayProveAbsence(rr, name) {
+				continue
 			}
-			if nsecCovers(rr, wildcard) || canonicalCompare(rr.Header().Name, wildcard) == 0 {
-				// A matching wildcard record proves the wildcard exists, which
-				// is not a name error; only a covering one denies it.
-				if nsecCovers(rr, wildcard) {
-					wildcardDenied = true
-				}
+			// RFC 4035 section 5.4 requires that a name error also prove no
+			// relevant wildcard could have answered. For NSEC, the record that
+			// covers QNAME retains the hierarchy that NSEC3 hashes away: its
+			// owner and QNAME share the closest encloser. Checking only
+			// "*.zone" would accept a replayed NXDOMAIN for x.b.zone when
+			// "*.b.zone" actually exists.
+			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
+			if closest != "" && d.nsecCovers("*."+closest) {
+				return true
 			}
 		}
-		return covered && wildcardDenied
+		return false
 	}
 
 	// NSEC3 proves it in three parts: the deepest ancestor that does exist, the
@@ -319,6 +477,61 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 	return d.covered("*." + closest)
 }
 
+// nsecClosestEncloser derives the closest enclosing name retained by an NSEC
+// proof. Unlike NSEC3, canonical NSEC ordering includes the hierarchy: the
+// immediate predecessor that covers QNAME must lie at or below the same
+// closest encloser. RFC 7129 section 5.5 describes this as NSEC implicitly
+// containing the closest-encloser information.
+func nsecClosestEncloser(name, owner, zone string) string {
+	nameLabels := canonicalLabels(name)
+	ownerLabels := canonicalLabels(owner)
+	common := 0
+	for i, j := len(nameLabels)-1, len(ownerLabels)-1; i >= 0 && j >= 0; i, j = i-1, j-1 {
+		if nameLabels[i] != ownerLabels[j] {
+			break
+		}
+		common++
+	}
+	if common == 0 {
+		return ""
+	}
+	closest := strings.Join(nameLabels[len(nameLabels)-common:], ".") + "."
+	if !WithinZone(closest, zone) {
+		return ""
+	}
+	return closest
+}
+
+func (d Denial) nsecCovers(name string) bool {
+	for _, rr := range d.NSEC {
+		if d.nsecMayProveAbsence(rr, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// nsecMayProveAbsence applies RFC 6840 section 4.1's two exclusions. A
+// parental NSEC at a delegation, or an NSEC at a DNAME, does not authorize the
+// parent to deny records below that point. Without this check, authentic data
+// from an ancestor can be replayed as an NXDOMAIN under its child.
+func (d Denial) nsecMayProveAbsence(rr *dns.NSEC, name string) bool {
+	if !nsecCovers(rr, name) {
+		return false
+	}
+	owner := rr.Header().Name
+	if !dns.EqualName(name, owner) && WithinZone(name, owner) {
+		if coversType(rr.TypeBitMap, dns.TypeDNAME) {
+			return false
+		}
+		if coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA) &&
+			d.zone != "" && CountLabels(d.zone) < CountLabels(owner) {
+			return false
+		}
+	}
+	return true
+}
+
 // closestEncloser finds the deepest ancestor of name that the zone has a
 // matching record for.
 func (d Denial) closestEncloser(name, zone string) (string, bool) {
@@ -328,6 +541,13 @@ func (d Denial) closestEncloser(name, zone string) (string, bool) {
 		for _, rr := range d.NSEC3 {
 			hashed := NSEC3Hash(candidate, rr.Hash, rr.Iterations, rr.Salt)
 			if hashed != "" && hashed == strings.ToUpper(firstLabel(rr.Header().Name)) {
+				// RFC 5155 section 8.3 requires the closest-encloser record
+				// to be authoritative for this zone: a DNAME cannot be used,
+				// and NS is acceptable only together with SOA at the apex.
+				if coversType(rr.TypeBitMap, dns.TypeDNAME) ||
+					(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
+					return "", false
+				}
 				return candidate, true
 			}
 		}
@@ -346,7 +566,7 @@ func (d Denial) closestEncloser(name, zone string) (string, bool) {
 func (d Denial) covered(name string) bool {
 	for _, rr := range d.NSEC3 {
 		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) {
+		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
 			return true
 		}
 	}
@@ -399,7 +619,7 @@ const maxNSEC3Iterations = 100
 // does that.
 func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
 	for _, rr := range d.NSEC {
-		if nsecCovers(rr, nextCloser) {
+		if d.nsecMayProveAbsence(rr, nextCloser) {
 			return true
 		}
 	}
@@ -408,7 +628,7 @@ func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
 			continue
 		}
 		hashed := NSEC3Hash(nextCloser, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) {
+		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, nextCloser) {
 			return true
 		}
 	}
@@ -422,13 +642,19 @@ func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
 // nothing delegated here" or "there is a child zone and its parent does not
 // sign for it", and only the first allows the walk to carry on using this
 // zone's keys. Positive proof is required: an NSEC or NSEC3 matching the name
-// itself, without NS in its type bitmap. Anything less -- a proof for another
-// name, an opt-out span, hashing this build declines to do -- establishes
-// nothing, and treating that as "not a delegation" would hand the parent's keys
-// to a child zone and refuse its unsigned answers as forged.
+// itself, without NS in its type bitmap. A covering NSEC also proves this: the
+// name does not exist in the parent zone, so cannot be its delegation point.
+// A covering NSEC3 has that meaning only without Opt-Out; an Opt-Out span can
+// conceal an unsigned delegation. Anything less -- a proof for another name,
+// an opt-out span, hashing this build declines to do -- establishes nothing,
+// and treating that as "not a delegation" would hand the parent's keys to a
+// child zone and refuse its unsigned answers as forged.
 func (d Denial) ProvesNotADelegation(name string) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
+			if d.nsecMayProveAbsence(rr, name) {
+				return true
+			}
 			continue
 		}
 		// SOA marks a zone apex, which this name would not be if it were merely
@@ -440,7 +666,16 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 	}
 	for _, rr := range d.NSEC3 {
 		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed == "" || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
+		if hashed == "" {
+			continue
+		}
+		if hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
+			// RFC 5155 section 8.9 permits an NSEC3 span to hide an unsigned
+			// delegation only with Opt-Out. Without that bit, a covered name is
+			// known not to be a zone cut.
+			if rr.Flags == 0 && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
+				return true
+			}
 			continue
 		}
 		if coversType(rr.TypeBitMap, dns.TypeNS) || coversType(rr.TypeBitMap, dns.TypeSOA) {
@@ -449,4 +684,35 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 		return true
 	}
 	return false
+}
+
+// nsec3MayProveAbsence is the NSEC3 form of the RFC 6840 section 4.1 guard.
+// The original owner is hashed, so test every ancestor of the claimed-absent
+// name against this NSEC3 owner. Only an exact hash match establishes that its
+// DNAME or delegation bitmap belongs to an ancestor rather than an unrelated
+// point in the hash ring.
+func (d Denial) nsec3MayProveAbsence(rr *dns.NSEC3, name string) bool {
+	if !coversType(rr.TypeBitMap, dns.TypeDNAME) &&
+		!(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
+		return true
+	}
+	zone := d.zone
+	if zone == "" {
+		zone = "."
+	}
+	candidate := canonicalName(name)
+	owner := strings.ToUpper(firstLabel(rr.Header().Name))
+	for {
+		if NSEC3Hash(candidate, rr.Hash, rr.Iterations, rr.Salt) == owner {
+			return false
+		}
+		if canonicalCompare(candidate, zone) == 0 {
+			return true
+		}
+		parent := parentName(candidate)
+		if parent == candidate {
+			return true
+		}
+		candidate = parent
+	}
 }

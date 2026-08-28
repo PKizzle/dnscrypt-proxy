@@ -2,6 +2,7 @@ package dnssec
 
 import (
 	"testing"
+	"time"
 
 	"codeberg.org/miekg/dns"
 	"codeberg.org/miekg/dns/rdata"
@@ -101,6 +102,69 @@ func TestProvesNoDataRefusesToDenyACNAME(t *testing.T) {
 	}
 }
 
+// DNAME redirects all names below its owner. It cannot coexist with ordinary
+// data, so a denial that ignores it would accept a NODATA reply where the zone
+// should have supplied the redirection.
+func TestProvesNoDataRefusesToDenyADNAME(t *testing.T) {
+	d := Denial{NSEC: []*dns.NSEC{nsec("www.example.", "x.example.", dns.TypeDNAME, dns.TypeRRSIG)}}
+	if d.ProvesNoData("www.example.", dns.TypeA) {
+		t.Error("a name holding a DNAME must not be denied")
+	}
+}
+
+// RFC 6840 section 4.1/4.4: an NSEC at a delegation point cannot turn a
+// referral into NODATA. Its NS-without-SOA bitmap identifies parent-side data,
+// not an authoritative answer for ordinary types.
+func TestProvesNoDataRefusesToDenyAtADelegation(t *testing.T) {
+	d := Denial{NSEC: []*dns.NSEC{nsec("child.example.", "d.example.", dns.TypeNS, dns.TypeNSEC, dns.TypeRRSIG)}}
+	if d.ProvesNoData("child.example.", dns.TypeA) {
+		t.Error("a delegation NSEC must not prove child.example. has no A record")
+	}
+}
+
+func TestProvesWildcardNoDataRequiresBothTheClosestEncloserAndWildcard(t *testing.T) {
+	// RFC 4035 appendix B.7: the gap proves x is below the closest encloser
+	// example.test.; the matching wildcard record proves that wildcard exists
+	// but has no AAAA record.
+	gap := nsec("a.example.test.", "z.example.test.", dns.TypeNSEC, dns.TypeRRSIG)
+	wildcard := nsec("*.example.test.", "x.example.test.", dns.TypeA, dns.TypeNSEC, dns.TypeRRSIG)
+	d := Denial{NSEC: []*dns.NSEC{gap, wildcard}}
+	if !d.ProvesWildcardNoData("x.example.test.", "example.test.", dns.TypeAAAA) {
+		t.Fatal("a complete NSEC wildcard NODATA proof was not accepted")
+	}
+	if d.ProvesWildcardNoData("x.example.test.", "example.test.", dns.TypeA) {
+		t.Fatal("a wildcard containing the requested type proved NODATA")
+	}
+	if (Denial{NSEC: []*dns.NSEC{gap}}).ProvesWildcardNoData("x.example.test.", "example.test.", dns.TypeAAAA) {
+		t.Fatal("the closest-encloser proof alone proved wildcard NODATA")
+	}
+	if (Denial{NSEC: []*dns.NSEC{wildcard}}).ProvesWildcardNoData("x.example.test.", "example.test.", dns.TypeAAAA) {
+		t.Fatal("the wildcard proof alone proved wildcard NODATA")
+	}
+}
+
+func TestProvesNSEC3WildcardNoData(t *testing.T) {
+	name, zone := "x.example.test.", "example.test."
+	closestHash := NSEC3Hash(zone, 1, 0, "-")
+	wildcardHash := NSEC3Hash("*."+zone, 1, 0, "-")
+	nextCloserHash := NSEC3Hash(name, 1, 0, "-")
+	before, after := "0000000000000000000000000000000A", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+	if nextCloserHash < before || nextCloserHash > after {
+		t.Skipf("hash %s falls outside the constructed gap", nextCloserHash)
+	}
+	d := Denial{NSEC3: []*dns.NSEC3{
+		nsec3(closestHash, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, dns.TypeNSEC3, dns.TypeRRSIG),
+		nsec3(before, after, 0, dns.TypeNSEC3, dns.TypeRRSIG),
+		nsec3(wildcardHash, "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", 0, dns.TypeA, dns.TypeNSEC3, dns.TypeRRSIG),
+	}}
+	if !d.ProvesWildcardNoData(name, zone, dns.TypeAAAA) {
+		t.Fatal("a complete NSEC3 wildcard NODATA proof was not accepted")
+	}
+	if d.ProvesWildcardNoData(name, zone, dns.TypeA) {
+		t.Fatal("an NSEC3 wildcard containing the requested type proved NODATA")
+	}
+}
+
 // This is the denial that decides whether everything below a delegation is
 // outside DNSSEC, so it is the one an attacker forges to downgrade a zone.
 func TestProvesNoDS(t *testing.T) {
@@ -128,6 +192,13 @@ func TestProvesNoDS(t *testing.T) {
 	}
 }
 
+func TestProvesNotADelegationWhenNSECCoversANonexistentName(t *testing.T) {
+	d := Denial{NSEC: []*dns.NSEC{nsec("a.example.", "c.example.", dns.TypeNSEC, dns.TypeRRSIG)}}
+	if !d.ProvesNotADelegation("b.example.") {
+		t.Error("a covering NSEC should prove a nonexistent name is not a delegation")
+	}
+}
+
 // A name error needs the wildcard denied too: a zone holding *.example. would
 // have answered, so covering the name alone proves nothing.
 func TestProvesNameErrorRequiresTheWildcardDenied(t *testing.T) {
@@ -145,6 +216,47 @@ func TestProvesNameErrorRequiresTheWildcardDenied(t *testing.T) {
 	}
 }
 
+// RFC 4035 section 5.4 requires denial of the wildcard that would actually be
+// consulted. Denying only *.example. must not turn a real *.b.example. answer
+// into an accepted NXDOMAIN for x.b.example.
+func TestProvesNameErrorUsesTheClosestNSECEncloser(t *testing.T) {
+	nameCover := nsec("a.b.example.", "z.b.example.", dns.TypeA)
+	apexWildcardCover := nsec("example.", "a.example.", dns.TypeSOA)
+	wrong := Denial{NSEC: []*dns.NSEC{nameCover, apexWildcardCover}}
+	if wrong.ProvesNameError("x.b.example.", "example.") {
+		t.Fatal("a proof for *.example. must not deny the relevant *.b.example. wildcard")
+	}
+
+	closestWildcardCover := nsec("b.example.", "c.b.example.", dns.TypeNS)
+	valid := Denial{NSEC: []*dns.NSEC{nameCover, closestWildcardCover}}
+	if !valid.ProvesNameError("x.b.example.", "example.") {
+		t.Fatal("a proof for the closest-encloser wildcard should validate the name error")
+	}
+}
+
+func TestAncestorDNAMEProofCannotDenyItsDescendant(t *testing.T) {
+	// d.example. -> z.example. covers x.d.example. and *.d.example., but
+	// RFC 6840 section 4.1 says the DNAME bit prevents it proving either
+	// absent: the response must contain the DNAME synthesis instead.
+	d := Denial{NSEC: []*dns.NSEC{nsec("d.example.", "z.example.", dns.TypeDNAME, dns.TypeNSEC, dns.TypeRRSIG)}}
+	if d.ProvesNameError("x.d.example.", "example.") {
+		t.Fatal("an NSEC at a DNAME must not prove its descendant NXDOMAIN")
+	}
+	if d.ProvesNoCloserMatch("x.d.example.") {
+		t.Fatal("an NSEC at a DNAME must not prove a wildcard expansion below it absent")
+	}
+}
+
+func TestNSEC3AncestorDNAMECannotProveAbsence(t *testing.T) {
+	ancestor := "d.example.test."
+	owner := NSEC3Hash(ancestor, 1, 0, "-")
+	rr := nsec3(owner, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", 0, dns.TypeDNAME)
+	d := Denial{NSEC3: []*dns.NSEC3{rr}, zone: "example.test."}
+	if d.nsec3MayProveAbsence(rr, "x.d.example.test.") {
+		t.Fatal("NSEC3 at a DNAME must not deny a descendant")
+	}
+}
+
 func TestNSEC3HashMatchesTheKnownVector(t *testing.T) {
 	// RFC 5155 appendix A: "a.example" with salt aabbccdd and 12 iterations.
 	got := NSEC3Hash("a.example.", 1, 12, "aabbccdd")
@@ -159,6 +271,47 @@ func TestNSEC3HashMatchesTheKnownVector(t *testing.T) {
 func TestNSEC3HashRefusesAnUnknownAlgorithm(t *testing.T) {
 	if got := NSEC3Hash("a.example.", 99, 0, "-"); got != "" {
 		t.Errorf("NSEC3Hash() with an unknown algorithm = %q, want empty", got)
+	}
+}
+
+func TestNSEC3HashRefusesAnOddLengthSalt(t *testing.T) {
+	if got := NSEC3Hash("a.example.", 1, 0, "a"); got != "" {
+		t.Errorf("NSEC3Hash() with an odd-length salt = %q, want empty", got)
+	}
+}
+
+func TestDenialIdentifiesOnlyUnsupportedNSEC3Iterations(t *testing.T) {
+	high := nsec3("AAAA", "ZZZZ", 0, dns.TypeRRSIG, dns.TypeNSEC3)
+	high.Iterations = maxNSEC3Iterations + 1
+	if !(Denial{NSEC3: []*dns.NSEC3{high}}).HasOnlyUnsupportedNSEC3Iterations() {
+		t.Fatal("a denial consisting only of high-iteration NSEC3 records was not identified")
+	}
+	low := nsec3("BBBB", "ZZZZ", 0, dns.TypeRRSIG, dns.TypeNSEC3)
+	low.Iterations = maxNSEC3Iterations
+	if (Denial{NSEC3: []*dns.NSEC3{high, low}}).HasOnlyUnsupportedNSEC3Iterations() {
+		t.Fatal("a usable NSEC3 record made the whole denial look unsupported")
+	}
+	plain := nsec("a.example.test.", "z.example.test.", dns.TypeRRSIG, dns.TypeNSEC)
+	if (Denial{NSEC: []*dns.NSEC{plain}, NSEC3: []*dns.NSEC3{high}}).HasOnlyUnsupportedNSEC3Iterations() {
+		t.Fatal("an NSEC proof made the whole denial look unsupported")
+	}
+	unknownHash := *high
+	unknownHash.Hash = 2
+	if (Denial{NSEC3: []*dns.NSEC3{&unknownHash}}).HasOnlyUnsupportedNSEC3Iterations() {
+		t.Fatal("an unknown NSEC3 hash was incorrectly attributed to iterations")
+	}
+}
+
+func TestNSEC3ClosestEncloserRefusesDNAMEAndDelegationRecords(t *testing.T) {
+	owner := NSEC3Hash("example.test.", 1, 0, "-")
+	for _, types := range [][]uint16{
+		{dns.TypeDNAME},
+		{dns.TypeNS},
+	} {
+		d := Denial{NSEC3: []*dns.NSEC3{nsec3(owner, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, types...)}}
+		if _, ok := d.closestEncloser("missing.example.test.", "example.test."); ok {
+			t.Errorf("NSEC3 bitmap %v was accepted as a closest encloser", types)
+		}
 	}
 }
 
@@ -197,6 +350,82 @@ func TestCollectDenialAndEmpty(t *testing.T) {
 	}
 	if d.Empty() {
 		t.Error("a denial holding a record is not empty")
+	}
+}
+
+// Denial records make negative answers and unsigned delegations trustworthy;
+// without their own RRSIG, an upstream could manufacture either conclusion.
+func TestOnlyASignedDenialCanProveAbsence(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec("www.example.test.", "x.example.test.", dns.TypeRRSIG, dns.TypeNSEC)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.ProvesNoData("www.example.test.", dns.TypeA) {
+		t.Error("a denial signed by the zone's key did not verify")
+	}
+
+	forged := CollectDenial([]dns.RR{rr}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !forged.Empty() {
+		t.Error("an unsigned denial was accepted as proof")
+	}
+}
+
+// RFC 4035 section 5.4 permits a matching NSEC to establish that wildcard
+// expansion was not used only when the signature's label count matches the
+// NSEC owner. A wildcard-expanded NSEC is cryptographically valid but does
+// not establish that the expanded owner exists.
+func TestVerifiedDenialRejectsWildcardExpandedNSEC(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	wildcard := nsec("*.example.test.", "z.example.test.", dns.TypeNSEC, dns.TypeRRSIG)
+	sig := z.sign([]dns.RR{wildcard}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	wildcard.Hdr.Name = "missing.example.test."
+	sig.Hdr.Name = "missing.example.test."
+	verified := CollectDenial([]dns.RR{wildcard, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Fatal("a wildcard-expanded NSEC was accepted as an exact denial proof")
+	}
+}
+
+func TestVerifiedDenialRejectsARecordOutsideTheSignerZone(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec("a.invalid.", "z.invalid.", dns.TypeNSEC, dns.TypeRRSIG)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Error("a signer must not establish denial for data outside its zone")
+	}
+}
+
+func TestVerifiedDenialRejectsNSEC3WithUnknownFlags(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec3("0000000000000000000000000000000A", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 2)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Error("an NSEC3 with an unknown flag bit must not prove absence")
+	}
+}
+
+// The key must sign as the zone that owns the denial. A signature with the
+// right key tag but a different signer name is not a statement by that zone.
+func TestDenialRequiresTheExpectedSignerName(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec("www.example.test.", "x.example.test.", dns.TypeRRSIG, dns.TypeNSEC)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+	sig.SignerName = "other.example.test."
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Error("a denial with the wrong signer name was accepted")
 	}
 }
 

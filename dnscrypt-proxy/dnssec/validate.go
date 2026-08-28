@@ -20,7 +20,8 @@ type Result int
 
 const (
 	// Indeterminate: nothing was concluded, because the inputs did not allow a
-	// conclusion. Never a reason to reject.
+	// conclusion. Reporting mode can serve it with no AD claim; enforcing mode
+	// must treat it as a validation failure unless the client set CD.
 	Indeterminate Result = iota
 	// Insecure: the zone is genuinely unsigned, proven or assumed by the caller.
 	// The ordinary state of most of the internet, and not a failure.
@@ -167,17 +168,50 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		return Bogus, fmt.Errorf("no offered key matches the delegation signer")
 	}
 
+	zone := keys[0].Header().Name
 	rrset := make([]dns.RR, 0, len(keys))
 	for _, key := range keys {
+		if !dns.EqualName(key.Header().Name, zone) {
+			return Bogus, fmt.Errorf("DNSKEY set mixes zones %s and %s", zone, key.Header().Name)
+		}
 		rrset = append(rrset, key)
 	}
+	// RFC 4035 section 5.3.1 requires the RRSIG Signer's Name to name the
+	// zone containing the RRset. The cryptographic check alone cannot enforce
+	// that: a key can sign an otherwise valid RRSIG carrying another name.
+	zoneSigs := signaturesFromZone(sigs, zone)
 	// Verified against the anchored keys only: a self-signature by an unanchored
 	// key would let the set vouch for itself.
-	res, err := VerifyRRSet(rrset, sigs, anchored, now)
+	res, err := VerifyRRSet(rrset, zoneSigs, anchored, now)
+	if res != Secure && hasCoveringSignatureFromAnotherZone(rrset, sigs, zone) {
+		return Bogus, fmt.Errorf("key set has a signature from another zone")
+	}
 	if res != Secure {
 		return res, fmt.Errorf("key set is not signed by an anchored key: %w", err)
 	}
 	return Secure, nil
+}
+
+// signaturesFromZone keeps only signatures whose signer is the zone expected
+// to own the RRset. Callers know that zone from the chain of trust; the generic
+// RRset verifier deliberately does not guess it.
+func signaturesFromZone(sigs []*dns.RRSIG, zone string) []*dns.RRSIG {
+	matched := make([]*dns.RRSIG, 0, len(sigs))
+	for _, sig := range sigs {
+		if dns.EqualName(sig.SignerName, zone) {
+			matched = append(matched, sig)
+		}
+	}
+	return matched
+}
+
+func hasCoveringSignatureFromAnotherZone(rrset []dns.RR, sigs []*dns.RRSIG, zone string) bool {
+	for _, sig := range sigs {
+		if covers(sig, rrset) && !dns.EqualName(sig.SignerName, zone) {
+			return true
+		}
+	}
+	return false
 }
 
 // equalFold compares hex digests without caring about case, which zones publish
