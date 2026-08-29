@@ -570,7 +570,11 @@ func (d Denial) nsecMayProveAbsence(rr *dns.NSEC, name string) bool {
 		return false
 	}
 	owner := rr.Header().Name
-	if !dns.EqualName(name, owner) && WithinZone(name, owner) {
+	// Query plugins retain a client QNAME without its trailing root label,
+	// while DNS RRs are fully qualified. dns.EqualName requires both inputs to
+	// be FQDNs and panics otherwise. Canonical comparison has the DNSSEC name
+	// semantics we need here and accepts either internal representation.
+	if canonicalCompare(name, owner) != 0 && WithinZone(name, owner) {
 		if coversType(rr.TypeBitMap, dns.TypeDNAME) {
 			return false
 		}

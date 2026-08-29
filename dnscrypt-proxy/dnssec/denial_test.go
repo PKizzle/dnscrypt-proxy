@@ -247,6 +247,19 @@ func TestAncestorDNAMEProofCannotDenyItsDescendant(t *testing.T) {
 	}
 }
 
+// Query plugins retain an internal QNAME without the trailing root label.
+// NSEC owner names are DNS RRs and therefore always fully qualified. The
+// absence check must compare those representations without calling the DNS
+// library's FQDN-only EqualName helper, which otherwise panics on real NXDOMAIN
+// traffic before the RFC 6840 DNAME/delegation exclusions can be applied.
+func TestNSECAbsenceCheckAcceptsAnInternalQName(t *testing.T) {
+	rr := nsec("a.example.", "c.example.", dns.TypeNSEC, dns.TypeRRSIG)
+	d := Denial{NSEC: []*dns.NSEC{rr}}
+	if !d.nsecMayProveAbsence(rr, "b.example") {
+		t.Fatal("NSEC should cover the internal, non-FQDN query name")
+	}
+}
+
 func TestNSEC3AncestorDNAMECannotProveAbsence(t *testing.T) {
 	ancestor := "d.example.test."
 	owner := NSEC3Hash(ancestor, 1, 0, "-")
