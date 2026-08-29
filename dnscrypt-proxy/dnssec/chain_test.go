@@ -52,6 +52,37 @@ type flakyDelegationHierarchy struct {
 	calls int
 }
 
+// cnameDelegationHierarchy models a DS query that is answered by a CNAME in
+// the signed parent zone. This is what real recursive resolvers return for a
+// CNAME-bearing Microsoft service name: it is positive evidence that the
+// queried name is not a delegation, but only after the parent signature is
+// checked.
+type cnameDelegationHierarchy struct {
+	*hierarchy
+	name   string
+	signed bool
+}
+
+func (h *cnameDelegationHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if zoneName != h.name {
+		return h.hierarchy.DS(zoneName)
+	}
+	parentName := h.parentOf(zoneName)
+	parent := h.zones[parentName]
+	if parent == nil {
+		return nil, nil, Denial{}, fmt.Errorf("no parent for CNAME %s", zoneName)
+	}
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: zoneName, Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: "target."},
+	}
+	evidence := Denial{cnames: []*dns.CNAME{cname}}
+	if h.signed {
+		evidence.cnameSigs = []*dns.RRSIG{parent.sign([]dns.RR{cname}, h.now.Add(-time.Hour), h.now.Add(time.Hour))}
+	}
+	return nil, nil, evidence, nil
+}
+
 func (h *flakyDelegationHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	if zoneName != h.zone {
 		return h.hierarchy.DS(zoneName)
@@ -266,6 +297,24 @@ func TestBuildChainRefetchesAnInvalidDelegationSigner(t *testing.T) {
 	}
 	if f.calls != 2 {
 		t.Fatalf("DS calls = %d, want 2 (invalid response then refetch)", f.calls)
+	}
+}
+
+func TestBuildChainWalksPastASignedCNAMEForDS(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	const alias = "alias.example.test."
+	res := BuildChain(&cnameDelegationHierarchy{hierarchy: h, name: alias, signed: true}, alias, h.anchors(), h.now)
+	if res.Status != Secure || res.Zone != "example.test." {
+		t.Fatalf("BuildChain() = %v at %q (%v), want secure parent zone", res.Status, res.Zone, res.Why)
+	}
+}
+
+func TestBuildChainDoesNotTrustAnUnsignedCNAMEForDS(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	const alias = "alias.example.test."
+	res := BuildChain(&cnameDelegationHierarchy{hierarchy: h, name: alias}, alias, h.anchors(), h.now)
+	if res.Status != Indeterminate {
+		t.Fatalf("BuildChain() = %v (%v), want indeterminate for unsigned CNAME evidence", res.Status, res.Why)
 	}
 }
 

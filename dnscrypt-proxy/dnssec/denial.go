@@ -196,7 +196,14 @@ type Denial struct {
 	NSEC  []*dns.NSEC
 	NSEC3 []*dns.NSEC3
 	sigs  []*dns.RRSIG
-	zone  string
+	// cnames is positive evidence collected only from a DS lookup. A signed,
+	// exact CNAME at the queried name proves that the current zone owns that
+	// name, and therefore that it is not a delegation point. Keeping it with
+	// the DS-absence evidence lets the chain distinguish that ordinary case
+	// from a response whose absence of DS data was merely unexplained.
+	cnames    []*dns.CNAME
+	cnameSigs []*dns.RRSIG
+	zone      string
 }
 
 // CollectDenial picks the denial records out of an authority section.
@@ -211,6 +218,27 @@ func CollectDenial(rrs []dns.RR) Denial {
 		case *dns.RRSIG:
 			if v.TypeCovered == dns.TypeNSEC || v.TypeCovered == dns.TypeNSEC3 {
 				d.sigs = append(d.sigs, v)
+			}
+		}
+	}
+	return d
+}
+
+// CollectDelegationEvidence gathers the proof a DS lookup can return when the
+// queried label is an alias rather than a zone cut. RFC 1034 section 3.6.2
+// makes a CNAME exclusive of ordinary data, and RFC 4035 sections 2.5 and 2.6
+// leave no room for parent-side DS/NS data at that same owner. The CNAME is
+// still untrusted here; Verified authenticates it with the current parent key
+// before the chain relies on it.
+func CollectDelegationEvidence(answer, authority []dns.RR) Denial {
+	d := CollectDenial(authority)
+	for _, rr := range answer {
+		switch v := rr.(type) {
+		case *dns.CNAME:
+			d.cnames = append(d.cnames, v)
+		case *dns.RRSIG:
+			if v.TypeCovered == dns.TypeCNAME {
+				d.cnameSigs = append(d.cnameSigs, v)
 			}
 		}
 	}
@@ -276,6 +304,26 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 			}
 		}
 	}
+	for _, cname := range d.cnames {
+		owner := cname.Header().Name
+		if !WithinZone(owner, zone) {
+			continue
+		}
+		rrset := []dns.RR{cname}
+		for _, sig := range signaturesFromZone(d.cnameSigs, zone) {
+			// A wildcard-expanded CNAME alone is not enough: without the
+			// accompanying denial proof, it does not establish that this exact
+			// owner was not a delegation. An exact signature is the positive
+			// parent-side fact needed by the chain walk.
+			if int(sig.Labels) != CountLabels(owner) {
+				continue
+			}
+			if res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, keys, now); res == Secure && err == nil {
+				verified.cnames = append(verified.cnames, cname)
+				break
+			}
+		}
+	}
 	return verified
 }
 
@@ -301,7 +349,9 @@ func hasExactNSECSignature(set RRSet, keys []*dns.DNSKEY, now time.Time) bool {
 }
 
 // Empty reports whether nothing was offered.
-func (d Denial) Empty() bool { return len(d.NSEC) == 0 && len(d.NSEC3) == 0 }
+func (d Denial) Empty() bool {
+	return len(d.NSEC) == 0 && len(d.NSEC3) == 0 && len(d.cnames) == 0
+}
 
 // HasOnlyUnsupportedNSEC3Iterations reports whether every authenticated
 // denial proof supplied by the zone is an NSEC3 record over our iteration
@@ -682,6 +732,11 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 			return false
 		}
 		return true
+	}
+	for _, cname := range d.cnames {
+		if canonicalCompare(cname.Header().Name, name) == 0 {
+			return true
+		}
 	}
 	return false
 }

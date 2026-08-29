@@ -238,11 +238,15 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	records := msg.Answer
 	denial := Denial{}
 	if len(dss) == 0 {
-		records = msg.Ns
+		// A DS query can encounter a CNAME at an ordinary name. Preserve its
+		// signed, exact parent-side proof alongside NSEC/NSEC3 evidence so the
+		// chain can continue through aliases such as Microsoft's service names.
+		// It is verified before use; a bare CNAME never establishes anything.
+		records = append(append([]dns.RR{}, msg.Answer...), msg.Ns...)
 		// Held with the absence it explains: it is what says whether there is a
 		// delegation here at all, and re-deriving it per name below this one
 		// would cost a query each time.
-		denial = CollectDenial(msg.Ns)
+		denial = CollectDelegationEvidence(msg.Answer, msg.Ns)
 		if denial.Empty() {
 			// An absence nothing accounts for is not a fact worth keeping. A
 			// response that lost its authority section on the way back looks

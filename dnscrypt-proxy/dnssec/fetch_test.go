@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/rdata"
 )
 
 // recordingQuery counts what it is asked, so the tests can tell a cache hit
@@ -115,6 +116,35 @@ func TestFetcherKeepsANameErrorProofForTheChain(t *testing.T) {
 	dss, _, denial, err := f.DS("nope.")
 	if err != nil || len(dss) != 0 || len(denial.NSEC) != 1 {
 		t.Fatalf("DS() = %d signers, %d NSEC, err %v; want a usable negative proof", len(dss), len(denial.NSEC), err)
+	}
+}
+
+// A DS query to an alias returns the signed CNAME in the Answer section, not
+// an NSEC in Authority. The chain needs that evidence to continue through the
+// parent zone, so the fetcher must preserve and cache it rather than treating
+// the empty DS set as unexplained.
+func TestFetcherKeepsCNAMEDelegationEvidence(t *testing.T) {
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "alias.example.", Class: dns.ClassINET, TTL: 120},
+		CNAME: rdata.CNAME{Target: "target.example."},
+	}
+	sig := &dns.RRSIG{
+		Hdr:   dns.Header{Name: "alias.example.", Class: dns.ClassINET, TTL: 120},
+		RRSIG: rdata.RRSIG{TypeCovered: dns.TypeCNAME},
+	}
+	rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+		return msgWith(dns.RcodeSuccess, []dns.RR{cname, sig}, nil), nil
+	}}
+	f := NewCachingFetcher(rec.fn)
+
+	for i := 0; i < 2; i++ {
+		dss, _, evidence, err := f.DS("alias.example.")
+		if err != nil || len(dss) != 0 || len(evidence.cnames) != 1 || len(evidence.cnameSigs) != 1 {
+			t.Fatalf("DS() = %d DS, %d CNAME, %d CNAME signatures, err %v", len(dss), len(evidence.cnames), len(evidence.cnameSigs), err)
+		}
+	}
+	if got := rec.calls["alias.example./43"]; got != 1 {
+		t.Errorf("upstream asked %d times, want 1: CNAME evidence should be cached", got)
 	}
 }
 
