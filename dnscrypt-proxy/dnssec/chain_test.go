@@ -61,6 +61,18 @@ type flakyRootHierarchy struct {
 	calls int
 }
 
+// flakyChildKeyHierarchy supplies one delegated DNSKEY RRset with a signature
+// that is not made by that zone's delegated key, then the valid response. It
+// models one inconsistent recursive upstream; retrying must never accept the
+// bad reply, but must avoid treating it as the permanent fate of the zone.
+type flakyChildKeyHierarchy struct {
+	*hierarchy
+	zone          string
+	calls         int
+	alwaysInvalid bool
+	badSigner     *zone
+}
+
 func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
 	if canonicalName(zoneName) != "." {
 		return h.hierarchy.DNSKEY(zoneName)
@@ -72,6 +84,18 @@ func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSI
 	root := h.zones["."]
 	stranger := h.zones["test."]
 	return []*dns.DNSKEY{root.key}, []*dns.RRSIG{stranger.sign([]dns.RR{root.key}, h.now.Add(-time.Hour), h.now.Add(time.Hour))}, nil
+}
+
+func (h *flakyChildKeyHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	if canonicalName(zoneName) != canonicalName(h.zone) {
+		return h.hierarchy.DNSKEY(zoneName)
+	}
+	h.calls++
+	if !h.alwaysInvalid && h.calls != 1 {
+		return h.hierarchy.DNSKEY(zoneName)
+	}
+	child := h.zones[canonicalName(zoneName)]
+	return []*dns.DNSKEY{child.key}, []*dns.RRSIG{h.badSigner.sign([]dns.RR{child.key}, h.now.Add(-time.Hour), h.now.Add(time.Hour))}, nil
 }
 
 // cnameDelegationHierarchy models a DS query that is answered by a CNAME in
@@ -389,6 +413,41 @@ func TestBuildChainRefetchesAnInvalidRootKeySet(t *testing.T) {
 	}
 	if f.calls != 2 {
 		t.Fatalf("root DNSKEY calls = %d, want 2 (invalid response then refetch)", f.calls)
+	}
+}
+
+func TestBuildChainRefetchesAnInvalidDelegatedKeySet(t *testing.T) {
+	h := newHierarchy(t, ".", "test.")
+	f := &flakyChildKeyHierarchy{
+		hierarchy: h,
+		zone:      "test.",
+		badSigner: newZone(t, "test."),
+	}
+
+	res := BuildChain(f, "test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("BuildChain() = %v (%v), want secure after refetch", res.Status, res.Why)
+	}
+	if f.calls != 2 {
+		t.Fatalf("delegated DNSKEY calls = %d, want 2 (invalid response then refetch)", f.calls)
+	}
+}
+
+func TestBuildChainRejectsADelegatedKeySetThatNeverVerifies(t *testing.T) {
+	h := newHierarchy(t, ".", "test.")
+	f := &flakyChildKeyHierarchy{
+		hierarchy:     h,
+		zone:          "test.",
+		alwaysInvalid: true,
+		badSigner:     newZone(t, "test."),
+	}
+
+	res := BuildChain(f, "test.", h.anchors(), h.now)
+	if res.Status != Bogus {
+		t.Fatalf("BuildChain() = %v (%v), want bogus", res.Status, res.Why)
+	}
+	if f.calls != chainFetchAttempts {
+		t.Fatalf("delegated DNSKEY calls = %d, want %d", f.calls, chainFetchAttempts)
 	}
 }
 

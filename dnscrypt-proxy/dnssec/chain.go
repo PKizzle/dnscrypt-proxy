@@ -197,18 +197,9 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 			}
 		}
 
-		childKeys, childSigs, err := f.DNSKEY(child)
-		if err != nil {
-			return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch keys for %s: %w", child, err)}
-		}
-		if res, err := VerifyDNSKEYs(childKeys, childSigs, dss, now); res != Secure {
-			// A key set that cannot be used stops the walk without condemning
-			// the zone: everything at or below is served unvalidated, which is
-			// what an unsigned zone gets and what RFC 6840 section 5.2 asks for.
-			// It is dropped rather than kept, so the next walk asks again
-			// instead of meeting the same answer from cache.
-			forget(f, child)
-			return ChainResult{Status: res, Zone: child, Why: fmt.Errorf("key set for %s: %w", child, err)}
+		childKeys, keyResult, err := verifiedChildKeys(f, child, dss, now)
+		if keyResult != Secure {
+			return ChainResult{Status: keyResult, Zone: child, Why: err}
 		}
 		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
 	}
@@ -244,6 +235,34 @@ func verifiedRootKeys(f Fetcher, anchors []*dns.DS, now time.Time) ([]*dns.DNSKE
 		forget(f, ".")
 	}
 	return nil, ChainResult{Status: lastResult, Zone: ".", Why: fmt.Errorf("root key set: %w", lastErr)}
+}
+
+// verifiedChildKeys authenticates a delegated DNSKEY RRset against the DS
+// RRset already authenticated from its parent. As with root keys and DS
+// RRsets, a delivered but invalid key set is not a transport error. In a pool
+// of recursive upstreams it can be stale or malformed, so evict and re-fetch
+// it a bounded number of times. A retry is accepted only after the same DS
+// authentication succeeds; if all attempts fail, RFC 4035 section 5.5 still
+// requires a validation failure rather than an insecure downgrade.
+func verifiedChildKeys(f Fetcher, child string, dss []*dns.DS, now time.Time) ([]*dns.DNSKEY, Result, error) {
+	var lastResult Result
+	var lastErr error
+	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+		keys, sigs, err := f.DNSKEY(child)
+		if err != nil {
+			return nil, Indeterminate, fmt.Errorf("fetch keys for %s: %w", child, err)
+		}
+		if res, err := VerifyDNSKEYs(keys, sigs, dss, now); res == Secure {
+			return keys, Secure, nil
+		} else {
+			lastResult, lastErr = res, err
+		}
+
+		// Do not allow an unauthenticated DNSKEY RRset to survive in cache and
+		// poison later chain walks until its TTL expires.
+		forget(f, child)
+	}
+	return nil, lastResult, fmt.Errorf("key set for %s: %w", child, lastErr)
 }
 
 // verifiedDelegationSigners fetches and authenticates the parent-side DS RRset
