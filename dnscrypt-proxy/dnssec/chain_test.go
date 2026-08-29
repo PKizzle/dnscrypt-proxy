@@ -63,6 +63,46 @@ type cnameDelegationHierarchy struct {
 	signed bool
 }
 
+// absentAncestorHierarchy returns a complete signed NSEC3 name-error proof
+// for one label, then fails if the chain asks about a descendant. A complete
+// name-error means that descendant cannot be a zone cut: if it had a child,
+// the supposedly absent label would be an existing empty non-terminal.
+type absentAncestorHierarchy struct {
+	*hierarchy
+	absent          string
+	descendantCalls int
+}
+
+func (h *absentAncestorHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if canonicalName(zoneName) == canonicalName(h.absent) {
+		parentName := h.parentOf(zoneName)
+		parent := h.zones[parentName]
+		if parent == nil {
+			return nil, nil, Denial{}, fmt.Errorf("no parent for %s", zoneName)
+		}
+
+		// RFC 5155 sections 8.3 and 8.4: the exact closest encloser,
+		// plus one NSEC3 span covering both next-closer and wildcard.
+		// The synthetic span is intentionally non-opt-out: it proves the
+		// absent names rather than concealing an unsigned delegation.
+		closest := NSEC3Hash(parentName, 1, 0, "-")
+		ce := nsec3(closest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC3)
+		cover := nsec3("00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, dns.TypeRRSIG, dns.TypeNSEC3)
+		return nil, nil, Denial{
+			NSEC3: []*dns.NSEC3{ce, cover},
+			sigs: []*dns.RRSIG{
+				parent.sign([]dns.RR{ce}, h.now.Add(-time.Hour), h.now.Add(time.Hour)),
+				parent.sign([]dns.RR{cover}, h.now.Add(-time.Hour), h.now.Add(time.Hour)),
+			},
+		}, nil
+	}
+	if WithinZone(zoneName, h.absent) {
+		h.descendantCalls++
+		return nil, nil, Denial{}, fmt.Errorf("unexpected DS lookup below proven-absent %s: %s", h.absent, zoneName)
+	}
+	return h.hierarchy.DS(zoneName)
+}
+
 func (h *cnameDelegationHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	if zoneName != h.name {
 		return h.hierarchy.DS(zoneName)
@@ -273,6 +313,23 @@ func TestBuildChainWalksPastASignedNameErrorForDS(t *testing.T) {
 	res := BuildChain(f, "kolbergs-nas.", []*dns.DS{root.key.ToDS(dns.SHA256)}, now)
 	if res.Status != Secure || res.Zone != "." || len(res.Keys) != 1 {
 		t.Fatalf("BuildChain() = %v at %q (%v), want root secure", res.Status, res.Zone, res.Why)
+	}
+}
+
+// A complete RFC 5155 name-error proof makes all descendants impossible. In
+// particular, the walk must not require a redundant DS proof for each label
+// below it; recursive resolvers normally provide the one closest-encloser
+// proof for the entire negative answer.
+func TestBuildChainSkipsDescendantsOfAProvenAbsentNSEC3Name(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	f := &absentAncestorHierarchy{hierarchy: h, absent: "missing.example.test."}
+
+	res := BuildChain(f, "leaf.missing.example.test.", h.anchors(), h.now)
+	if res.Status != Secure || res.Zone != "example.test." {
+		t.Fatalf("BuildChain() = %v at %q (%v), want secure at example.test.", res.Status, res.Zone, res.Why)
+	}
+	if f.descendantCalls != 0 {
+		t.Fatalf("DS lookups below proven-absent name = %d, want 0", f.descendantCalls)
 	}
 }
 

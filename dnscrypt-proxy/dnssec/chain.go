@@ -119,8 +119,22 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 		return ChainResult{Status: res, Zone: ".", Why: fmt.Errorf("root key set: %w", err)}
 	}
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
+	// An authenticated name-error proof establishes that this label is absent
+	// from the current zone. DNS names with descendants are existing empty
+	// non-terminals, so no label below a proven-absent name can be a zone cut.
+	// Remembering that fact avoids asking every descendant for its own DS proof.
+	//
+	// This is deliberately a complete name-error proof, not merely a covering
+	// NSEC/NSEC3: RFC 5155 sections 8.3 and 8.4 require the closest encloser,
+	// next-closer, and wildcard evidence before a validator can conclude that a
+	// name is absent. An exact NSEC/NSEC3 or a signed CNAME only establishes
+	// that one label is not a cut; a delegation may still exist below it.
+	var absentAncestor string
 
 	for _, child := range zones[1:] {
+		if absentAncestor != "" && WithinZone(child, absentAncestor) {
+			continue
+		}
 		dss, _, denial, err, invalid := verifiedDelegationSigners(f, child, current, now)
 		if err != nil {
 			if invalid {
@@ -162,6 +176,13 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				current.Keys = nil
 				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
 				return current
+			case denial.ProvesNameError(child, current.Zone):
+				// A complete authenticated name-error proof says this label is
+				// absent, not just that it is an ordinary existing name. Any
+				// descendant is therefore absent too, so it cannot be a zone
+				// cut. Retain the current zone's keys for the original response.
+				absentAncestor = canonicalName(child)
+				continue
 			case denial.ProvesNotADelegation(child):
 				// An ordinary name inside the zone reached so far. The walk
 				// carries on rather than stopping here: a label further down
