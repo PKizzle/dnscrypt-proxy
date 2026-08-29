@@ -73,6 +73,16 @@ type flakyChildKeyHierarchy struct {
 	badSigner     *zone
 }
 
+// flakyNoDSProofHierarchy first returns authenticated evidence that settles
+// neither a delegation nor an ordinary name, then the real parent proof. It
+// models a recursive upstream that omitted useful negative evidence.
+type flakyNoDSProofHierarchy struct {
+	*hierarchy
+	zone           string
+	calls          int
+	alwaysUnproven bool
+}
+
 func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
 	if canonicalName(zoneName) != "." {
 		return h.hierarchy.DNSKEY(zoneName)
@@ -96,6 +106,17 @@ func (h *flakyChildKeyHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.
 	}
 	child := h.zones[canonicalName(zoneName)]
 	return []*dns.DNSKEY{child.key}, []*dns.RRSIG{h.badSigner.sign([]dns.RR{child.key}, h.now.Add(-time.Hour), h.now.Add(time.Hour))}, nil
+}
+
+func (h *flakyNoDSProofHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if canonicalName(zoneName) != canonicalName(h.zone) {
+		return h.hierarchy.DS(zoneName)
+	}
+	h.calls++
+	if h.alwaysUnproven || h.calls == 1 {
+		return nil, nil, h.nsecProving("other."+canonicalName(zoneName), dns.TypeA), nil
+	}
+	return h.hierarchy.DS(zoneName)
 }
 
 // cnameDelegationHierarchy models a DS query that is answered by a CNAME in
@@ -448,6 +469,35 @@ func TestBuildChainRejectsADelegatedKeySetThatNeverVerifies(t *testing.T) {
 	}
 	if f.calls != chainFetchAttempts {
 		t.Fatalf("delegated DNSKEY calls = %d, want %d", f.calls, chainFetchAttempts)
+	}
+}
+
+func TestBuildChainRefetchesAnInconclusiveNoDSResponse(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	const ordinaryName = "www.example.test."
+	h.notACut[ordinaryName] = true
+	f := &flakyNoDSProofHierarchy{hierarchy: h, zone: ordinaryName}
+
+	res := BuildChain(f, ordinaryName, h.anchors(), h.now)
+	if res.Status != Secure || res.Zone != "example.test." {
+		t.Fatalf("BuildChain() = %v at %q (%v), want secure parent after refetch", res.Status, res.Zone, res.Why)
+	}
+	if f.calls != 2 {
+		t.Fatalf("DS calls = %d, want 2 (inconclusive response then refetch)", f.calls)
+	}
+}
+
+func TestBuildChainRejectsNoDSResponsesThatNeverSettleTheZoneCut(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	const ordinaryName = "www.example.test."
+	f := &flakyNoDSProofHierarchy{hierarchy: h, zone: ordinaryName, alwaysUnproven: true}
+
+	res := BuildChain(f, ordinaryName, h.anchors(), h.now)
+	if res.Status != Indeterminate {
+		t.Fatalf("BuildChain() = %v (%v), want indeterminate", res.Status, res.Why)
+	}
+	if f.calls != chainFetchAttempts {
+		t.Fatalf("DS calls = %d, want %d", f.calls, chainFetchAttempts)
 	}
 }
 

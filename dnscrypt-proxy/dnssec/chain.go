@@ -124,21 +124,38 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	// that one label is not a cut; a delegation may still exist below it.
 	var absentAncestor string
 
+nextChild:
 	for _, child := range zones[1:] {
 		if absentAncestor != "" && WithinZone(child, absentAncestor) {
 			continue
 		}
-		dss, _, denial, err, invalid := verifiedDelegationSigners(f, child, current, now)
-		if err != nil {
-			if invalid {
-				return ChainResult{
-					Status: Bogus, Zone: current.Zone,
-					Why: fmt.Errorf("delegation signer for %s is not signed by %s: %w", child, current.Zone, err),
+
+		// A response with no DS needs authenticated evidence to distinguish an
+		// ordinary name from an unsigned delegation. Different recursive
+		// upstreams can return incomplete negative responses, so an answer that
+		// settles neither is evicted and retried just like an invalid DS RRset.
+		// This never turns an unproven response into a trusted one: all attempts
+		// must still pass the RFC 4035/RFC 5155 predicates below.
+		for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+			dss, _, denial, err, invalid := verifiedDelegationSigners(f, child, current, now)
+			if err != nil {
+				if invalid {
+					return ChainResult{
+						Status: Bogus, Zone: current.Zone,
+						Why: fmt.Errorf("delegation signer for %s is not signed by %s: %w", child, current.Zone, err),
+					}
 				}
+				return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch DS for %s: %w", child, err)}
 			}
-			return ChainResult{Status: Indeterminate, Zone: current.Zone, Why: fmt.Errorf("fetch DS for %s: %w", child, err)}
-		}
-		if len(dss) == 0 {
+			if len(dss) != 0 {
+				childKeys, keyResult, err := verifiedChildKeys(f, child, dss, now)
+				if keyResult != Secure {
+					return ChainResult{Status: keyResult, Zone: child, Why: err}
+				}
+				current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
+				continue nextChild
+			}
+
 			denial = denial.Verified(current.Keys, current.Zone, now)
 			// No delegation signer has two very different meanings, and reading
 			// the wrong one costs either coverage or correctness.
@@ -165,17 +182,14 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				// carrying no signature, so this stays where it was and says that
 				// nothing could be concluded. It is not an unsigned delegation:
 				// no signed proof established one.
-				current.Status = Indeterminate
-				current.Keys = nil
-				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
-				return current
+				// Retry below after evicting this incomplete response.
 			case denial.ProvesNameError(child, current.Zone):
 				// A complete authenticated name-error proof says this label is
 				// absent, not just that it is an ordinary existing name. Any
 				// descendant is therefore absent too, so it cannot be a zone
 				// cut. Retain the current zone's keys for the original response.
 				absentAncestor = canonicalName(child)
-				continue
+				continue nextChild
 			case denial.ProvesNotADelegation(child):
 				// An ordinary name inside the zone reached so far. The walk
 				// carries on rather than stopping here: a label further down
@@ -183,25 +197,29 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 				// is not would hand this zone's keys to a child zone below it
 				// and refuse that zone's unsigned answers as forged. A CDN
 				// name three labels below a signed zone is exactly that shape.
-				continue
+				continue nextChild
 			default:
 				// The parent offered something, but nothing that settles which
 				// of the two this is. Carrying on would hand its keys to what
 				// may be a child zone and then refuse that zone's unsigned
 				// answers as forged -- which is what a reverse-DNS delegation
 				// under an opt-out span looks like from here.
-				current.Status = Indeterminate
-				current.Keys = nil
-				current.Why = fmt.Errorf("%s: nothing shown either way about a delegation there", child)
-				return current
+				// Retry below after evicting this inconclusive response.
 			}
-		}
 
-		childKeys, keyResult, err := verifiedChildKeys(f, child, dss, now)
-		if keyResult != Secure {
-			return ChainResult{Status: keyResult, Zone: child, Why: err}
+			if attempt+1 < chainFetchAttempts {
+				forget(f, child)
+				continue
+			}
+			current.Status = Indeterminate
+			current.Keys = nil
+			if denial.Empty() {
+				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
+			} else {
+				current.Why = fmt.Errorf("%s: nothing shown either way about a delegation there", child)
+			}
+			return current
 		}
-		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
 	}
 	return current
 }

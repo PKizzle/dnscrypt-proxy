@@ -163,6 +163,43 @@ func TestProvesNSEC3WildcardNoData(t *testing.T) {
 	if d.ProvesWildcardNoData(name, zone, dns.TypeA) {
 		t.Fatal("an NSEC3 wildcard containing the requested type proved NODATA")
 	}
+	// An Opt-Out span can conceal an unsigned delegation and therefore cannot
+	// prove that the next-closer name is absent for a wildcard response.
+	d.NSEC3[1].Flags = 1
+	if d.ProvesWildcardNoData(name, zone, dns.TypeAAAA) {
+		t.Fatal("an Opt-Out span proved wildcard NODATA")
+	}
+}
+
+// abuse.ch returns this RFC 5155 section 8.7 shape for DNSBL DS lookups: an
+// exact closest encloser, a non-Opt-Out span over the next closer name, and a
+// matching wildcard that omits DS. It proves the queried label is not a
+// delegation, even though no NSEC3 directly covers the queried leaf.
+func TestProvesNotADelegationFromNSEC3WildcardNoData(t *testing.T) {
+	const (
+		name = "65.spam.abuse.ch."
+		zone = "abuse.ch."
+	)
+	makeRR := func(owner, next string, types ...uint16) *dns.NSEC3 {
+		rr := &dns.NSEC3{Hdr: dns.Header{Name: owner + "." + zone, Class: dns.ClassINET, TTL: 300}}
+		rr.Hash = 1
+		rr.Iterations = 1
+		rr.Salt = "7CFB068B53AA9CBF"
+		rr.NextDomain = next
+		rr.TypeBitMap = types
+		return rr
+	}
+	d := Denial{zone: zone, NSEC3: []*dns.NSEC3{
+		makeRR("O187VO66FPKO7RD6PV6223BDH0I5UTNU", "O363CMUV83PO814A2N1V1OT4AGRBANF4", dns.TypeA, dns.TypeNS, dns.TypeSOA, dns.TypeNSEC3, dns.TypeRRSIG),
+		makeRR("6T0M3GD658T7HOUUUES6KM1HQNL4P0CV", "76A7M4UMTM9GUJLBS0FC14DQB2PFVKGN", dns.TypeCNAME, dns.TypeRRSIG),
+		makeRR("U28E8TRO47LAJEQQVDNMV8NI3RB59TO5", "UBLSRVMCRAOA64REHUI09SUPF0KKI3EF", dns.TypeTXT, dns.TypeRRSIG),
+	}}
+	if !d.ProvesWildcardNoData(name, zone, dns.TypeDS) {
+		t.Fatal("the complete wildcard DS NODATA proof was not accepted")
+	}
+	if !d.ProvesNotADelegation(name) {
+		t.Fatal("a wildcard DS NODATA proof did not establish that the name is not a delegation")
+	}
 }
 
 // This is the denial that decides whether everything below a delegation is

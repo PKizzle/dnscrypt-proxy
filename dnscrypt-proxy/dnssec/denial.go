@@ -438,7 +438,7 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 		return false
 	}
 	nextCloser := nextCloserName(name, closest)
-	return nextCloser != "" && d.covered(nextCloser) && d.ProvesNoData("*."+closest, rrtype)
+	return nextCloser != "" && d.coveredWithoutOptOut(nextCloser) && d.ProvesNoData("*."+closest, rrtype)
 }
 
 // ProvesNoDS reports whether the zone proved that name is delegated without a
@@ -627,6 +627,24 @@ func (d Denial) covered(name string) bool {
 	return false
 }
 
+// coveredWithoutOptOut reports a covering NSEC3 span that proves the name is
+// absent rather than merely allowing an unsigned delegation at that point.
+// RFC 5155 section 3.1.2.1 says an Opt-Out span may cover unsigned
+// delegations, so it cannot establish the nonexistence that wildcard proofs
+// require.
+func (d Denial) coveredWithoutOptOut(name string) bool {
+	for _, rr := range d.NSEC3 {
+		if rr.Flags&1 != 0 {
+			continue
+		}
+		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
+		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // nextCloserName is the ancestor of name one label below closest.
 func nextCloserName(name, closest string) string {
 	nameLabels := canonicalLabels(name)
@@ -742,7 +760,12 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 			return true
 		}
 	}
-	return false
+	// A validated wildcard NODATA response proves that the queried name is
+	// absent and that the wildcard was the applicable owner. A delegation at
+	// that name would have stopped wildcard synthesis, so this is positive
+	// evidence that the name is not a zone cut. RFC 5155 section 8.7 requires
+	// the closest-encloser and wildcard proofs used here.
+	return d.zone != "" && d.ProvesWildcardNoData(name, d.zone, dns.TypeDS)
 }
 
 // nsec3MayProveAbsence is the NSEC3 form of the RFC 6840 section 4.1 guard.
