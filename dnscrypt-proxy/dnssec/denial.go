@@ -426,7 +426,7 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 				continue
 			}
 			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
-			if closest != "" && d.ProvesNoData("*."+closest, rrtype) {
+			if closest != "" && d.ProvesNoData(wildcardName(closest), rrtype) {
 				return true
 			}
 		}
@@ -438,7 +438,7 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 		return false
 	}
 	nextCloser := nextCloserName(name, closest)
-	return nextCloser != "" && d.coveredWithoutOptOut(nextCloser) && d.ProvesNoData("*."+closest, rrtype)
+	return nextCloser != "" && d.coveredWithoutOptOut(nextCloser) && d.ProvesNoData(wildcardName(closest), rrtype)
 }
 
 // ProvesNoDS reports whether the zone proved that name is delegated without a
@@ -506,7 +506,7 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 			// "*.zone" would accept a replayed NXDOMAIN for x.b.zone when
 			// "*.b.zone" actually exists.
 			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
-			if closest != "" && d.nsecCovers("*."+closest) {
+			if closest != "" && d.nsecCovers(wildcardName(closest)) {
 				return true
 			}
 		}
@@ -524,7 +524,7 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 	if nextCloser == "" || !d.covered(nextCloser) {
 		return false
 	}
-	return d.covered("*." + closest)
+	return d.covered(wildcardName(closest))
 }
 
 // nsecClosestEncloser derives the closest enclosing name retained by an NSEC
@@ -543,6 +543,13 @@ func nsecClosestEncloser(name, owner, zone string) string {
 		common++
 	}
 	if common == 0 {
+		// The DNS root is an implicit common suffix. canonicalLabels omits its
+		// empty label, so a root-zone NSEC predecessor and a one-label QNAME
+		// otherwise look unrelated. RFC 4035 section 5.4 still requires the
+		// wildcard proof at that closest encloser: "*." rather than "*..".
+		if canonicalName(zone) == "." {
+			return "."
+		}
 		return ""
 	}
 	closest := strings.Join(nameLabels[len(nameLabels)-common:], ".") + "."
@@ -550,6 +557,16 @@ func nsecClosestEncloser(name, owner, zone string) string {
 		return ""
 	}
 	return closest
+}
+
+// wildcardName returns the wildcard at closest. The root's wildcard is "*.",
+// not "*.."; keeping this in one helper prevents root-zone NSEC proofs from
+// becoming malformed while ordinary zones retain their familiar form.
+func wildcardName(closest string) string {
+	if canonicalName(closest) == "." {
+		return "*."
+	}
+	return "*." + canonicalName(closest)
 }
 
 func (d Denial) nsecCovers(name string) bool {

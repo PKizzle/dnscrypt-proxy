@@ -80,6 +80,28 @@ func TestNSECCoversTheWrapAtTheEndOfAZone(t *testing.T) {
 	}
 }
 
+// The root's empty label is the closest encloser for a one-label name. The
+// root response below is the shape returned for the malformed IPv6-literal
+// QNAME fdb3:e6dc:eb35::ffff:0:1: one NSEC covers QNAME and the root-to-aaa
+// NSEC covers the required wildcard "*.". RFC 4035 section 5.4 therefore
+// proves NXDOMAIN; valid DNS names are arbitrary octets, not hostnames only.
+func TestProvesRootNameErrorForNonHostnameLabel(t *testing.T) {
+	d := Denial{NSEC: []*dns.NSEC{
+		nsec("fast.", "fedex.", dns.TypeNS, dns.TypeDS, dns.TypeRRSIG, dns.TypeNSEC),
+		nsec(".", "aaa.", dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeDNSKEY),
+	}}
+	const name = "fdb3:e6dc:eb35::ffff:0:1"
+	if closest := nsecClosestEncloser(name, "fast.", "."); closest != "." {
+		t.Fatalf("closest encloser = %q, want root", closest)
+	}
+	if got := wildcardName("."); got != "*." {
+		t.Fatalf("root wildcard = %q, want *.", got)
+	}
+	if !d.ProvesNameError(name, ".") {
+		t.Fatal("root NSEC proof did not validate the name error")
+	}
+}
+
 func TestProvesNoData(t *testing.T) {
 	d := Denial{NSEC: []*dns.NSEC{nsec("www.example.", "x.example.", dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC)}}
 	if !d.ProvesNoData("www.example.", dns.TypeAAAA) {
