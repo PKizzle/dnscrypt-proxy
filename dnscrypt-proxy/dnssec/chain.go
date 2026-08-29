@@ -107,16 +107,9 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	zones := AncestorZones(zone)
 
 	// The root's keys are anchored by the trust anchors rather than by a parent.
-	keys, sigs, err := f.DNSKEY(".")
-	if err != nil {
-		return ChainResult{Status: Indeterminate, Zone: ".", Why: fmt.Errorf("fetch root keys: %w", err)}
-	}
-	if res, err := VerifyDNSKEYs(keys, sigs, anchors, now); res != Secure {
-		// Held keys that do not verify are worse than none: kept, they answer
-		// every walk from cache and leave everything below unvalidated until
-		// they expire. At the root that is every name there is.
-		forget(f, ".")
-		return ChainResult{Status: res, Zone: ".", Why: fmt.Errorf("root key set: %w", err)}
+	keys, root := verifiedRootKeys(f, anchors, now)
+	if root.Status != Secure {
+		return root
 	}
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
 	// An authenticated name-error proof establishes that this label is absent
@@ -220,6 +213,37 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 		current = ChainResult{Status: Secure, Keys: childKeys, Zone: child}
 	}
 	return current
+}
+
+// verifiedRootKeys authenticates the root key set against the configured trust
+// anchors. A delivered but invalid reply is not a transport error: with a pool
+// of encrypted recursive upstreams, one stale or malformed response must not
+// decide the DNSSEC status of every name. Drop it and try another bounded
+// fetch, exactly as verifiedDelegationSigners does for a child DS RRset.
+//
+// The retry never trusts a later reply without verification. If every attempt
+// is invalid, RFC 4035 section 5.5 still requires a validation failure rather
+// than treating the root as insecure.
+func verifiedRootKeys(f Fetcher, anchors []*dns.DS, now time.Time) ([]*dns.DNSKEY, ChainResult) {
+	var lastResult Result
+	var lastErr error
+	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+		keys, sigs, err := f.DNSKEY(".")
+		if err != nil {
+			return nil, ChainResult{Status: Indeterminate, Zone: ".", Why: fmt.Errorf("fetch root keys: %w", err)}
+		}
+		if res, err := VerifyDNSKEYs(keys, sigs, anchors, now); res == Secure {
+			return keys, ChainResult{Status: Secure, Keys: keys, Zone: "."}
+		} else {
+			lastResult, lastErr = res, err
+		}
+
+		// Held keys that do not verify are worse than none: kept, they answer
+		// every walk from cache and leave everything below unvalidated until
+		// they expire. At the root that is every name there is.
+		forget(f, ".")
+	}
+	return nil, ChainResult{Status: lastResult, Zone: ".", Why: fmt.Errorf("root key set: %w", lastErr)}
 }
 
 // verifiedDelegationSigners fetches and authenticates the parent-side DS RRset

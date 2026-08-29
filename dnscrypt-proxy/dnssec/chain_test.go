@@ -52,6 +52,28 @@ type flakyDelegationHierarchy struct {
 	calls int
 }
 
+// flakyRootHierarchy supplies one root key set whose signature does not match
+// the configured anchor, then the valid root response. It represents one
+// inconsistent upstream in a recursive pool; an invalid reply must be evicted
+// and retried, never accepted.
+type flakyRootHierarchy struct {
+	*hierarchy
+	calls int
+}
+
+func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	if canonicalName(zoneName) != "." {
+		return h.hierarchy.DNSKEY(zoneName)
+	}
+	h.calls++
+	if h.calls != 1 {
+		return h.hierarchy.DNSKEY(zoneName)
+	}
+	root := h.zones["."]
+	stranger := h.zones["test."]
+	return []*dns.DNSKEY{root.key}, []*dns.RRSIG{stranger.sign([]dns.RR{root.key}, h.now.Add(-time.Hour), h.now.Add(time.Hour))}, nil
+}
+
 // cnameDelegationHierarchy models a DS query that is answered by a CNAME in
 // the signed parent zone. This is what real recursive resolvers return for a
 // CNAME-bearing Microsoft service name: it is positive evidence that the
@@ -354,6 +376,19 @@ func TestBuildChainRefetchesAnInvalidDelegationSigner(t *testing.T) {
 	}
 	if f.calls != 2 {
 		t.Fatalf("DS calls = %d, want 2 (invalid response then refetch)", f.calls)
+	}
+}
+
+func TestBuildChainRefetchesAnInvalidRootKeySet(t *testing.T) {
+	h := newHierarchy(t, ".", "test.")
+	f := &flakyRootHierarchy{hierarchy: h}
+
+	res := BuildChain(f, "test.", h.anchors(), h.now)
+	if res.Status != Secure {
+		t.Fatalf("BuildChain() = %v (%v), want secure after refetch", res.Status, res.Why)
+	}
+	if f.calls != 2 {
+		t.Fatalf("root DNSKEY calls = %d, want 2 (invalid response then refetch)", f.calls)
 	}
 }
 
