@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto"
+	"errors"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -151,6 +152,21 @@ func TestDNSSECEnforceRejectsOnlyValidationFailuresWithoutCD(t *testing.T) {
 				t.Errorf("mustReject(%v) = %v, want %v", tc.result, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRetryableDNSSECFailure(t *testing.T) {
+	if !retryableDNSSECFailure(dnssec.Indeterminate, errors.New("temporary lookup failure")) {
+		t.Fatal("an indeterminate lookup failure should be retried")
+	}
+	if retryableDNSSECFailure(dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations) {
+		t.Fatal("an unsupported NSEC3 iteration count is not retryable")
+	}
+	if !retryableDNSSECFailure(dnssec.Bogus, fmt.Errorf("%w: no denial", errDNSSECIncompleteEvidence)) {
+		t.Fatal("missing DNSSEC evidence should be retried")
+	}
+	if retryableDNSSECFailure(dnssec.Bogus, errors.New("invalid signature")) {
+		t.Fatal("a cryptographic failure must not be retried")
 	}
 }
 

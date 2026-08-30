@@ -22,6 +22,14 @@ import (
 // on its own behalf.
 const dnssecInternalProto = "internal-dnssec"
 
+// A missing DNSSEC proof is often an incomplete recursive response rather
+// than proof that the zone is broken. Try a different encrypted upstream
+// before making a client wait for SERVFAIL, but never retry a cryptographic
+// failure as though it were transient.
+const dnssecResponseAttempts = 3
+
+var errDNSSECIncompleteEvidence = errors.New("incomplete DNSSEC evidence")
+
 type ValidationMode int
 
 const (
@@ -60,6 +68,7 @@ type PluginDNSSECValidate struct {
 	insecureZones []string
 	anchors       []*dns.DS
 	fetcher       *dnssec.CachingFetcher
+	proxy         *Proxy
 }
 
 // dnssecVerdicts counts what validation concluded, so that the decision to move
@@ -98,6 +107,7 @@ func (plugin *PluginDNSSECValidate) Init(proxy *Proxy) error {
 		return err
 	}
 	plugin.mode = mode
+	plugin.proxy = proxy
 	dnssecMode.Store(modeName(mode))
 	plugin.anchors = dnssec.RootAnchors
 
@@ -207,6 +217,29 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	}
 
 	result, why := plugin.judge(msg, qName)
+	if plugin.proxy != nil && retryableDNSSECFailure(result, why) {
+		qtype := dns.RRToType(msg.Question[0])
+		for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
+			retry, err := plugin.resolveInternally(plugin.proxy, qName, qtype)
+			if err != nil {
+				continue
+			}
+			// The client transaction and question belong to the original query,
+			// not to this private retry. Unpack into the existing message rather
+			// than copying dns.Msg: its decoded form contains atomic state.
+			originalID, originalQuestion := msg.ID, msg.Question
+			msg.Data = retry.Data
+			if err := msg.Unpack(); err != nil {
+				continue
+			}
+			msg.ID = originalID
+			msg.Question = originalQuestion
+			result, why = plugin.judge(msg, qName)
+			if !retryableDNSSECFailure(result, why) {
+				break
+			}
+		}
+	}
 
 	pluginsState.sessionData[dnssecVerdictKey] = verdictName(result)
 	if why != nil && result != dnssec.Secure {
@@ -252,6 +285,17 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	pluginsState.action = PluginsActionReject
 	pluginsState.returnCode = PluginsReturnCodeServFail
 	return nil
+}
+
+// retryableDNSSECFailure identifies failures for which a different recursive
+// upstream can supply the missing evidence. A bad signature is evidence about
+// the DNS data and must remain a failure; an unsupported NSEC3 cost is a local
+// policy limit, not a transport condition another resolver can repair.
+func retryableDNSSECFailure(result dnssec.Result, why error) bool {
+	if result == dnssec.Indeterminate {
+		return !errors.Is(why, dnssec.ErrUnsupportedNSEC3Iterations)
+	}
+	return result == dnssec.Bogus && errors.Is(why, errDNSSECIncompleteEvidence)
 }
 
 // dnssecFailureEDE preserves the reason a validator had to return SERVFAIL.
@@ -306,7 +350,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		}
 		denial := dnssec.CollectDenial(msg.Ns).Verified(chain.Keys, chain.Zone, now)
 		if denial.Empty() {
-			return dnssec.Bogus, fmt.Errorf("a signed zone answered nothing and proved nothing")
+			return dnssec.Bogus, fmt.Errorf("%w: a signed zone answered nothing and proved nothing", errDNSSECIncompleteEvidence)
 		}
 		qtype := dns.RRToType(msg.Question[0])
 		if msg.Rcode == dns.RcodeNameError {
@@ -316,7 +360,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 			if denial.HasOnlyUnsupportedNSEC3Iterations() {
 				return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 			}
-			return dnssec.Bogus, fmt.Errorf("no proof that %s does not exist", qName)
+			return dnssec.Bogus, fmt.Errorf("%w: no proof that %s does not exist", errDNSSECIncompleteEvidence, qName)
 		}
 		if denial.ProvesNoData(qName, qtype) {
 			return plugin.judgeNegativeAuthority(msg, chain, now)
@@ -327,7 +371,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		if denial.HasOnlyUnsupportedNSEC3Iterations() {
 			return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 		}
-		return dnssec.Bogus, fmt.Errorf("no proof that %s holds no record of this type", qName)
+		return dnssec.Bogus, fmt.Errorf("%w: no proof that %s holds no record of this type", errDNSSECIncompleteEvidence, qName)
 	}
 
 	// Each set is checked on its own, against a chain for the zone that signed
@@ -482,7 +526,7 @@ func (plugin *PluginDNSSECValidate) judgeCNAMEChainTerminal(msg *dns.Msg, qName 
 		if denial.ProvesNameError(terminal, owner.Zone) {
 			return plugin.judgeNegativeAuthority(msg, owner, now)
 		}
-		return dnssec.Bogus, fmt.Errorf("no proof that CNAME target %s does not exist", terminal)
+		return dnssec.Bogus, fmt.Errorf("%w: no proof that CNAME target %s does not exist", errDNSSECIncompleteEvidence, terminal)
 	}
 	if denial.ProvesNoData(terminal, qtype) || denial.ProvesWildcardNoData(terminal, owner.Zone, qtype) {
 		return plugin.judgeNegativeAuthority(msg, owner, now)
@@ -490,7 +534,7 @@ func (plugin *PluginDNSSECValidate) judgeCNAMEChainTerminal(msg *dns.Msg, qName 
 	if denial.HasOnlyUnsupportedNSEC3Iterations() {
 		return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 	}
-	return dnssec.Bogus, fmt.Errorf("no proof that CNAME target %s holds no record of type %s", terminal, dns.TypeToString[qtype])
+	return dnssec.Bogus, fmt.Errorf("%w: no proof that CNAME target %s holds no record of type %s", errDNSSECIncompleteEvidence, terminal, dns.TypeToString[qtype])
 }
 
 // cnameChainTerminal follows the CNAME RRsets actually included in an answer.
@@ -650,7 +694,7 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		owner := plugin.chainFor(set.Name, chain, now)
 		switch owner.Status {
 		case dnssec.Secure:
-			return dnssec.Bogus, fmt.Errorf("%s is signed, but its %s record for %s is not",
+			return dnssec.Bogus, fmt.Errorf("%w: %s is signed, but its %s record for %s is not", errDNSSECIncompleteEvidence,
 				owner.Zone, dns.TypeToString[set.Type], set.Name)
 		case dnssec.Insecure:
 			return dnssec.Insecure, owner.Why
