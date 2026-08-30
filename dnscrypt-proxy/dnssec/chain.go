@@ -112,24 +112,8 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 		return root
 	}
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
-	// An authenticated name-error proof establishes that this label is absent
-	// from the current zone. DNS names with descendants are existing empty
-	// non-terminals, so no label below a proven-absent name can be a zone cut.
-	// Remembering that fact avoids asking every descendant for its own DS proof.
-	//
-	// This is deliberately a complete name-error proof, not merely a covering
-	// NSEC/NSEC3: RFC 5155 sections 8.3 and 8.4 require the closest encloser,
-	// next-closer, and wildcard evidence before a validator can conclude that a
-	// name is absent. An exact NSEC/NSEC3 or a signed CNAME only establishes
-	// that one label is not a cut; a delegation may still exist below it.
-	var absentAncestor string
-
 nextChild:
 	for _, child := range zones[1:] {
-		if absentAncestor != "" && WithinZone(child, absentAncestor) {
-			continue
-		}
-
 		// A response with no DS needs authenticated evidence to distinguish an
 		// ordinary name from an unsigned delegation. Different recursive
 		// upstreams can return incomplete negative responses, so an answer that
@@ -183,20 +167,13 @@ nextChild:
 				// nothing could be concluded. It is not an unsigned delegation:
 				// no signed proof established one.
 				// Retry below after evicting this incomplete response.
-			case denial.ProvesNameError(child, current.Zone):
-				// A complete authenticated name-error proof says this label is
-				// absent, not just that it is an ordinary existing name. Any
-				// descendant is therefore absent too, so it cannot be a zone
-				// cut. Retain the current zone's keys for the original response.
-				absentAncestor = canonicalName(child)
-				continue nextChild
 			case denial.ProvesNotADelegation(child):
-				// An ordinary name inside the zone reached so far. The walk
-				// carries on rather than stopping here: a label further down
-				// can still be a zone cut, and stopping at the first one that
-				// is not would hand this zone's keys to a child zone below it
-				// and refuse that zone's unsigned answers as forged. A CDN
-				// name three labels below a signed zone is exactly that shape.
+				// This label is not a delegation point. It does not say the
+				// same about a deeper label: DNSSEC's DS state belongs to the
+				// exact parent-side zone cut (RFC 4035 section 5.2). Continue
+				// rather than treating this as proof that the rest of the
+				// textual path cannot be delegated. Reverse DNS commonly has
+				// precisely that shape.
 				continue nextChild
 			default:
 				// The parent offered something, but nothing that settles which

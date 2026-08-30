@@ -130,29 +130,27 @@ type cnameDelegationHierarchy struct {
 	signed bool
 }
 
-// absentAncestorHierarchy returns a complete signed NSEC3 name-error proof
-// for one label, then fails if the chain asks about a descendant. A complete
-// name-error means that descendant cannot be a zone cut: if it had a child,
-// the supposedly absent label would be an existing empty non-terminal.
-type absentAncestorHierarchy struct {
+// deepDelegationHierarchy returns an authenticated no-delegation proof for an
+// intermediate label and an authenticated unsigned-delegation proof below it.
+// This is the shape used by reverse DNS allocations: a parent-side zone cut can
+// be many labels below a name that merely has no DS.
+type deepDelegationHierarchy struct {
 	*hierarchy
-	absent          string
-	descendantCalls int
+	intermediate    string
+	delegation      string
+	delegationCalls int
 }
 
-func (h *absentAncestorHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
-	if canonicalName(zoneName) == canonicalName(h.absent) {
-		parentName := h.parentOf(zoneName)
-		parent := h.zones[parentName]
+func (h *deepDelegationHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	parent := h.zones["example.test."]
+	if canonicalName(zoneName) == canonicalName(h.intermediate) {
 		if parent == nil {
 			return nil, nil, Denial{}, fmt.Errorf("no parent for %s", zoneName)
 		}
 
-		// RFC 5155 sections 8.3 and 8.4: the exact closest encloser,
-		// plus one NSEC3 span covering both next-closer and wildcard.
-		// The synthetic span is intentionally non-opt-out: it proves the
-		// absent names rather than concealing an unsigned delegation.
-		closest := NSEC3Hash(parentName, 1, 0, "-")
+		// RFC 5155 section 8.7: a non-opt-out NSEC3 span proves this
+		// intermediate label is not a delegation point.
+		closest := NSEC3Hash("example.test.", 1, 0, "-")
 		ce := nsec3(closest, "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC3)
 		cover := nsec3("00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0, dns.TypeRRSIG, dns.TypeNSEC3)
 		return nil, nil, Denial{
@@ -163,9 +161,15 @@ func (h *absentAncestorHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, 
 			},
 		}, nil
 	}
-	if WithinZone(zoneName, h.absent) {
-		h.descendantCalls++
-		return nil, nil, Denial{}, fmt.Errorf("unexpected DS lookup below proven-absent %s: %s", h.absent, zoneName)
+	if canonicalName(zoneName) == canonicalName(h.delegation) {
+		h.delegationCalls++
+		if parent == nil {
+			return nil, nil, Denial{}, fmt.Errorf("no parent for %s", zoneName)
+		}
+		nsec := nsec(zoneName, "next."+zoneName, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC)
+		return nil, nil, Denial{NSEC: []*dns.NSEC{nsec}, sigs: []*dns.RRSIG{
+			parent.sign([]dns.RR{nsec}, h.now.Add(-time.Hour), h.now.Add(time.Hour)),
+		}}, nil
 	}
 	return h.hierarchy.DS(zoneName)
 }
@@ -383,20 +387,24 @@ func TestBuildChainWalksPastASignedNameErrorForDS(t *testing.T) {
 	}
 }
 
-// A complete RFC 5155 name-error proof makes all descendants impossible. In
-// particular, the walk must not require a redundant DS proof for each label
-// below it; recursive resolvers normally provide the one closest-encloser
-// proof for the entire negative answer.
-func TestBuildChainSkipsDescendantsOfAProvenAbsentNSEC3Name(t *testing.T) {
+// A no-delegation proof belongs only to the queried label. A deeper label can
+// still be a parent-side zone cut, so the walk must find its signed no-DS proof
+// and classify the answer below it as insecure rather than using the signed
+// ancestor's keys to reject it. This occurs in public IPv6 reverse DNS.
+func TestBuildChainFindsDeepUnsignedDelegationAfterNSEC3NoDelegation(t *testing.T) {
 	h := newHierarchy(t, ".", "test.", "example.test.")
-	f := &absentAncestorHierarchy{hierarchy: h, absent: "missing.example.test."}
+	f := &deepDelegationHierarchy{
+		hierarchy:    h,
+		intermediate: "missing.example.test.",
+		delegation:   "leaf.missing.example.test.",
+	}
 
 	res := BuildChain(f, "leaf.missing.example.test.", h.anchors(), h.now)
-	if res.Status != Secure || res.Zone != "example.test." {
-		t.Fatalf("BuildChain() = %v at %q (%v), want secure at example.test.", res.Status, res.Zone, res.Why)
+	if res.Status != Insecure {
+		t.Fatalf("BuildChain() = %v at %q (%v), want insecure", res.Status, res.Zone, res.Why)
 	}
-	if f.descendantCalls != 0 {
-		t.Fatalf("DS lookups below proven-absent name = %d, want 0", f.descendantCalls)
+	if f.delegationCalls != 1 {
+		t.Fatalf("DS lookups for deep delegation = %d, want 1", f.delegationCalls)
 	}
 }
 
