@@ -107,6 +107,20 @@
         .section-nav a:focus {
             background-color: #cbd5e1;
         }
+        .fleet-status {
+            margin: 0 0 20px;
+            padding: 10px 14px;
+            color: #1b5e20;
+            background: #e8f5e9;
+            border-left: 4px solid #2e7d32;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+        .fleet-status-degraded {
+            color: #8a4b00;
+            background: #fff3e0;
+            border-left-color: #ef6c00;
+        }
         @media (max-width: 600px) {
             .section-nav {
                 gap: 6px;
@@ -150,6 +164,7 @@
             <a href="#source-refresh">Sources</a>
             <a href="#recent-queries">Recent Queries</a>
         </nav>
+        <div id="fleet-status" class="fleet-status" hidden></div>
 
         <!-- Loading indicator -->
         <div id="loading-indicator" style="text-align: center; padding: 40px; margin: 20px 0; background-color: #f8f9fa; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
@@ -183,7 +198,7 @@
                     <span class="stat-label">Queries Per Second:</span>
                     <span id="qps">-</span>
                 </div>
-                <div class="stat">
+                <div class="stat" id="uptime-row">
                     <span class="stat-label">Uptime:</span>
                     <span id="uptime">-</span>
                 </div>
@@ -310,6 +325,7 @@
                         <th>Next Refresh</th>
                         <th>Status</th>
                         <th>Age</th>
+                        <th>Coverage</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -338,6 +354,6 @@
         </div>
     </div>
 
-    <script src="/static/monitoring.js"></script>
+    <script src="/static/monitoring.js?v={{VERSION}}-fleet-v2"></script>
 </body>
 </html>

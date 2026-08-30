@@ -94,18 +94,28 @@ function safeUpdateDashboard(data) {
             loadingIndicator.style.display = 'none';
         }
 
-        // A browser-facing request carries fleet totals when peers are
-        // configured. Summary cards must use them: reading the local fields
-        // here made a healthy pod conceal another pod's DNSSEC failures.
-        // Tables below stay local because their rows cannot be meaningfully
-        // merged without losing which instance saw them.
+        // A peer-enabled browser payload is fleet-only. It must never use
+        // whatever local fields happened to come from the Pod handling the
+        // WebSocket connection.
         const fleetTotals = data.fleet && data.fleet.totals ? data.fleet.totals : null;
+        const fleetMode = Boolean(data.fleet &&
+            (data.fleet.mode === 'aggregate' || data.fleet.mode === 'unavailable'));
         const summary = fleetTotals || data;
-        const fleetLabel = fleetTotals
+        const fleetLabel = data.fleet && data.fleet.mode === 'unavailable'
+            ? 'fleet unavailable'
+            : fleetTotals
             ? `fleet: ${fleetTotals.instances_reachable || 0}/${fleetTotals.instances || 0} reachable`
             : null;
-        updateElementText('overview', fleetLabel ? `Overview (${fleetLabel})` : 'Overview');
-        updateElementText('recent-queries', fleetLabel ? 'Recent Queries (this instance)' : 'Recent Queries');
+        const panelTitle = title => fleetLabel ? `${title} (${fleetLabel})` : title;
+        updateElementText('overview', panelTitle('Overview'));
+        updateElementText('dnssec', panelTitle('DNSSEC'));
+        updateElementText('cache-performance', panelTitle('Cache Performance'));
+        updateElementText('query-types', panelTitle('Query Types'));
+        updateElementText('resolver-health', panelTitle('Resolver Health'));
+        updateElementText('top-domains', panelTitle('Top Domains'));
+        updateElementText('source-refresh', panelTitle('Source Refresh Status'));
+        updateElementText('recent-queries', panelTitle('Recent Queries'));
+        updateFleetStatus(data.fleet);
 
         // Update overview stats with null checks
         const totalQueries = summary.total_queries !== undefined ? summary.total_queries : 0;
@@ -117,7 +127,13 @@ function safeUpdateDashboard(data) {
         updateElementText('total-queries', formatNumber(totalQueries));
         updateElementText('blocked-queries', formatNumber(blockedQueries));
         updateElementText('qps', qps.toFixed(2));
-        updateElementText('uptime', formatUptime(uptime));
+        const uptimeRow = document.getElementById('uptime-row');
+        if (uptimeRow) {
+            uptimeRow.style.display = fleetMode ? 'none' : '';
+        }
+        if (!fleetMode) {
+            updateElementText('uptime', formatUptime(uptime));
+        }
         updateElementText('avg-response-time', formatMilliseconds(avgResponseTime));
 
         const generatedAt = data.generated_at ? new Date(data.generated_at) : null;
@@ -138,7 +154,6 @@ function safeUpdateDashboard(data) {
         const secure = dnssec.secure || 0;
         const bogus = dnssec.bogus || 0;
         const indeterminate = dnssec.indeterminate || 0;
-        updateElementText('dnssec', fleetLabel ? `DNSSEC (${fleetLabel})` : 'DNSSEC');
         updateElementText('dnssec-mode', dnssec.mode || 'off');
         updateElementText('dnssec-secure', secure.toLocaleString());
         updateElementText('dnssec-insecure', (dnssec.insecure || 0).toLocaleString());
@@ -210,7 +225,9 @@ function safeUpdateDashboard(data) {
 
             sortedResolvers.forEach(resolver => {
                 const row = resolverTable.insertRow();
-                row.insertCell(0).textContent = resolver.name || 'Unknown';
+                row.insertCell(0).textContent = resolver.proto
+                    ? `${resolver.name || 'Unknown'} (${resolver.proto})`
+                    : (resolver.name || 'Unknown');
                 row.insertCell(1).textContent = formatStatus(resolver.status);
                 row.insertCell(2).textContent = formatPercent(resolver.success_rate);
                 row.insertCell(3).textContent = formatNumber(resolver.total_queries !== undefined ? resolver.total_queries : resolver.queries);
@@ -258,11 +275,15 @@ function safeUpdateDashboard(data) {
                 row.insertCell(2).textContent = formatTimestamp(source.next_refresh);
                 row.insertCell(3).textContent = formatSourceStatus(source.status, source.error);
                 row.insertCell(4).textContent = formatAge(source.age_seconds);
+                const coverage = source.instances;
+                row.insertCell(5).textContent = coverage !== undefined
+                    ? `${source.ok_instances || 0}/${coverage}`
+                    : '-';
             });
         } else {
             const row = sourcesTable.insertRow();
             const cell = row.insertCell(0);
-            cell.colSpan = 5;
+            cell.colSpan = 6;
             cell.textContent = 'No source activity recorded yet';
         }
 
@@ -330,6 +351,36 @@ function updateElementText(id, value) {
     el.textContent = value !== undefined && value !== null && value !== '' ? value : '-';
 }
 
+function updateFleetStatus(fleet) {
+    const status = document.getElementById('fleet-status');
+    if (!status) {
+        return;
+    }
+    if (!fleet || !fleet.mode) {
+        status.hidden = true;
+        return;
+    }
+    if (fleet.mode === 'unavailable') {
+        status.hidden = false;
+        status.className = 'fleet-status fleet-status-degraded';
+        status.textContent = `Fleet view unavailable: ${fleet.error || 'peer authentication is not configured'}`;
+        return;
+    }
+    if (fleet.mode !== 'aggregate' || !fleet.totals) {
+        status.hidden = true;
+        return;
+    }
+
+    const totals = fleet.totals;
+    const reachable = totals.instances_reachable || 0;
+    const instances = totals.instances || 0;
+    status.hidden = false;
+    status.className = fleet.degraded ? 'fleet-status fleet-status-degraded' : 'fleet-status';
+    status.textContent = fleet.degraded
+        ? `Fleet view is partial: ${reachable}/${instances} instances reachable`
+        : `Fleet view: all ${reachable}/${instances} instances reachable`;
+}
+
 function formatNumber(value) {
     if (value === undefined || value === null) {
         return '-';
@@ -366,6 +417,9 @@ function formatMilliseconds(value) {
 function formatBoolean(value) {
     if (value === undefined || value === null) {
         return '-';
+    }
+    if (value === 'mixed') {
+        return 'Mixed';
     }
     return value ? 'Yes' : 'No';
 }
@@ -417,6 +471,9 @@ function formatAge(seconds) {
 function formatTTLRange(cacheStats) {
     if (!cacheStats || typeof cacheStats !== 'object') {
         return '-';
+    }
+    if (cacheStats.ttl_mixed) {
+        return 'Mixed across fleet';
     }
     const parts = [];
     if (cacheStats.min_ttl !== undefined && cacheStats.max_ttl !== undefined) {

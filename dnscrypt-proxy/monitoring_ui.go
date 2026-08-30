@@ -46,6 +46,9 @@ type MonitoringUIConfig struct {
 	// point of it being the resolver -- which leaves discovery unable to
 	// resolve a name that only a local resolver knows.
 	PeerDiscoveryResolver string `toml:"peer_discovery_resolver"`
+	// PeerToken authenticates requests between instances before they are given
+	// the local detail used to construct the browser's aggregate.
+	PeerToken string `toml:"peer_token"`
 }
 
 const maxTopDomains = 1000
@@ -177,6 +180,10 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 		dlog.Errorf("Proxy is nil in NewMonitoringUI")
 		return nil
 	}
+	config := proxy.monitoringUI
+	if config.PeerToken == "" {
+		config.PeerToken = os.Getenv("DNSCRYPT_MONITORING_PEER_TOKEN")
+	}
 
 	// Set defaults for memory limits if not configured
 	maxEntries := proxy.monitoringUI.MaxQueryLogEntries
@@ -214,7 +221,7 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 
 	// Create and return the monitoring UI instance
 	ui := &MonitoringUI{
-		config:           proxy.monitoringUI,
+		config:           config,
 		metricsCollector: metricsCollector,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
@@ -1213,6 +1220,49 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 	return metrics
 }
 
+// GetPeerMetrics returns the local data needed to build an accurate fleet view.
+// It is deliberately only used for requests between monitoring peers. The
+// browser gets the merged result instead, so it never receives a serving pod's
+// private per-instance view.
+func (mc *MetricsCollector) GetPeerMetrics() map[string]any {
+	metrics := mc.GetMetrics()
+	peerMetrics := make(map[string]any, len(metrics)+2)
+	for key, value := range metrics {
+		peerMetrics[key] = value
+	}
+
+	// The public lists are deliberately short. Merging only each node's top
+	// entries can produce an incorrect fleet-wide ranking, so peers exchange the
+	// bounded raw counters and the browser sees the global top entries only.
+	peerMetrics["peer_top_domains"] = mc.peerTopDomains()
+	peerMetrics["peer_query_types"] = mc.peerQueryTypes()
+	return peerMetrics
+}
+
+func (mc *MetricsCollector) peerTopDomains() map[string]uint64 {
+	if mc.privacyLevel >= 2 {
+		return nil
+	}
+
+	mc.domainMutex.RLock()
+	defer mc.domainMutex.RUnlock()
+	counts := make(map[string]uint64, len(mc.topDomains))
+	for domain, count := range mc.topDomains {
+		counts[domain] = count
+	}
+	return counts
+}
+
+func (mc *MetricsCollector) peerQueryTypes() map[string]uint64 {
+	mc.queryTypesMutex.RLock()
+	defer mc.queryTypesMutex.RUnlock()
+	counts := make(map[string]uint64, len(mc.queryTypes))
+	for queryType, count := range mc.queryTypes {
+		counts[queryType] = count
+	}
+	return counts
+}
+
 // requestScheme - Returns the scheme the client used, which a TLS-terminating
 // proxy reports in X-Forwarded-Proto. Browsers cannot forge that header on a
 // WebSocket handshake.
@@ -1299,6 +1349,62 @@ func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(body))
 }
 
+// browserMetrics returns only the fleet view rendered by a browser. Local
+// metrics stay on the peer path: exposing them alongside the aggregate makes
+// it too easy for a stale WebSocket frame or UI change to turn the page back
+// into a single-node view.
+func (ui *MonitoringUI) browserMetrics() map[string]any {
+	if ui.peers == nil || !ui.peers.configured() {
+		return ui.metricsCollector.GetMetrics()
+	}
+	if !ui.peers.enabled() {
+		return unavailableFleetMetrics("peer authentication is not configured")
+	}
+
+	fleet := ui.peers.Fleet(ui.metricsCollector.GetPeerMetrics())
+	return browserFleetMetrics(fleet, ui.metricsCollector.maxRecentQueries)
+}
+
+func unavailableFleetMetrics(reason string) map[string]any {
+	return map[string]any{
+		"total_queries":      float64(0),
+		"queries_per_second": float64(0),
+		"cache_hit_ratio":    float64(0),
+		"cache_hits":         float64(0),
+		"cache_misses":       float64(0),
+		"blocked_queries":    float64(0),
+		"avg_response_time":  float64(0),
+		"cache_stats": map[string]any{
+			"enabled":         false,
+			"configured_size": float64(0),
+			"entries":         float64(0),
+			"capacity":        float64(0),
+		},
+		"query_types":     []map[string]any{},
+		"top_domains":     []map[string]any{},
+		"resolver_health": []map[string]any{},
+		"sources":         []map[string]any{},
+		"recent_queries":  []QueryLogEntry{},
+		"generated_at":    time.Now().UTC(),
+		"fleet": map[string]any{
+			"mode":     "unavailable",
+			"totals":   map[string]any{"instances": 0, "instances_reachable": 0},
+			"degraded": true,
+			"error":    reason,
+		},
+	}
+}
+
+func (ui *MonitoringUI) isAuthenticatedPeerRequest(r *http.Request) bool {
+	if r.Header.Get("X-Dnscrypt-Peer") == "" || ui.config.PeerToken == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare(
+		[]byte(r.Header.Get("X-Dnscrypt-Peer-Token")),
+		[]byte(ui.config.PeerToken),
+	) == 1
+}
+
 // handleMetrics - Handles the metrics API endpoint
 func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	dlog.Debugf("Received metrics request from %s", r.RemoteAddr)
@@ -1312,15 +1418,20 @@ func (ui *MonitoringUI) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	metrics := ui.metricsCollector.GetMetrics()
-
 	// A request from another instance is answered with this instance's own
 	// numbers: aggregating in turn would have every instance asking every other
-	// one for every page view.
-	if r.Header.Get("X-Dnscrypt-Peer") == "" && ui.peers != nil {
-		if fleet := ui.peers.Fleet(metrics); len(fleet.Instances) > 1 {
-			metrics["fleet"] = fleet
+	// one for every page view. The marker without the shared token is rejected
+	// rather than treated as a browser request: during a rolling upgrade an old
+	// peer would otherwise count this instance's whole aggregate as one peer.
+	var metrics map[string]any
+	if r.Header.Get("X-Dnscrypt-Peer") != "" {
+		if !ui.isAuthenticatedPeerRequest(r) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
 		}
+		metrics = ui.metricsCollector.GetPeerMetrics()
+	} else {
+		metrics = ui.browserMetrics()
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1356,9 +1467,10 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 	ui.clientsMutex.Unlock()
 
 	// Send initial metrics
+	metrics := ui.browserMetrics()
 	ui.writesMutex.Lock()
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	err = conn.WriteJSON(ui.metricsCollector.GetMetrics())
+	err = conn.WriteJSON(metrics)
 	ui.writesMutex.Unlock()
 
 	if err != nil {
@@ -1404,6 +1516,7 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 				dlog.Debugf("Received ping message from client")
 
 				// Send pong response and updated metrics
+				metrics := ui.browserMetrics()
 				ui.writesMutex.Lock()
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				if err := conn.WriteJSON(map[string]string{"type": "pong"}); err != nil {
@@ -1413,7 +1526,7 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 				}
 
 				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				if err := conn.WriteJSON(ui.metricsCollector.GetMetrics()); err != nil {
+				if err := conn.WriteJSON(metrics); err != nil {
 					dlog.Warnf("Error sending metrics after ping: %v", err)
 				}
 				ui.writesMutex.Unlock()
@@ -1516,7 +1629,7 @@ func (ui *MonitoringUI) scheduleBroadcast() {
 
 // broadcastMetrics - Broadcasts metrics to all connected WebSocket clients
 func (ui *MonitoringUI) broadcastMetrics() {
-	metrics := ui.metricsCollector.GetMetrics()
+	metrics := ui.browserMetrics()
 
 	ui.writesMutex.Lock()
 	defer ui.writesMutex.Unlock()

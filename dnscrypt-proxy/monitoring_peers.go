@@ -29,6 +29,9 @@ const (
 	// Held briefly so that a page refreshing every few seconds, or several
 	// people watching at once, does not multiply into requests to every peer.
 	peerCacheTTL = 3 * time.Second
+
+	maxFleetTopDomains = 20
+	maxFleetQueryTypes = 10
 )
 
 // peerMetrics is one instance's answer, or the reason there was not one.
@@ -77,6 +80,14 @@ func newPeerCollector(ui *MonitoringUI) *peerCollector {
 	}
 }
 
+func (pc *peerCollector) enabled() bool {
+	return pc.ui.config.PeerToken != "" && pc.configured()
+}
+
+func (pc *peerCollector) configured() bool {
+	return len(pc.ui.config.Peers) > 0 || pc.ui.config.PeerDiscoveryDNS != ""
+}
+
 // peerAddresses returns the instances to ask, discovered from a name when one
 // is configured and from the static list otherwise.
 //
@@ -113,11 +124,30 @@ func (pc *peerCollector) peerAddresses() []string {
 			dlog.Debugf("Monitoring peer discovery for [%s] failed: %v", host, err)
 		}
 		sort.Strings(addrs)
-		for _, a := range addrs {
+		for _, a := range preferredPeerAddresses(addrs) {
 			add(net.JoinHostPort(a, port))
 		}
 	}
 	return out
+}
+
+// A dual-stack headless Service exposes two addresses for every pod. A healthy
+// response is deduplicated by instance ID, but a pod that is starting cannot
+// identify itself yet; counting its failed A and AAAA requests separately
+// inflates the fleet during a rollout. Prefer IPv4 when it exists, falling
+// back to the full IPv6 set for IPv6-only deployments. Explicit static peers
+// are left untouched above.
+func preferredPeerAddresses(addrs []string) []string {
+	ipv4 := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			ipv4 = append(ipv4, addr)
+		}
+	}
+	if len(ipv4) > 0 {
+		return ipv4
+	}
+	return addrs
 }
 
 // resolver looks up the discovery name.
@@ -156,12 +186,10 @@ func (pc *peerCollector) listenPort() string {
 // Fleet returns the aggregate, asking each peer at most once per cache window.
 func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 	pc.mu.Lock()
+	defer pc.mu.Unlock()
 	if pc.cached != nil && time.Since(pc.cachedAt) < peerCacheTTL {
-		cached := pc.cached
-		pc.mu.Unlock()
-		return cached
+		return pc.cached
 	}
-	pc.mu.Unlock()
 
 	peers := pc.peerAddresses()
 	results := make([]peerMetrics, len(peers))
@@ -213,9 +241,7 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 	}
 	fleet.Totals = sumMetrics(fleet.Instances)
 
-	pc.mu.Lock()
 	pc.cached, pc.cachedAt = fleet, time.Now()
-	pc.mu.Unlock()
 	return fleet
 }
 
@@ -236,8 +262,10 @@ func (pc *peerCollector) fetch(addr string) peerMetrics {
 		req.SetBasicAuth(pc.ui.config.Username, pc.ui.config.Password)
 	}
 	// Marks the request as one instance asking another, so the peer does not
-	// aggregate in turn and ask everyone back.
+	// aggregate in turn and ask everyone back. The token keeps an arbitrary
+	// browser client from forging that marker to obtain one pod's raw details.
 	req.Header.Set("X-Dnscrypt-Peer", "1")
+	req.Header.Set("X-Dnscrypt-Peer-Token", pc.ui.config.PeerToken)
 
 	resp, err := pc.client.Do(req)
 	if err != nil {
@@ -382,6 +410,468 @@ func sumDNSSEC(instances []peerMetrics) (map[string]any, bool) {
 		totals["mode"] = "mixed"
 	}
 	return totals, true
+}
+
+// browserFleetMetrics creates the only schema sent to browsers when peers are
+// configured. Its top-level fields are fleet aggregates, and the envelope
+// contains health metadata only; per-instance metrics never leave the peer
+// collection path.
+func browserFleetMetrics(fleet *FleetMetrics, recentLimit int) map[string]any {
+	if fleet == nil {
+		return map[string]any{}
+	}
+
+	metrics := make(map[string]any, len(fleet.Totals)+8)
+	for key, value := range fleet.Totals {
+		metrics[key] = value
+	}
+	metrics["cache_stats"] = aggregateFleetCacheStats(fleet.Instances)
+	metrics["query_types"] = aggregateFleetNamedCounts(
+		fleet.Instances, "peer_query_types", "query_types", "type", maxFleetQueryTypes,
+	)
+	metrics["top_domains"] = aggregateFleetNamedCounts(
+		fleet.Instances, "peer_top_domains", "top_domains", "domain", maxFleetTopDomains,
+	)
+	metrics["resolver_health"] = aggregateFleetResolverHealth(fleet.Instances)
+	metrics["sources"] = aggregateFleetSources(fleet.Instances)
+	metrics["recent_queries"] = aggregateFleetRecentQueries(fleet.Instances, recentLimit)
+	metrics["generated_at"] = time.Now().UTC()
+	metrics["fleet"] = map[string]any{
+		"mode":         "aggregate",
+		"totals":       fleet.Totals,
+		"degraded":     fleet.Degraded,
+		"collected_at": time.Now().UTC(),
+	}
+	return metrics
+}
+
+func aggregateFleetCacheStats(instances []peerMetrics) map[string]any {
+	stats := map[string]any{
+		"enabled":         false,
+		"configured_size": float64(0),
+		"entries":         float64(0),
+		"capacity":        float64(0),
+	}
+
+	seenStats := false
+	seenEnabled := false
+	allEnabled := true
+	anyEnabled := false
+	ttlKeys := []string{"min_ttl", "max_ttl", "neg_min_ttl", "neg_max_ttl"}
+	ttlValues := make(map[string]float64, len(ttlKeys))
+	ttlSeen := make(map[string]bool, len(ttlKeys))
+	ttlMixed := false
+
+	for _, instance := range instances {
+		if !instance.Reachable {
+			continue
+		}
+		cacheStats, ok := instance.Metrics["cache_stats"].(map[string]any)
+		if !ok {
+			continue
+		}
+		seenStats = true
+
+		if enabled, ok := cacheStats["enabled"].(bool); ok {
+			seenEnabled = true
+			allEnabled = allEnabled && enabled
+			anyEnabled = anyEnabled || enabled
+		}
+		for _, key := range []string{"configured_size", "entries", "capacity"} {
+			if value, ok := toFloat(cacheStats[key]); ok {
+				current, _ := toFloat(stats[key])
+				stats[key] = current + value
+			}
+		}
+		for _, key := range ttlKeys {
+			value, ok := toFloat(cacheStats[key])
+			if !ok {
+				ttlMixed = true
+				continue
+			}
+			if previous, exists := ttlValues[key]; exists && previous != value {
+				ttlMixed = true
+			}
+			ttlValues[key] = value
+			ttlSeen[key] = true
+		}
+	}
+
+	if !seenStats {
+		return stats
+	}
+	if seenEnabled {
+		switch {
+		case allEnabled:
+			stats["enabled"] = true
+		case !anyEnabled:
+			stats["enabled"] = false
+		default:
+			stats["enabled"] = "mixed"
+		}
+	}
+	for _, key := range ttlKeys {
+		if !ttlSeen[key] {
+			ttlMixed = true
+		}
+		if ttlSeen[key] && !ttlMixed {
+			stats[key] = ttlValues[key]
+		}
+	}
+	stats["ttl_mixed"] = ttlMixed
+	return stats
+}
+
+// aggregateFleetNamedCounts sums a complete counter map from every reachable
+// peer, then ranks the resulting fleet totals. The fallback is retained for
+// backwards-compatible tests and old peers during a rolling upgrade.
+func aggregateFleetNamedCounts(instances []peerMetrics, preferredKey, fallbackKey, nameKey string, limit int) []map[string]any {
+	counts := map[string]float64{}
+	for _, instance := range instances {
+		if !instance.Reachable {
+			continue
+		}
+		value, ok := instance.Metrics[preferredKey]
+		if !ok {
+			value = instance.Metrics[fallbackKey]
+		}
+		for name, count := range metricNamedCounts(value, nameKey) {
+			counts[name] += count
+		}
+	}
+
+	type namedCount struct {
+		name  string
+		count float64
+	}
+	rows := make([]namedCount, 0, len(counts))
+	for name, count := range counts {
+		rows = append(rows, namedCount{name: name, count: count})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].count != rows[j].count {
+			return rows[i].count > rows[j].count
+		}
+		return rows[i].name < rows[j].name
+	})
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+
+	result := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, map[string]any{nameKey: row.name, "count": row.count})
+	}
+	return result
+}
+
+func metricNamedCounts(value any, nameKey string) map[string]float64 {
+	counts := map[string]float64{}
+	add := func(name string, count any) {
+		if name == "" {
+			return
+		}
+		if value, ok := toFloat(count); ok {
+			counts[name] += value
+		}
+	}
+
+	switch values := value.(type) {
+	case map[string]uint64:
+		for name, count := range values {
+			add(name, count)
+		}
+	case map[string]any:
+		for name, count := range values {
+			add(name, count)
+		}
+	case []map[string]any:
+		for _, row := range values {
+			name, _ := row[nameKey].(string)
+			add(name, row["count"])
+		}
+	case []any:
+		for _, value := range values {
+			row, ok := value.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := row[nameKey].(string)
+			add(name, row["count"])
+		}
+	}
+	return counts
+}
+
+func aggregateFleetResolverHealth(instances []peerMetrics) []map[string]any {
+	type aggregate struct {
+		name          string
+		proto         string
+		status        string
+		total         float64
+		failed        float64
+		latencySum    float64
+		latencyWeight float64
+		lastUpdate    time.Time
+		ageSeconds    float64
+		hasAge        bool
+	}
+
+	aggregates := map[string]*aggregate{}
+	for _, instance := range instances {
+		if !instance.Reachable {
+			continue
+		}
+		for _, row := range metricRows(instance.Metrics["resolver_health"]) {
+			name, _ := row["name"].(string)
+			if name == "" {
+				continue
+			}
+			proto, _ := row["proto"].(string)
+			key := name + "\x00" + proto
+			entry := aggregates[key]
+			if entry == nil {
+				entry = &aggregate{name: name, proto: proto}
+				aggregates[key] = entry
+			}
+			total, _ := toFloat(row["total_queries"])
+			failed, _ := toFloat(row["failed_queries"])
+			entry.total += total
+			entry.failed += failed
+			if avg, ok := toFloat(row["avg_response_ms"]); ok && total > 0 {
+				entry.latencySum += avg * total
+				entry.latencyWeight += total
+			}
+			if status, _ := row["status"].(string); status != "" &&
+				(entry.status == "" || resolverStatusRank(status) < resolverStatusRank(entry.status)) {
+				entry.status = status
+			}
+			if updated, ok := metricTime(row["last_update"]); ok &&
+				(entry.lastUpdate.IsZero() || updated.Before(entry.lastUpdate)) {
+				entry.lastUpdate = updated
+			}
+			if age, ok := toFloat(row["age_seconds"]); ok &&
+				(!entry.hasAge || age > entry.ageSeconds) {
+				entry.ageSeconds = age
+				entry.hasAge = true
+			}
+		}
+	}
+
+	entries := make([]*aggregate, 0, len(aggregates))
+	for _, entry := range aggregates {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if resolverStatusRank(entries[i].status) != resolverStatusRank(entries[j].status) {
+			return resolverStatusRank(entries[i].status) < resolverStatusRank(entries[j].status)
+		}
+		if entries[i].total != entries[j].total {
+			return entries[i].total > entries[j].total
+		}
+		if entries[i].name != entries[j].name {
+			return entries[i].name < entries[j].name
+		}
+		return entries[i].proto < entries[j].proto
+	})
+
+	result := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		status := entry.status
+		if status == "" {
+			status = "unknown"
+		}
+		successRate := float64(1)
+		if entry.total > 0 {
+			successRate = (entry.total - entry.failed) / entry.total
+		}
+		row := map[string]any{
+			"name":           entry.name,
+			"proto":          entry.proto,
+			"status":         status,
+			"success_rate":   successRate,
+			"total_queries":  entry.total,
+			"failed_queries": entry.failed,
+		}
+		if entry.latencyWeight > 0 {
+			row["avg_response_ms"] = entry.latencySum / entry.latencyWeight
+		}
+		if !entry.lastUpdate.IsZero() {
+			row["last_update"] = entry.lastUpdate
+		}
+		if entry.hasAge {
+			row["age_seconds"] = entry.ageSeconds
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+func aggregateFleetSources(instances []peerMetrics) []map[string]any {
+	type aggregate struct {
+		name        string
+		status      string
+		instances   int
+		okInstances int
+		errors      int
+		lastRefresh time.Time
+		nextRefresh time.Time
+		ageSeconds  float64
+		hasAge      bool
+	}
+
+	aggregates := map[string]*aggregate{}
+	for _, instance := range instances {
+		if !instance.Reachable {
+			continue
+		}
+		for _, row := range metricRows(instance.Metrics["sources"]) {
+			name, _ := row["name"].(string)
+			if name == "" {
+				continue
+			}
+			entry := aggregates[name]
+			if entry == nil {
+				entry = &aggregate{name: name}
+				aggregates[name] = entry
+			}
+			entry.instances++
+			status, _ := row["status"].(string)
+			if status == "" {
+				status = "unknown"
+			}
+			if status == "ok" {
+				entry.okInstances++
+			}
+			if entry.status == "" || sourceStatusRank(status) < sourceStatusRank(entry.status) {
+				entry.status = status
+			}
+			if _, present := row["error"]; present {
+				entry.errors++
+			}
+			if refreshed, ok := metricTime(row["last_refresh"]); ok &&
+				(entry.lastRefresh.IsZero() || refreshed.Before(entry.lastRefresh)) {
+				entry.lastRefresh = refreshed
+			}
+			if next, ok := metricTime(row["next_refresh"]); ok &&
+				(entry.nextRefresh.IsZero() || next.Before(entry.nextRefresh)) {
+				entry.nextRefresh = next
+			}
+			if age, ok := toFloat(row["age_seconds"]); ok &&
+				(!entry.hasAge || age > entry.ageSeconds) {
+				entry.ageSeconds = age
+				entry.hasAge = true
+			}
+		}
+	}
+
+	entries := make([]*aggregate, 0, len(aggregates))
+	for _, entry := range aggregates {
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	result := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		row := map[string]any{
+			"name":         entry.name,
+			"status":       entry.status,
+			"instances":    entry.instances,
+			"ok_instances": entry.okInstances,
+		}
+		if !entry.lastRefresh.IsZero() {
+			row["last_refresh"] = entry.lastRefresh
+		}
+		if !entry.nextRefresh.IsZero() {
+			row["next_refresh"] = entry.nextRefresh
+		}
+		if entry.hasAge {
+			row["age_seconds"] = entry.ageSeconds
+		}
+		if entry.errors > 0 {
+			row["error"] = fmt.Sprintf("%d instance(s) reported an error", entry.errors)
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+func aggregateFleetRecentQueries(instances []peerMetrics, limit int) []QueryLogEntry {
+	if limit <= 0 {
+		limit = 100
+	}
+	queries := make([]QueryLogEntry, 0)
+	for _, instance := range instances {
+		if !instance.Reachable {
+			continue
+		}
+		value := instance.Metrics["recent_queries"]
+		if value == nil {
+			continue
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		var entries []QueryLogEntry
+		if err := json.Unmarshal(encoded, &entries); err != nil {
+			continue
+		}
+		queries = append(queries, entries...)
+	}
+	sort.SliceStable(queries, func(i, j int) bool {
+		return queries[i].Timestamp.Before(queries[j].Timestamp)
+	})
+	if len(queries) > limit {
+		queries = queries[len(queries)-limit:]
+	}
+	return queries
+}
+
+func metricRows(value any) []map[string]any {
+	switch rows := value.(type) {
+	case []map[string]any:
+		return rows
+	case []any:
+		result := make([]map[string]any, 0, len(rows))
+		for _, value := range rows {
+			if row, ok := value.(map[string]any); ok {
+				result = append(result, row)
+			}
+		}
+		return result
+	default:
+		return nil
+	}
+}
+
+func metricTime(value any) (time.Time, bool) {
+	switch timestamp := value.(type) {
+	case time.Time:
+		return timestamp, !timestamp.IsZero()
+	case string:
+		parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+		return parsed, err == nil
+	default:
+		return time.Time{}, false
+	}
+}
+
+func sourceStatusRank(status string) int {
+	switch status {
+	case "error":
+		return 0
+	case "stale":
+		return 1
+	case "due":
+		return 2
+	case "unknown":
+		return 3
+	case "ok":
+		return 4
+	default:
+		return 5
+	}
 }
 
 func toFloat(v any) (float64, bool) {
