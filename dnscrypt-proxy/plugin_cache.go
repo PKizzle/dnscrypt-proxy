@@ -80,6 +80,14 @@ func (plugin *PluginCache) Reload() error {
 }
 
 func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	// DNSSEC's internal DNSKEY and DS fetches have their own cache, which only
+	// retains the material the chain walk has accepted. Replaying a response
+	// from the general cache here would defeat the chain walk's retry path: a
+	// malformed or incomplete delegation proof is evicted from that cache, but
+	// would still be served again before a different upstream could be tried.
+	if pluginsState.clientProto == dnssecInternalProto {
+		return nil
+	}
 	if cachedResponses == nil {
 		return nil
 	}
@@ -135,6 +143,12 @@ func (plugin *PluginCacheResponse) Reload() error {
 }
 
 func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
+	// See PluginCache.Eval. Internal validation material is cached only after
+	// the DNSSEC fetcher has accepted it; the general cache must not preserve a
+	// reply which the chain walk later rejects.
+	if pluginsState.clientProto == dnssecInternalProto {
+		return nil
+	}
 	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError && msg.Rcode != dns.RcodeNotAuth {
 		return nil
 	}
