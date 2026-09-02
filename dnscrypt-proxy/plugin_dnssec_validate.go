@@ -329,49 +329,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	records, _ := dnssec.SplitSignatures(msg.Answer)
 
 	if len(records) == 0 {
-		// Nothing was answered, so there is no signature to follow back to a
-		// zone and the walk to the name is the only way to learn whether the
-		// absence had to be proved.
-		chain := dnssec.BuildChain(plugin.fetcher, qName, plugin.anchors, now)
-		switch chain.Status {
-		case dnssec.Secure:
-		case dnssec.Insecure:
-			// The zone is unsigned, so there is nothing to check. Whether the
-			// delegation saying so was itself genuine is what the denial proofs
-			// decide, and that is checked where the delegation is read.
-			return dnssec.Insecure, nil
-		case dnssec.Bogus:
-			return dnssec.Bogus, chain.Why
-		default:
-			// A chain that could not be built is not evidence that an answer is
-			// forged. Refusing here would take the resolver down whenever the
-			// path to the root is unreachable.
-			return dnssec.Indeterminate, chain.Why
-		}
-		denial := dnssec.CollectDenial(msg.Ns).Verified(chain.Keys, chain.Zone, now)
-		if denial.Empty() {
-			return dnssec.Bogus, fmt.Errorf("%w: a signed zone answered nothing and proved nothing", errDNSSECIncompleteEvidence)
-		}
-		qtype := dns.RRToType(msg.Question[0])
-		if msg.Rcode == dns.RcodeNameError {
-			if denial.ProvesNameError(qName, chain.Zone) {
-				return plugin.judgeNegativeAuthority(msg, chain, now)
-			}
-			if denial.HasOnlyUnsupportedNSEC3Iterations() {
-				return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
-			}
-			return dnssec.Bogus, fmt.Errorf("%w: no proof that %s does not exist", errDNSSECIncompleteEvidence, qName)
-		}
-		if denial.ProvesNoData(qName, qtype) {
-			return plugin.judgeNegativeAuthority(msg, chain, now)
-		}
-		if denial.ProvesWildcardNoData(qName, chain.Zone, qtype) {
-			return plugin.judgeNegativeAuthority(msg, chain, now)
-		}
-		if denial.HasOnlyUnsupportedNSEC3Iterations() {
-			return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
-		}
-		return dnssec.Bogus, fmt.Errorf("%w: no proof that %s holds no record of this type", errDNSSECIncompleteEvidence, qName)
+		return plugin.judgeNegative(msg, qName, now)
 	}
 
 	// Each set is checked on its own, against a chain for the zone that signed
@@ -489,6 +447,109 @@ func (plugin *PluginDNSSECValidate) judgeNegativeAuthority(msg *dns.Msg, chain d
 	return dnssec.Secure, nil
 }
 
+// judgeNegative validates an answer with no ordinary RRsets.  An authenticated
+// denial is signed by the zone that generated the NSEC/NSEC3 proof, not by a
+// made-up zone at every label of the queried name.  In particular, an NXDOMAIN
+// below signed tor.dan.me.uk. has to build a chain to tor.dan.me.uk., rather
+// than trying to establish whether each nonexistent address label is itself a
+// delegation.
+//
+// RFC 4035 sections 5.3.1 and 5.4 make the signer's zone the authoritative
+// source of the denial.  We still verify both the chain and the denial before
+// trusting it; the untrusted Signer's Name merely selects which chain to try.
+func (plugin *PluginDNSSECValidate) judgeNegative(msg *dns.Msg, qName string, now time.Time) (dnssec.Result, error) {
+	zones := negativeDenialSignerZones(msg.Ns, qName)
+	if len(zones) == 0 {
+		// An unsigned negative response has no denial signer to follow.  The
+		// chain to the name is then the only way to distinguish an ordinary
+		// unsigned delegation from a response missing the proof it owes us.
+		return plugin.judgeNegativeWithChain(msg, qName, dnssec.BuildChain(plugin.fetcher, qName, plugin.anchors, now), now)
+	}
+
+	// A response can carry more than one authenticated denial signature during
+	// a key rollover.  Accept the first fully validated proof, but do not let a
+	// failed candidate hide a valid one from the same response.
+	var worst dnssec.Result = dnssec.Indeterminate
+	var worstErr error
+	for _, zone := range zones {
+		chain := dnssec.BuildChain(plugin.fetcher, zone, plugin.anchors, now)
+		result, err := plugin.judgeNegativeWithChain(msg, qName, chain, now)
+		if result == dnssec.Secure || result == dnssec.Insecure {
+			return result, err
+		}
+		if result == dnssec.Bogus || worstErr == nil {
+			worst, worstErr = result, err
+		}
+	}
+	return worst, worstErr
+}
+
+// negativeDenialSignerZones returns the zones that claim to have signed the
+// NSEC/NSEC3 evidence for qName.  Requiring each candidate to enclose qName
+// prevents an unrelated authority record from steering the chain walk.  The
+// candidate is not trusted until judgeNegativeWithChain verifies its DNSKEY
+// chain and the actual denial RRset.
+func negativeDenialSignerZones(authority []dns.RR, qName string) []string {
+	zones := make([]string, 0, 1)
+	seen := make(map[string]struct{})
+	for _, rr := range authority {
+		sig, ok := rr.(*dns.RRSIG)
+		if !ok || (sig.TypeCovered != dns.TypeNSEC && sig.TypeCovered != dns.TypeNSEC3) ||
+			!dnssec.WithinZone(qName, sig.SignerName) {
+			continue
+		}
+		zone := strings.ToLower(sig.SignerName)
+		if _, ok := seen[zone]; ok {
+			continue
+		}
+		seen[zone] = struct{}{}
+		zones = append(zones, zone)
+	}
+	return zones
+}
+
+// judgeNegativeWithChain validates a negative answer against an already
+// selected chain.  Keeping the proof check separate from chain selection makes
+// it impossible for a Signer's Name alone to authenticate a denial.
+func (plugin *PluginDNSSECValidate) judgeNegativeWithChain(msg *dns.Msg, qName string, chain dnssec.ChainResult, now time.Time) (dnssec.Result, error) {
+	switch chain.Status {
+	case dnssec.Secure:
+	case dnssec.Insecure:
+		// The zone is unsigned, so there is nothing to check. Whether the
+		// delegation saying so was itself genuine is checked while building
+		// the chain.
+		return dnssec.Insecure, nil
+	case dnssec.Bogus:
+		return dnssec.Bogus, chain.Why
+	default:
+		return dnssec.Indeterminate, chain.Why
+	}
+	denial := dnssec.CollectDenial(msg.Ns).Verified(chain.Keys, chain.Zone, now)
+	if denial.Empty() {
+		return dnssec.Bogus, fmt.Errorf("%w: a signed zone answered nothing and proved nothing", errDNSSECIncompleteEvidence)
+	}
+	qtype := dns.RRToType(msg.Question[0])
+	if msg.Rcode == dns.RcodeNameError {
+		if denial.ProvesNameError(qName, chain.Zone) {
+			return plugin.judgeNegativeAuthority(msg, chain, now)
+		}
+		if denial.HasOnlyUnsupportedNSEC3Iterations() {
+			return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
+		}
+		return dnssec.Bogus, fmt.Errorf("%w: no proof that %s does not exist", errDNSSECIncompleteEvidence, qName)
+	}
+	if denial.ProvesNoData(qName, qtype) {
+		return plugin.judgeNegativeAuthority(msg, chain, now)
+	}
+	if denial.ProvesWildcardNoData(qName, chain.Zone, qtype) {
+		return plugin.judgeNegativeAuthority(msg, chain, now)
+	}
+	if denial.HasOnlyUnsupportedNSEC3Iterations() {
+		return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
+	}
+	return dnssec.Bogus, fmt.Errorf("%w: no proof that %s holds no record of this type", errDNSSECIncompleteEvidence, qName)
+}
+
 // judgeCNAMEChainTerminal authenticates the final negative answer behind a
 // CNAME chain. RFC 4035 section 3.2.3 permits AD only when all answer RRsets
 // and relevant negative authority RRsets are authentic. It returns Secure
@@ -510,31 +571,12 @@ func (plugin *PluginDNSSECValidate) judgeCNAMEChainTerminal(msg *dns.Msg, qName 
 		return dnssec.Secure, nil
 	}
 
-	owner := plugin.chainFor(terminal, chain, now)
-	switch owner.Status {
-	case dnssec.Secure:
-	case dnssec.Insecure:
-		return dnssec.Insecure, owner.Why
-	case dnssec.Bogus:
-		return dnssec.Bogus, owner.Why
-	default:
-		return dnssec.Indeterminate, owner.Why
-	}
-
-	denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
-	if msg.Rcode == dns.RcodeNameError {
-		if denial.ProvesNameError(terminal, owner.Zone) {
-			return plugin.judgeNegativeAuthority(msg, owner, now)
-		}
-		return dnssec.Bogus, fmt.Errorf("%w: no proof that CNAME target %s does not exist", errDNSSECIncompleteEvidence, terminal)
-	}
-	if denial.ProvesNoData(terminal, qtype) || denial.ProvesWildcardNoData(terminal, owner.Zone, qtype) {
-		return plugin.judgeNegativeAuthority(msg, owner, now)
-	}
-	if denial.HasOnlyUnsupportedNSEC3Iterations() {
-		return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
-	}
-	return dnssec.Bogus, fmt.Errorf("%w: no proof that CNAME target %s holds no record of type %s", errDNSSECIncompleteEvidence, terminal, dns.TypeToString[qtype])
+	// The authority proof belongs to the zone that signed its NSEC/NSEC3
+	// RRsets, which can be above the terminal name by several non-zone-cut
+	// labels.  Use the same signer-directed path as a wholly negative answer;
+	// walking directly to terminal would reject valid deep negative CNAME
+	// targets for the same reason.
+	return plugin.judgeNegative(msg, terminal, now)
 }
 
 // cnameChainTerminal follows the CNAME RRsets actually included in an answer.

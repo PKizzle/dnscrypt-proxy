@@ -462,6 +462,56 @@ func TestValidatorAcceptsASignedWildcardNoDataResponse(t *testing.T) {
 	}
 }
 
+// A negative answer is signed by the zone that supplied the NSEC proof, not by
+// every textual ancestor of the queried name.  This is the shape used by the
+// signed tor.dan.me.uk. zones: several address labels below the actual zone
+// are ordinary nonexistent names, not zone cuts.  RFC 4035 sections 5.3.1 and
+// 5.4 require validating that zone's chain and its authenticated denial;
+// probing for DS at the fabricated intermediate labels instead leaves a valid
+// NXDOMAIN indeterminate.
+func TestValidatorAcceptsDeepNegativeAnswerSignedByEnclosingZone(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	zone := newValidatorTestZone(t, "example.")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	ds := zone.key.ToDS(dns.SHA256)
+	dsSig := root.sign([]dns.RR{ds}, now)
+	zoneKeySig := zone.sign([]dns.RR{zone.key}, now)
+
+	// The first NSEC covers four.three.two.one.example.; the second denies
+	// the wildcard at the closest encloser, example.
+	nameCover := &dns.NSEC{
+		Hdr:  dns.Header{Name: "a.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "z.example.", TypeBitMap: []uint16{dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	wildcardCover := &dns.NSEC{
+		Hdr:  dns.Header{Name: "example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "a.example.", TypeBitMap: []uint16{dns.TypeSOA, dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	nameCoverSig := zone.sign([]dns.RR{nameCover}, now)
+	wildcardCoverSig := zone.sign([]dns.RR{wildcardCover}, now)
+
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{ds, dsSig}, nil), nil
+		case qtype == dns.TypeDNSKEY && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zone.key, zoneKeySig}, nil), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	msg := testDNSMessage(dns.RcodeNameError, nil, []dns.RR{nameCover, nameCoverSig, wildcardCover, wildcardCoverSig})
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "four.three.two.one.example.", Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, "four.three.two.one.example")
+	if result != dnssec.Secure {
+		t.Fatalf("judge() = %v (%v), want secure deep signed NXDOMAIN", result, why)
+	}
+}
+
 // A CNAME is only an intermediate answer to an A query. RFC 4035 section
 // 3.2.3 requires the final negative answer to be authenticated before AD can
 // be set; accepting just the signed alias would make a stripped NODATA proof
