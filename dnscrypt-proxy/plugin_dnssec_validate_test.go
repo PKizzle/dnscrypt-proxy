@@ -759,6 +759,41 @@ func TestTheValidatorsOwnFetchesAreNotTrimmed(t *testing.T) {
 	}
 }
 
+// Chain material is queried through the regular proxy path, but it is not a
+// client query and carries no DNSSEC verdict of its own. It must not therefore
+// distort the dashboard's query, domain, or unchecked-verdict figures.
+func TestTheValidatorsOwnFetchesAreNotRecordedByMonitoring(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.EnableQueryLog = true
+
+	state := PluginsState{
+		clientProto: dnssecInternalProto,
+		qName:       "key.example.",
+		serverName:  "test-server",
+		returnCode:  PluginsReturnCodePass,
+		sessionData: map[string]any{},
+	}
+	msg := dns.NewMsg("key.example.", dns.TypeDNSKEY)
+	if msg == nil {
+		t.Fatal("cannot build DNSKEY query")
+	}
+
+	ui.UpdateMetrics(&state, msg)
+	ui.Flush()
+
+	metrics := ui.metricsCollector.GetMetrics()
+	if total, _ := metrics["total_queries"].(uint64); total != 0 {
+		t.Errorf("internal DNSSEC fetches recorded as %d client queries, want 0", total)
+	}
+	if recent, _ := metrics["recent_queries"].([]QueryLogEntry); len(recent) != 0 {
+		t.Errorf("internal DNSSEC fetches leaked into recent queries: %#v", recent)
+	}
+	if domains, _ := metrics["top_domains"].([]map[string]any); len(domains) != 0 {
+		t.Errorf("internal DNSSEC fetches leaked into top domains: %#v", domains)
+	}
+}
+
 // The verdict has to reach whatever reports on the query. On the wire there is
 // room for it as one bit; someone looking at a dashboard to find out why a name
 // will not resolve needs the sentence that goes with it.

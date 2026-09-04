@@ -381,6 +381,14 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 	if !ui.config.Enabled || pluginsState == nil {
 		return
 	}
+	// DNSSEC chain fetches pass through the normal query pipeline so that they
+	// retain DNS records needed by the validator. They are implementation
+	// detail, not client queries: recording them here inflates dashboard totals
+	// and top domains, and presents their deliberately absent verdict as
+	// "unchecked" traffic.
+	if pluginsState.clientProto == dnssecInternalProto {
+		return
+	}
 	mc := ui.metricsCollector
 	now := time.Now()
 
