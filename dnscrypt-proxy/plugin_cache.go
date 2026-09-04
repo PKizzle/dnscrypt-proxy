@@ -14,8 +14,10 @@ import (
 const StaleResponseTTL = 30 * time.Second
 
 type CachedResponse struct {
-	expiration time.Time
-	msg        *dns.Msg
+	expiration    time.Time
+	msg           *dns.Msg
+	dnssecVerdict string
+	dnssecReason  string
 }
 
 // cachedResponses is created once, before any goroutine that reads it exists
@@ -115,6 +117,21 @@ func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	pluginsState.synthResponse = synth
 	pluginsState.action = PluginsActionSynth
 	pluginsState.cacheHit = true
+	// A cache hit did not run the validator again, but it is serving the exact
+	// response the validator classified before it entered this cache. Carry that
+	// classification to monitoring so an empty per-query verdict never looks
+	// like validation was disabled. The cache expiry below is capped at the
+	// earliest RRSIG expiration, so the stored conclusion cannot outlive the
+	// data it describes.
+	if cached.dnssecVerdict != "" {
+		if pluginsState.sessionData == nil {
+			pluginsState.sessionData = make(map[string]any)
+		}
+		pluginsState.sessionData[dnssecVerdictKey] = cached.dnssecVerdict
+		if cached.dnssecReason != "" {
+			pluginsState.sessionData[dnssecReasonKey] = cached.dnssecReason
+		}
+	}
 	return nil
 }
 
@@ -178,7 +195,14 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 	}
 	cachedMsg := cloneMsg(msg)
 	cachedMsg.Question = nil
-	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})
+	verdict, _ := pluginsState.sessionData[dnssecVerdictKey].(string)
+	reason, _ := pluginsState.sessionData[dnssecReasonKey].(string)
+	cachedResponses.Insert(cacheKey, CachedResponse{
+		expiration:    expiration,
+		msg:           cachedMsg,
+		dnssecVerdict: verdict,
+		dnssecReason:  reason,
+	})
 	updateTTL(msg, expiration)
 
 	return nil
