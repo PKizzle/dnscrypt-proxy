@@ -165,6 +165,9 @@ func TestRetryableDNSSECFailure(t *testing.T) {
 	if !retryableDNSSECFailure(dnssec.Bogus, fmt.Errorf("%w: no denial", errDNSSECIncompleteEvidence)) {
 		t.Fatal("missing DNSSEC evidence should be retried")
 	}
+	if !retryableDNSSECFailure(dnssec.Bogus, fmt.Errorf("relay response: %w", dnssec.ErrSignatureOutsideValidity)) {
+		t.Fatal("an expired relay signature should be retried through another upstream")
+	}
 	if retryableDNSSECFailure(dnssec.Bogus, errors.New("invalid signature")) {
 		t.Fatal("a cryptographic failure must not be retried")
 	}

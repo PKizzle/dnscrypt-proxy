@@ -53,6 +53,13 @@ func (r Result) String() string {
 // not know on its own -- the caller decides.
 var ErrNoSignature = fmt.Errorf("rrset carries no signature")
 
+// ErrSignatureOutsideValidity reports that an RRSIG was otherwise applicable
+// but is not valid at the validator's current time. RFC 4035 section 5.3.3
+// makes that response Bogus; callers may nevertheless obtain a fresh answer
+// from another recursive upstream, because a relay serving stale cache data is
+// not evidence that the zone itself published bad data.
+var ErrSignatureOutsideValidity = errors.New("signature is outside its validity")
+
 // VerifyRRSet reports whether rrset is covered by a signature that verifies
 // against one of keys and is valid at now.
 //
@@ -356,7 +363,7 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 			continue
 		}
 		if !ValidAt(sig, now) {
-			lastErr = fmt.Errorf("signature by key %d is outside its validity", sig.KeyTag)
+			lastErr = fmt.Errorf("%w: signature by key %d", ErrSignatureOutsideValidity, sig.KeyTag)
 			continue
 		}
 		for _, key := range keys {

@@ -22,10 +22,10 @@ import (
 // on its own behalf.
 const dnssecInternalProto = "internal-dnssec"
 
-// A missing DNSSEC proof is often an incomplete recursive response rather
-// than proof that the zone is broken. Try a different encrypted upstream
-// before making a client wait for SERVFAIL, but never retry a cryptographic
-// failure as though it were transient.
+// A missing DNSSEC proof or an expired RRSIG can be stale recursive data rather
+// than proof that the zone is broken. Try fresh encrypted upstreams before
+// making a client wait for SERVFAIL. A signature mismatch still remains a
+// cryptographic failure and is never promoted to a successful answer.
 const dnssecResponseAttempts = 3
 
 var errDNSSECIncompleteEvidence = errors.New("incomplete DNSSEC evidence")
@@ -295,7 +295,9 @@ func retryableDNSSECFailure(result dnssec.Result, why error) bool {
 	if result == dnssec.Indeterminate {
 		return !errors.Is(why, dnssec.ErrUnsupportedNSEC3Iterations)
 	}
-	return result == dnssec.Bogus && errors.Is(why, errDNSSECIncompleteEvidence)
+	return result == dnssec.Bogus &&
+		(errors.Is(why, errDNSSECIncompleteEvidence) ||
+			errors.Is(why, dnssec.ErrSignatureOutsideValidity))
 }
 
 // dnssecFailureEDE preserves the reason a validator had to return SERVFAIL.

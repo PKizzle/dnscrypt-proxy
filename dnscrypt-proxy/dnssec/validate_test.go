@@ -2,6 +2,7 @@ package dnssec
 
 import (
 	"crypto"
+	"errors"
 	"net/netip"
 	"testing"
 	"time"
@@ -113,9 +114,12 @@ func TestVerifyRRSetRejectsOutsideValidity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sig := z.sign(rrset, tc.inception, tc.expiration)
-			res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+			res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
 			if res != Bogus {
 				t.Fatalf("VerifyRRSet() = %v, want bogus", res)
+			}
+			if !errors.Is(err, ErrSignatureOutsideValidity) {
+				t.Fatalf("VerifyRRSet() error = %v, want ErrSignatureOutsideValidity", err)
 			}
 		})
 	}
