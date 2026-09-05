@@ -29,6 +29,23 @@ func TestGetOneExceptNeverReturnsExcludedServer(t *testing.T) {
 	}
 }
 
+func TestGetOneKeepsConfiguredSelectorForOrdinaryQueries(t *testing.T) {
+	serversInfo := NewServersInfo()
+	serversInfo.lbStrategy = LBStrategyFirst{}
+	serversInfo.inner = []*ServerInfo{
+		retryTestServer("first"),
+		retryTestServer("second"),
+	}
+
+	server := serversInfo.getOne()
+	if server == nil {
+		t.Fatal("getOne() returned nil")
+	}
+	if server.Name != "first" {
+		t.Fatalf("getOne() = %q, want configured first candidate", server.Name)
+	}
+}
+
 func TestGetOneExceptReturnsNilWhenNoAlternativeExists(t *testing.T) {
 	serversInfo := NewServersInfo()
 	serversInfo.inner = []*ServerInfo{retryTestServer("only")}
