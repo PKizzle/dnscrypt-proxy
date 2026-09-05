@@ -1,0 +1,38 @@
+package main
+
+import (
+	"testing"
+
+	"github.com/VividCortex/ewma"
+)
+
+func retryTestServer(name string) *ServerInfo {
+	return &ServerInfo{Name: name, rtt: ewma.NewMovingAverage(RTTEwmaDecay)}
+}
+
+func TestGetOneExceptNeverReturnsExcludedServer(t *testing.T) {
+	serversInfo := NewServersInfo()
+	serversInfo.inner = []*ServerInfo{
+		retryTestServer("excluded"),
+		retryTestServer("eligible-a"),
+		retryTestServer("eligible-b"),
+	}
+
+	for range 100 {
+		server := serversInfo.getOneExcept("excluded")
+		if server == nil {
+			t.Fatal("getOneExcept() returned nil with eligible servers")
+		}
+		if server.Name == "excluded" {
+			t.Fatal("getOneExcept() returned the excluded server")
+		}
+	}
+}
+
+func TestGetOneExceptReturnsNilWhenNoAlternativeExists(t *testing.T) {
+	serversInfo := NewServersInfo()
+	serversInfo.inner = []*ServerInfo{retryTestServer("only")}
+	if server := serversInfo.getOneExcept("only"); server != nil {
+		t.Fatalf("getOneExcept() = %q, want nil", server.Name)
+	}
+}

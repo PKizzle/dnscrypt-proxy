@@ -149,6 +149,14 @@ func (plugin *PluginDNSSECValidate) Reload() error {
 // the same encryption as any other query, marked so that this plugin leaves the
 // answer alone.
 func (plugin *PluginDNSSECValidate) resolveInternally(proxy *Proxy, qname string, qtype uint16) (*dns.Msg, error) {
+	return plugin.resolveInternallyExcept(proxy, qname, qtype, "")
+}
+
+// resolveInternallyExcept obtains a fresh client-answer retry from a resolver
+// other than excludeServerName. The normal chain fetcher calls
+// resolveInternally, without an exclusion, because its lookups do not originate
+// from the client-answer resolver.
+func (plugin *PluginDNSSECValidate) resolveInternallyExcept(proxy *Proxy, qname string, qtype uint16, excludeServerName string) (*dns.Msg, error) {
 	msg := dns.NewMsg(qname, qtype)
 	if msg == nil {
 		return nil, fmt.Errorf("cannot build a query for %s/%d", qname, qtype)
@@ -163,8 +171,8 @@ func (plugin *PluginDNSSECValidate) resolveInternally(proxy *Proxy, qname string
 	if err := msg.Pack(); err != nil {
 		return nil, err
 	}
-	response := proxy.processIncomingQuery(
-		dnssecInternalProto, proxy.xTransport.mainProto, msg.Data, nil, nil, time.Now(), false,
+	response := proxy.processIncomingQueryExcept(
+		dnssecInternalProto, proxy.xTransport.mainProto, msg.Data, nil, nil, time.Now(), false, excludeServerName,
 	)
 	if len(response) == 0 {
 		return nil, fmt.Errorf("no response for %s/%d", qname, qtype)
@@ -220,7 +228,7 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	if plugin.proxy != nil && retryableDNSSECFailure(result, why) {
 		qtype := dns.RRToType(msg.Question[0])
 		for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
-			retry, err := plugin.resolveInternally(plugin.proxy, qName, qtype)
+			retry, err := plugin.resolveInternallyExcept(plugin.proxy, qName, qtype, pluginsState.serverName)
 			if err != nil {
 				continue
 			}

@@ -805,6 +805,25 @@ func (proxy *Proxy) processIncomingQuery(
 	start time.Time,
 	onlyCached bool,
 ) []byte {
+	return proxy.processIncomingQueryExcept(
+		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, "",
+	)
+}
+
+// processIncomingQueryExcept is processIncomingQuery with one upstream omitted
+// from selection. It is used for a DNSSEC retry after that exact upstream has
+// supplied an answer that cannot be validated; DNSSEC chain fetches deliberately
+// do not use it, as those lookups have their own upstream provenance.
+func (proxy *Proxy) processIncomingQueryExcept(
+	clientProto string,
+	serverProto string,
+	query []byte,
+	clientAddr *net.Addr,
+	clientPc net.Conn,
+	start time.Time,
+	onlyCached bool,
+	excludeServerName string,
+) []byte {
 	// Initialize metrics for this query
 	clientAddrStr := "unknown"
 	if clientAddr != nil {
@@ -831,7 +850,7 @@ func (proxy *Proxy) processIncomingQuery(
 		func() (*ServerInfo, bool) {
 			// Only get server info once when actually needed
 			if serverInfo == nil {
-				serverInfo = proxy.serversInfo.getOne()
+				serverInfo = proxy.serversInfo.getOneExcept(excludeServerName)
 				if serverInfo != nil {
 					serverName = serverInfo.Name
 				}
@@ -882,7 +901,7 @@ func (proxy *Proxy) processIncomingQuery(
 	// Note: if serverInfo is still nil here, we need to get it
 	if len(response) == 0 {
 		if serverInfo == nil {
-			serverInfo = proxy.serversInfo.getOne()
+			serverInfo = proxy.serversInfo.getOneExcept(excludeServerName)
 			if serverInfo != nil {
 				serverName = serverInfo.Name
 			}

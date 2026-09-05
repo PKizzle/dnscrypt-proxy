@@ -449,6 +449,14 @@ func (serversInfo *ServersInfo) recoverDormantServers() {
 }
 
 func (serversInfo *ServersInfo) getOne() *ServerInfo {
+	return serversInfo.getOneExcept("")
+}
+
+// getOneExcept picks an eligible server while omitting excludedName. Ordinary
+// lookups preserve the existing strategy exactly. DNSSEC response retries use
+// the exclusion so they do not ask the same resolver for the same stale or
+// incomplete answer again.
+func (serversInfo *ServersInfo) getOneExcept(excludedName string) *ServerInfo {
 	serversInfo.Lock()
 	serversCount := len(serversInfo.inner)
 	if serversCount <= 0 {
@@ -457,6 +465,43 @@ func (serversInfo *ServersInfo) getOne() *ServerInfo {
 	}
 
 	serversInfo.recoverDormantServers()
+	if excludedName != "" {
+		eligible := make([]*ServerInfo, 0, serversCount-1)
+		for _, server := range serversInfo.inner {
+			if server.Name != excludedName {
+				eligible = append(eligible, server)
+			}
+		}
+		if len(eligible) == 0 {
+			serversInfo.Unlock()
+			return nil
+		}
+
+		var serverInfo *ServerInfo
+		if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 && len(eligible) > 1 {
+			first := eligible[rand.Intn(len(eligible))]
+			second := eligible[rand.Intn(len(eligible))]
+			for second == first {
+				second = eligible[rand.Intn(len(eligible))]
+			}
+			if serversInfo.calculateServerScore(second) > serversInfo.calculateServerScore(first) {
+				serverInfo = second
+			} else {
+				serverInfo = first
+			}
+		} else {
+			// Retry traffic is exceptional. For strategies whose candidate indices
+			// refer to the complete server slice, choose uniformly from the
+			// remaining servers rather than accidentally reintroducing the excluded
+			// resolver through an index translation.
+			serverInfo = eligible[rand.Intn(len(eligible))]
+		}
+		dlog.Debugf("Using candidate [%s] (excluding [%s]) RTT: %d Score: %.3f",
+			serverInfo.Name, excludedName, int(serverInfo.rtt.Value()),
+			serversInfo.calculateServerScore(serverInfo))
+		serversInfo.Unlock()
+		return serverInfo
+	}
 
 	var candidate int
 
