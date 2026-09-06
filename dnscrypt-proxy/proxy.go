@@ -805,8 +805,8 @@ func (proxy *Proxy) processIncomingQuery(
 	start time.Time,
 	onlyCached bool,
 ) []byte {
-	return proxy.processIncomingQueryExcept(
-		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, "",
+	return proxy.processIncomingQueryExcluding(
+		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, nil,
 	)
 }
 
@@ -823,6 +823,29 @@ func (proxy *Proxy) processIncomingQueryExcept(
 	start time.Time,
 	onlyCached bool,
 	excludeServerName string,
+) []byte {
+	var excludedServerNames map[string]struct{}
+	if excludeServerName != "" {
+		excludedServerNames = map[string]struct{}{excludeServerName: {}}
+	}
+	return proxy.processIncomingQueryExcluding(
+		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, excludedServerNames,
+	)
+}
+
+// processIncomingQueryExcluding omits every server already tried by one
+// DNSSEC recovery transaction.  Selected servers are added to the caller's
+// set before exchange, so timeouts as well as incomplete answers move the next
+// attempt to a genuinely different recursive resolver.
+func (proxy *Proxy) processIncomingQueryExcluding(
+	clientProto string,
+	serverProto string,
+	query []byte,
+	clientAddr *net.Addr,
+	clientPc net.Conn,
+	start time.Time,
+	onlyCached bool,
+	excludedServerNames map[string]struct{},
 ) []byte {
 	// Initialize metrics for this query
 	clientAddrStr := "unknown"
@@ -842,6 +865,17 @@ func (proxy *Proxy) processIncomingQueryExcept(
 
 	var serverInfo *ServerInfo
 	var serverName string = "-"
+	pickServer := func() *ServerInfo {
+		server := proxy.serversInfo.getOneExcluding(excludedServerNames)
+		if server == nil {
+			return nil
+		}
+		serverName = server.Name
+		if excludedServerNames != nil {
+			excludedServerNames[serverName] = struct{}{}
+		}
+		return server
+	}
 
 	// Apply query plugins with lazy server selection
 	query, err := pluginsState.ApplyQueryPlugins(
@@ -850,10 +884,7 @@ func (proxy *Proxy) processIncomingQueryExcept(
 		func() (*ServerInfo, bool) {
 			// Only get server info once when actually needed
 			if serverInfo == nil {
-				serverInfo = proxy.serversInfo.getOneExcept(excludeServerName)
-				if serverInfo != nil {
-					serverName = serverInfo.Name
-				}
+				serverInfo = pickServer()
 			}
 			if serverInfo == nil {
 				return nil, false
@@ -901,10 +932,7 @@ func (proxy *Proxy) processIncomingQueryExcept(
 	// Note: if serverInfo is still nil here, we need to get it
 	if len(response) == 0 {
 		if serverInfo == nil {
-			serverInfo = proxy.serversInfo.getOneExcept(excludeServerName)
-			if serverInfo != nil {
-				serverName = serverInfo.Name
-			}
+			serverInfo = pickServer()
 		}
 		if serverInfo != nil {
 			pluginsState.serverName = serverName

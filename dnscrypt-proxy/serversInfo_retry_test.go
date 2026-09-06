@@ -53,3 +53,27 @@ func TestGetOneExceptReturnsNilWhenNoAlternativeExists(t *testing.T) {
 		t.Fatalf("getOneExcept() = %q, want nil", server.Name)
 	}
 }
+
+func TestGetOneExcludingNeverReusesATriedServer(t *testing.T) {
+	serversInfo := NewServersInfo()
+	serversInfo.inner = []*ServerInfo{
+		retryTestServer("original"),
+		retryTestServer("alternate-a"),
+		retryTestServer("alternate-b"),
+	}
+	excluded := map[string]struct{}{"original": {}}
+
+	for range 2 {
+		server := serversInfo.getOneExcluding(excluded)
+		if server == nil {
+			t.Fatal("getOneExcluding() exhausted eligible servers too early")
+		}
+		if _, wasTried := excluded[server.Name]; wasTried {
+			t.Fatalf("getOneExcluding() reused tried server %q", server.Name)
+		}
+		excluded[server.Name] = struct{}{}
+	}
+	if server := serversInfo.getOneExcluding(excluded); server != nil {
+		t.Fatalf("getOneExcluding() = %q after all servers were tried, want nil", server.Name)
+	}
+}

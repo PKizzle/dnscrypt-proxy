@@ -149,7 +149,7 @@ func (plugin *PluginDNSSECValidate) Reload() error {
 // the same encryption as any other query, marked so that this plugin leaves the
 // answer alone.
 func (plugin *PluginDNSSECValidate) resolveInternally(proxy *Proxy, qname string, qtype uint16) (*dns.Msg, error) {
-	return plugin.resolveInternallyExcept(proxy, qname, qtype, "")
+	return plugin.resolveInternallyExcluding(proxy, qname, qtype, nil)
 }
 
 // resolveInternallyExcept obtains a fresh client-answer retry from a resolver
@@ -157,6 +157,14 @@ func (plugin *PluginDNSSECValidate) resolveInternally(proxy *Proxy, qname string
 // resolveInternally, without an exclusion, because its lookups do not originate
 // from the client-answer resolver.
 func (plugin *PluginDNSSECValidate) resolveInternallyExcept(proxy *Proxy, qname string, qtype uint16, excludeServerName string) (*dns.Msg, error) {
+	var excludedServerNames map[string]struct{}
+	if excludeServerName != "" {
+		excludedServerNames = map[string]struct{}{excludeServerName: {}}
+	}
+	return plugin.resolveInternallyExcluding(proxy, qname, qtype, excludedServerNames)
+}
+
+func (plugin *PluginDNSSECValidate) resolveInternallyExcluding(proxy *Proxy, qname string, qtype uint16, excludedServerNames map[string]struct{}) (*dns.Msg, error) {
 	msg := dns.NewMsg(qname, qtype)
 	if msg == nil {
 		return nil, fmt.Errorf("cannot build a query for %s/%d", qname, qtype)
@@ -171,8 +179,8 @@ func (plugin *PluginDNSSECValidate) resolveInternallyExcept(proxy *Proxy, qname 
 	if err := msg.Pack(); err != nil {
 		return nil, err
 	}
-	response := proxy.processIncomingQueryExcept(
-		dnssecInternalProto, proxy.xTransport.mainProto, msg.Data, nil, nil, time.Now(), false, excludeServerName,
+	response := proxy.processIncomingQueryExcluding(
+		dnssecInternalProto, proxy.xTransport.mainProto, msg.Data, nil, nil, time.Now(), false, excludedServerNames,
 	)
 	if len(response) == 0 {
 		return nil, fmt.Errorf("no response for %s/%d", qname, qtype)
@@ -227,8 +235,12 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	result, why := plugin.judge(msg, qName)
 	if plugin.proxy != nil && retryableDNSSECFailure(result, why) {
 		qtype := dns.RRToType(msg.Question[0])
+		excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
+		if pluginsState.serverName != "" && pluginsState.serverName != "-" {
+			excludedServerNames[pluginsState.serverName] = struct{}{}
+		}
 		for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
-			retry, err := plugin.resolveInternallyExcept(plugin.proxy, qName, qtype, pluginsState.serverName)
+			retry, err := plugin.resolveInternallyExcluding(plugin.proxy, qName, qtype, excludedServerNames)
 			if err != nil {
 				continue
 			}
