@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -443,6 +444,104 @@ func TestDNSSECResponseSourceReplacesStaleResolverProvenance(t *testing.T) {
 	if state.relayName != "" {
 		t.Fatalf("stale relay provenance was retained: %q", state.relayName)
 	}
+}
+
+func TestDNSSECValidationRetryCommitsOnlyUsableResponse(t *testing.T) {
+	original := packedDNSSECRetryMessage(t, 1234, dns.RcodeSuccess, "original.example.")
+	candidates := []*dns.Msg{
+		packedDNSSECRetryMessage(t, 2001, dns.RcodeServerFailure, "servfail.example."),
+		packedDNSSECRetryMessage(t, 2002, dns.RcodeSuccess, "bogus.example."),
+		packedDNSSECRetryMessage(t, 2003, dns.RcodeNameError, "secure.example."),
+	}
+	calls := 0
+	result, why, returnCode, serverName, ok := retryDNSSECValidationFailure(
+		original,
+		"query.example.",
+		dns.TypeA,
+		"first",
+		func(_ string, _ uint16, excluded map[string]struct{}) (*dns.Msg, string, error) {
+			calls++
+			server := fmt.Sprintf("retry-%d", calls)
+			if calls > 1 {
+				if _, found := excluded[fmt.Sprintf("retry-%d", calls-1)]; !found {
+					t.Fatalf("previous resolver was not excluded before call %d", calls)
+				}
+			}
+			return candidates[calls-1], server, nil
+		},
+		func(candidate *dns.Msg, _ string) (dnssec.Result, error) {
+			switch candidate.ID {
+			case 2002:
+				return dnssec.Bogus, errors.New("bad alternate signature")
+			case 2003:
+				return dnssec.Secure, nil
+			default:
+				t.Fatalf("unacceptable RCODE reached the validator: %d", candidate.Rcode)
+				return dnssec.Indeterminate, errors.New("unreachable")
+			}
+		},
+	)
+	if !ok || result != dnssec.Secure || why != nil {
+		t.Fatalf("retry result = (%v, %v, %v), want Secure recovery", result, why, ok)
+	}
+	if calls != 3 || returnCode != PluginsReturnCodeNXDomain || serverName != "retry-3" {
+		t.Fatalf("retry selection = calls %d, code %v, server %q", calls, returnCode, serverName)
+	}
+	if original.ID != 1234 || original.Rcode != dns.RcodeNameError || original.Question[0].Header().Name != "original.example." {
+		t.Fatalf("usable retry was not installed while preserving the client transaction: %#v", original)
+	}
+}
+
+func TestDNSSECValidationRetryPreservesOriginalWhenNoResponseIsUsable(t *testing.T) {
+	original := packedDNSSECRetryMessage(t, 1234, dns.RcodeSuccess, "original.example.")
+	originalData := append([]byte(nil), original.Data...)
+	candidates := []*dns.Msg{
+		packedDNSSECRetryMessage(t, 2001, dns.RcodeServerFailure, "servfail.example."),
+		packedDNSSECRetryMessage(t, 2002, dns.RcodeSuccess, "bogus.example."),
+		packedDNSSECRetryMessage(t, 2003, dns.RcodeSuccess, "indeterminate.example."),
+	}
+	calls := 0
+	_, _, _, _, ok := retryDNSSECValidationFailure(
+		original,
+		"query.example.",
+		dns.TypeA,
+		"first",
+		func(_ string, _ uint16, _ map[string]struct{}) (*dns.Msg, string, error) {
+			candidate := candidates[calls]
+			calls++
+			return candidate, fmt.Sprintf("retry-%d", calls), nil
+		},
+		func(candidate *dns.Msg, _ string) (dnssec.Result, error) {
+			if candidate.ID == 2002 {
+				return dnssec.Bogus, errors.New("bad alternate signature")
+			}
+			return dnssec.Indeterminate, errors.New("alternate lookup incomplete")
+		},
+	)
+	if ok || calls != 3 {
+		t.Fatalf("unusable retries = recovered %v after %d calls, want false after 3", ok, calls)
+	}
+	if original.ID != 1234 || original.Rcode != dns.RcodeSuccess || original.Question[0].Header().Name != "original.example." || !slices.Equal(original.Data, originalData) {
+		t.Fatalf("unusable retry changed the original response: %#v", original)
+	}
+}
+
+func packedDNSSECRetryMessage(t *testing.T, id uint16, rcode uint16, qname string) *dns.Msg {
+	t.Helper()
+	msg := dns.NewMsg(qname, dns.TypeA)
+	msg.ID = id
+	msg.Response = true
+	msg.Rcode = rcode
+	if rcode == dns.RcodeSuccess {
+		msg.Answer = []dns.RR{&dns.A{
+			Hdr: dns.Header{Name: qname, Class: dns.ClassINET, TTL: 60},
+			A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+		}}
+	}
+	if err := msg.Pack(); err != nil {
+		t.Fatal(err)
+	}
+	return msg
 }
 
 func TestDNSSECFailureEDEIdentifiesUnsupportedNSEC3Iterations(t *testing.T) {

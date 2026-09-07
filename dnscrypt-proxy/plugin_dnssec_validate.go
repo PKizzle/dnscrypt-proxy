@@ -268,19 +268,11 @@ func retryDNSSECUpstreamSERVFAIL(
 		if err != nil || retry == nil {
 			continue
 		}
-		var returnCode PluginsReturnCode
-		switch retry.Rcode {
-		case dns.RcodeSuccess:
-			returnCode = PluginsReturnCodePass
-		case dns.RcodeNameError:
-			returnCode = PluginsReturnCodeNXDomain
-		case dns.RcodeYXDomain:
-			// RFC 6672 section 3.2 uses YXDOMAIN for a DNAME
-			// substitution that exceeds the DNS wire-name limit. Preserve it
-			// for the ordinary validator instead of discarding a potentially
-			// authenticated recovery response with the other error RCODEs.
-			returnCode = PluginsReturnCodeResponseError
-		default:
+		if serverName != "" && serverName != "-" {
+			excludedServerNames[serverName] = struct{}{}
+		}
+		returnCode, acceptable := dnssecResponseReturnCode(retry)
+		if !acceptable {
 			continue
 		}
 		if err := replaceDNSSECResponse(msg, retry); err != nil {
@@ -289,6 +281,68 @@ func retryDNSSECUpstreamSERVFAIL(
 		return returnCode, serverName, true
 	}
 	return PluginsReturnCodeServFail, "", false
+}
+
+// dnssecResponseReturnCode identifies response codes for which DNSSEC can
+// authenticate either the answer or its denial. RFC 6672 section 3.2 uses
+// YXDOMAIN for an authenticated DNAME substitution that exceeds the DNS
+// wire-name limit, so it is validation input rather than an upstream failure.
+func dnssecResponseReturnCode(msg *dns.Msg) (PluginsReturnCode, bool) {
+	if msg == nil {
+		return PluginsReturnCodeResponseError, false
+	}
+	switch msg.Rcode {
+	case dns.RcodeSuccess:
+		return PluginsReturnCodePass, true
+	case dns.RcodeNameError:
+		return PluginsReturnCodeNXDomain, true
+	case dns.RcodeYXDomain:
+		return PluginsReturnCodeResponseError, true
+	default:
+		return PluginsReturnCodeResponseError, false
+	}
+}
+
+// retryDNSSECValidationFailure tries distinct recursive resolvers without
+// allowing an unusable retry to replace the client response. Under RFC 4035
+// section 5.5 a Bogus or Indeterminate candidate still requires SERVFAIL when
+// CD is clear; with CD set (or while logging), replacing the original with a
+// different failure provides no recovery. Only a Secure or legitimately
+// Insecure candidate is therefore committed to the client response.
+func retryDNSSECValidationFailure(
+	msg *dns.Msg,
+	qName string,
+	qtype uint16,
+	originalServerName string,
+	resolve func(string, uint16, map[string]struct{}) (*dns.Msg, string, error),
+	judge func(*dns.Msg, string) (dnssec.Result, error),
+) (dnssec.Result, error, PluginsReturnCode, string, bool) {
+	excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
+	if originalServerName != "" && originalServerName != "-" {
+		excludedServerNames[originalServerName] = struct{}{}
+	}
+	for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
+		retry, serverName, err := resolve(qName, qtype, excludedServerNames)
+		if err != nil || retry == nil {
+			continue
+		}
+		if serverName != "" && serverName != "-" {
+			excludedServerNames[serverName] = struct{}{}
+		}
+		returnCode, acceptable := dnssecResponseReturnCode(retry)
+		if !acceptable {
+			continue
+		}
+		result, why := judge(retry, qName)
+		if result != dnssec.Secure && result != dnssec.Insecure {
+			continue
+		}
+		if err := replaceDNSSECResponse(msg, retry); err != nil {
+			continue
+		}
+		return result, why, returnCode, serverName, true
+	}
+	return dnssec.Indeterminate, nil, PluginsReturnCodeResponseError, "", false
 }
 
 // replaceDNSSECResponse installs a private retry without copying dns.Msg's
@@ -392,23 +446,19 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		result, why = plugin.judge(msg, qName)
 	}
 	if plugin.proxy != nil && !configuredInsecure && !outsideValidationScope && retryableDNSSECFailure(result, why) {
-		excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
-		if pluginsState.serverName != "" && pluginsState.serverName != "-" {
-			excludedServerNames[pluginsState.serverName] = struct{}{}
-		}
-		for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
-			retry, serverName, err := plugin.resolveInternallyExcludingWithServer(plugin.proxy, qName, qtype, excludedServerNames)
-			if err != nil {
-				continue
-			}
-			if err := replaceDNSSECResponse(msg, retry); err != nil {
-				continue
-			}
+		if retryResult, retryWhy, returnCode, serverName, recovered := retryDNSSECValidationFailure(
+			msg,
+			qName,
+			qtype,
+			pluginsState.serverName,
+			func(name string, recordType uint16, excluded map[string]struct{}) (*dns.Msg, string, error) {
+				return plugin.resolveInternallyExcludingWithServer(plugin.proxy, name, recordType, excluded)
+			},
+			plugin.judge,
+		); recovered {
+			result, why = retryResult, retryWhy
+			pluginsState.returnCode = returnCode
 			setDNSSECResponseSource(pluginsState, serverName)
-			result, why = plugin.judge(msg, qName)
-			if !retryableDNSSECFailure(result, why) {
-				break
-			}
 		}
 	}
 
