@@ -273,6 +273,68 @@ func TestDelegationThisBuildCannotCheckIsInsecureNotBogus(t *testing.T) {
 	}
 }
 
+// RFC 4035 section 5.2 and RFC 6840 section 5.2 apply the same rule to the
+// public-key algorithm named by a DS as to an unsupported DS digest: the DS is
+// disregarded, and a delegation with no supported DS left is treated unsigned.
+func TestDelegationWithUnsupportedKeyAlgorithmIsInsecureNotBogus(t *testing.T) {
+	z := newZone(t, "example.test.")
+	unsupported := *z.key
+	unsupported.Algorithm = 99
+	unsupported.Tag = 0
+	ds := unsupported.ToDS(dns.SHA256)
+	if ds == nil {
+		t.Fatal("construct DS for unsupported public-key algorithm")
+	}
+
+	res, err := VerifyDNSKEYs([]*dns.DNSKEY{&unsupported}, nil, []*dns.DS{ds}, time.Now())
+	if res != Insecure {
+		t.Fatalf("result = %v (%v), want Insecure", res, err)
+	}
+}
+
+// RFC 9904 makes the IANA registry canonical. Digest value 5 is GOST
+// R 34.11-2012 there; this pinned DNS library still calls the same numeric
+// value experimental SHA-512 and can compute the wrong digest for it. It is
+// therefore unsupported until the library implements the registered meaning.
+func TestRegisteredDigestFiveIsNotMistakenForLibrarySHA512(t *testing.T) {
+	z := newZone(t, "example.test.")
+	ds := z.key.ToDS(5)
+	if ds == nil {
+		t.Fatal("construct dependency's legacy digest-5 DS fixture")
+	}
+
+	res, err := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, nil, []*dns.DS{ds}, time.Now())
+	if res != Insecure {
+		t.Fatalf("result = %v (%v), want Insecure", res, err)
+	}
+}
+
+// Unsupported DS records are ignored, not allowed to hide a failure through a
+// different DS record whose algorithms this validator does support.
+func TestUnsupportedDelegationDoesNotMaskSupportedMismatch(t *testing.T) {
+	z := newZone(t, "example.test.")
+	badSupported := z.key.ToDS(dns.SHA256)
+	badSupported.Digest = "0000000000000000000000000000000000000000000000000000000000000000"
+
+	unsupported := *z.key
+	unsupported.Algorithm = 99
+	unsupported.Tag = 0
+	unsupportedDS := unsupported.ToDS(dns.SHA256)
+	if unsupportedDS == nil {
+		t.Fatal("construct DS for unsupported public-key algorithm")
+	}
+
+	res, err := VerifyDNSKEYs(
+		[]*dns.DNSKEY{z.key, &unsupported},
+		nil,
+		[]*dns.DS{unsupportedDS, badSupported},
+		time.Now(),
+	)
+	if res != Bogus {
+		t.Fatalf("result = %v (%v), want Bogus", res, err)
+	}
+}
+
 // A delegation that CAN be checked and does not match is still forged, and must
 // stay refused: treating the uncheckable case as unsigned must not soften this.
 func TestCheckableDelegationThatDoesNotMatchIsStillBogus(t *testing.T) {
@@ -431,6 +493,27 @@ func TestKeyWithAWrongProtocolIsNotUsed(t *testing.T) {
 	z.key.Protocol = 2
 	if res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now); res == Secure {
 		t.Error("a key with a non-DNSSEC protocol value was used to verify")
+	}
+}
+
+// A matching key for an algorithm the validator implements is part of a
+// claimed chain. Malformed key material makes that chain Bogus; it must never
+// be reclassified as an unsupported-algorithm Insecure delegation.
+func TestMalformedSupportedKeyIsBogusNotInsecure(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	malformed := *z.key
+	malformed.PublicKey = "not-base64"
+	// Preserve the already authenticated key tag so verification reaches the
+	// key parser rather than taking the unrelated no-matching-key branch.
+	malformed.Tag = sig.KeyTag
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{&malformed}, now)
+	if res != Bogus {
+		t.Fatalf("result = %v (%v), want Bogus", res, err)
 	}
 }
 

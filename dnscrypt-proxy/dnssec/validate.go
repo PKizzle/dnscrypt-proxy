@@ -128,24 +128,19 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		return Indeterminate, fmt.Errorf("no delegation signer to anchor against")
 	}
 
-	// Whether the parent published a delegation signer this build can compute at
-	// all. RFC 4035 section 5.2 treats a delegation whose digests are all
-	// unknown as unsigned rather than forged: refusing it would take zones off
-	// the air as digest types turn over, which is the opposite of what
-	// validating is for.
+	// Whether the parent published a delegation signer this build can follow at
+	// all. RFC 4035 section 5.2 and RFC 6840 section 5.2 require a validator to
+	// disregard DS records whose public-key algorithm or digest algorithm it
+	// cannot check. If none remain, the child is treated as unsigned rather than
+	// forged: refusing it would take zones off the air as algorithms turn over.
 	//
 	// Deliberately independent of whether any key matches. A key the parent
 	// never delegated is forged, and must stay refused -- that is the case this
 	// whole function exists for.
 	checkable := false
 	for _, ds := range dss {
-		for _, key := range keys {
-			if key.ToDS(ds.DigestType) != nil {
-				checkable = true
-				break
-			}
-		}
-		if checkable {
+		if supportedDNSKEYAlgorithm(ds.Algorithm) && supportedDSDigest(ds.DigestType) {
+			checkable = true
 			break
 		}
 	}
@@ -153,6 +148,9 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 	anchored := make([]*dns.DNSKEY, 0, len(keys))
 	for _, key := range keys {
 		for _, ds := range dss {
+			if !supportedDNSKEYAlgorithm(ds.Algorithm) || !supportedDSDigest(ds.DigestType) {
+				continue
+			}
 			if key.KeyTag() != ds.KeyTag || key.Algorithm != ds.Algorithm {
 				continue
 			}
@@ -197,6 +195,42 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		return res, fmt.Errorf("key set is not signed by an anchored key: %w", err)
 	}
 	return Secure, nil
+}
+
+// supportedDNSKEYAlgorithm mirrors the algorithms implemented by the pinned
+// dns.RRSIG.Verify method. Merely being assigned an IANA number, or appearing
+// in dns.AlgorithmToString, does not mean this build can verify it (that table
+// also contains DSA, GOST and Ed448). RFC 4035 section 5.2 makes this an input
+// to delegation security, so guessing support here can turn an unsupported
+// zone into a false Bogus result.
+func supportedDNSKEYAlgorithm(algorithm uint8) bool {
+	switch algorithm {
+	case dns.RSASHA1,
+		dns.RSASHA1NSEC3SHA1,
+		dns.RSASHA256,
+		dns.RSASHA512,
+		dns.ECDSAP256SHA256,
+		dns.ECDSAP384SHA384,
+		dns.ED25519:
+		return true
+	default:
+		return false
+	}
+}
+
+// supportedDSDigest lists the IANA-assigned digest algorithms that this build
+// implements correctly. Keeping this independent of the offered DNSKEY
+// material is important: a malformed key under a supported DS is a validation
+// failure, not evidence that the DS algorithm was unsupported. Do not include
+// dns.SHA512 here: the pinned library uses that name for numeric value 5, which
+// IANA now assigns to GOST R 34.11-2012, not SHA-512.
+func supportedDSDigest(digest uint8) bool {
+	switch digest {
+	case dns.SHA1, dns.SHA256, dns.SHA384:
+		return true
+	default:
+		return false
+	}
 }
 
 // signaturesFromZone keeps only signatures whose signer is the zone expected
@@ -391,13 +425,11 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 	if lastErr == nil {
 		return Indeterminate, nil, ErrNoSignature
 	}
-	// RFC 6840 section 5.2: a key this build cannot use proves nothing either
-	// way, and a zone must not be refused for being signed in a way this
-	// validator cannot follow -- which is what refusing here would come to as
-	// algorithms turn over.
-	if errors.Is(lastErr, dns.ErrKey) {
-		return Insecure, nil, lastErr
-	}
+	// Algorithm support is decided from the authenticated DS before this point.
+	// ErrKey here therefore means that matching material for an algorithm this
+	// build supports was malformed or unusable. RFC 4035 sections 4.3 and 5.5
+	// require that failed authentication to remain Bogus; treating it as
+	// Insecure would be a downgrade around the chain of trust.
 	return Bogus, nil, lastErr
 }
 
