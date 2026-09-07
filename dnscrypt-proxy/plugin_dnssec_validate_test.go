@@ -604,6 +604,86 @@ func TestValidatorClassifiesProvablyBadSignatureWhenOwnerWalkIsIncomplete(t *tes
 	}
 }
 
+// RFC 4035 section 2.2 says that RRSIG records do not form RRsets and that an
+// RRSIG record itself must not be signed.  A positive explicit RRSIG query is
+// consequently returned without AD, matching Unbound, instead of being
+// mistaken for a signed negative response with a missing denial proof.
+func TestValidatorTreatsPositiveRRSIGQueryAsInsecure(t *testing.T) {
+	plugin := &PluginDNSSECValidate{mode: ValidationEnforce}
+	msg := dns.NewMsg("example.", dns.TypeRRSIG)
+	msg.Answer = []dns.RR{&dns.RRSIG{
+		Hdr: dns.Header{Name: "example.", Class: dns.ClassINET, TTL: 300},
+		RRSIG: rdata.RRSIG{
+			TypeCovered: dns.TypeSOA,
+			SignerName:  "example.",
+		},
+	}}
+
+	result, why := plugin.judge(msg, "example.")
+	if result != dnssec.Insecure {
+		t.Fatalf("positive RRSIG query = %v (%v), want insecure", result, why)
+	}
+	if !errors.Is(why, errDNSSECRRSIGNotAuthenticated) {
+		t.Fatalf("positive RRSIG reason = %v, want RRSIG-not-authenticated", why)
+	}
+
+	msg.AuthenticatedData = true
+	state := PluginsState{
+		qName:       "example.",
+		returnCode:  PluginsReturnCodePass,
+		sessionData: map[string]any{},
+		questionMsg: dns.NewMsg("example.", dns.TypeRRSIG),
+	}
+	if err := plugin.Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if state.action == PluginsActionReject || state.returnCode == PluginsReturnCodeServFail {
+		t.Fatal("positive RRSIG query was rejected in enforce mode")
+	}
+	if msg.AuthenticatedData {
+		t.Fatal("positive RRSIG query retained an AD assertion")
+	}
+	if got := state.sessionData[dnssecVerdictKey]; got != "insecure" {
+		t.Fatalf("positive RRSIG verdict = %v, want insecure", got)
+	}
+}
+
+// The RRSIG exception must not become a blanket bypass.  Ordinary answer data
+// accompanying the requested signatures still has to authenticate normally.
+func TestPositiveRRSIGQueryStillRejectsBogusOrdinaryData(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	notADelegation := &dns.NSEC{
+		Hdr:  dns.Header{Name: "alias.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "b.", TypeBitMap: []uint16{dns.TypeCNAME, dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	notADelegationSig := root.sign([]dns.RR{notADelegation}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "alias.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{notADelegation, notADelegationSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "alias.", Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: "target."},
+	}
+	badSig := root.sign([]dns.RR{cname}, now)
+	badSig.Signature = "AAAA"
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{cname, badSig}, nil)
+	msg.Question = []dns.RR{&dns.RRSIG{Hdr: dns.Header{Name: "alias.", Class: dns.ClassINET}}}
+
+	result, _ := plugin.judge(msg, "alias.")
+	if result != dnssec.Bogus {
+		t.Fatalf("RRSIG query with bogus CNAME = %v, want bogus", result)
+	}
+}
+
 // DS data is the exception to the ordinary owner-zone rule: the RRset is at
 // the child zone cut, but RFC 4035 sections 2.4 and 5.2 put it in the parent
 // zone and require the parent's signature. This is the positive counterpart

@@ -30,6 +30,13 @@ const dnssecResponseAttempts = 3
 
 var errDNSSECIncompleteEvidence = errors.New("incomplete DNSSEC evidence")
 
+// RFC 4035 section 2.2 makes RRSIG the exception to ordinary RRset
+// authentication: RRSIG records do not form an RRset and an RRSIG record
+// itself must not be signed.  A positive QTYPE=RRSIG answer can therefore be
+// returned for inspection, but the recursive server cannot assert AD over the
+// RRSIG records as an independently authenticated RRset.
+var errDNSSECRRSIGNotAuthenticated = errors.New("RRSIG records do not form RRsets and are not themselves signed")
+
 type ValidationMode int
 
 const (
@@ -361,9 +368,14 @@ func (plugin *PluginDNSSECValidate) mustReject(result dnssec.Result, checkingDis
 // judge decides what an answer is worth.
 func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Result, error) {
 	now := time.Now()
-	records, _ := dnssec.SplitSignatures(msg.Answer)
+	records, signatures := dnssec.SplitSignatures(msg.Answer)
+	qtype := dns.RRToType(msg.Question[0])
+	positiveRRSIGQuery := qtype == dns.TypeRRSIG && len(signatures) > 0
 
 	if len(records) == 0 {
+		if positiveRRSIGQuery {
+			return dnssec.Insecure, errDNSSECRRSIGNotAuthenticated
+		}
 		return plugin.judgeNegative(msg, qName, now)
 	}
 
@@ -380,6 +392,13 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	var chain dnssec.ChainResult
 	worst := dnssec.Secure
 	var worstErr error
+	if positiveRRSIGQuery {
+		// Validate any ordinary CNAME/DNAME data alongside the requested
+		// signatures, but keep AD clear for the RRSIG records themselves.
+		// This is also what Unbound reports for a direct positive RRSIG query.
+		worst = dnssec.Insecure
+		worstErr = errDNSSECRRSIGNotAuthenticated
+	}
 	sets := dnssec.GroupRRSets(msg.Answer)
 	dnames := make([]validatedDNAME, 0)
 
@@ -445,7 +464,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	// response that AD would vouch for and has to be checked too. Without this,
 	// a signed alias plus an unsigned or forged target NODATA response is marked
 	// secure merely because the alias happened to validate.
-	if qtype := dns.RRToType(msg.Question[0]); qtype != dns.TypeCNAME && qtype != dns.TypeANY {
+	if qtype != dns.TypeCNAME && qtype != dns.TypeANY && !positiveRRSIGQuery {
 		res, err := plugin.judgeCNAMEChainTerminal(msg, qName, qtype, sets, chain, now)
 		switch res {
 		case dnssec.Bogus:
