@@ -366,6 +366,7 @@ func processPlugins(
 	response []byte,
 ) ([]byte, error) {
 	var err error
+	upstreamRcode := Rcode(response)
 
 	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
 	if err != nil {
@@ -389,16 +390,26 @@ func processPlugins(
 		}
 	}
 
-	// Check rcode and handle failures
-	if rcode := Rcode(response); rcode == dns.RcodeServerFailure { // SERVFAIL
-		if pluginsState.dnssec {
+	// Health belongs to the resolver's original response, not to a replacement
+	// supplied by a DNSSEC retry and not to a local enforcement response. A raw
+	// upstream SERVFAIL is a resolver failure even when another resolver repairs
+	// the client transaction; a locally generated DNSSEC SERVFAIL still means
+	// the original server completed its exchange and supplied judgeable data.
+	finalRcode := Rcode(response)
+	if upstreamRcode == dns.RcodeServerFailure {
+		serverInfo.noticeFailure(proxy)
+	} else if finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec {
+		serverInfo.noticeFailure(proxy)
+	} else {
+		serverInfo.noticeSuccess(proxy)
+	}
+
+	if finalRcode == dns.RcodeServerFailure {
+		if pluginsState.dnssec && upstreamRcode != dns.RcodeServerFailure {
 			dlog.Debug("A response had an invalid DNSSEC signature")
 		} else {
 			dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
-			serverInfo.noticeFailure(proxy)
 		}
-	} else {
-		serverInfo.noticeSuccess(proxy)
 	}
 
 	return response, nil

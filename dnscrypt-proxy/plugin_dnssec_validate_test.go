@@ -174,6 +174,104 @@ func TestRetryableDNSSECFailure(t *testing.T) {
 	}
 }
 
+func TestDNSSECUpstreamSERVFAILRetriesDistinctResolvers(t *testing.T) {
+	original := dns.NewMsg("example.test.", dns.TypeRRSIG)
+	original.ID = 1234
+	original.Response = true
+	original.Rcode = dns.RcodeServerFailure
+	if err := original.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := dns.NewMsg("example.test.", dns.TypeRRSIG)
+	recovered.ID = 9999
+	recovered.Response = true
+	recovered.Answer = []dns.RR{&dns.RRSIG{
+		Hdr:   dns.Header{Name: "example.test.", Class: dns.ClassINET, TTL: 300},
+		RRSIG: rdata.RRSIG{TypeCovered: dns.TypeSOA, SignerName: "example.test."},
+	}}
+	if err := recovered.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	returnCode, serverName, ok := retryDNSSECUpstreamSERVFAIL(
+		original,
+		"example.test.",
+		dns.TypeRRSIG,
+		"first",
+		func(qname string, qtype uint16, excluded map[string]struct{}) (*dns.Msg, string, error) {
+			calls++
+			if qname != "example.test." || qtype != dns.TypeRRSIG {
+				t.Fatalf("retry query = %s/%d", qname, qtype)
+			}
+			if _, ok := excluded["first"]; !ok {
+				t.Fatal("original SERVFAIL resolver was not excluded")
+			}
+			switch calls {
+			case 1:
+				excluded["second"] = struct{}{}
+				failed := dns.NewMsg(qname, qtype)
+				failed.Response = true
+				failed.Rcode = dns.RcodeServerFailure
+				if err := failed.Pack(); err != nil {
+					t.Fatal(err)
+				}
+				return failed, "second", nil
+			case 2:
+				if _, ok := excluded["second"]; !ok {
+					t.Fatal("the second SERVFAIL resolver was not excluded")
+				}
+				excluded["third"] = struct{}{}
+				failed := dns.NewMsg(qname, qtype)
+				failed.Response = true
+				failed.Rcode = dns.RcodeServerFailure
+				if err := failed.Pack(); err != nil {
+					t.Fatal(err)
+				}
+				return failed, "third", nil
+			case 3:
+				if _, ok := excluded["third"]; !ok {
+					t.Fatal("the third SERVFAIL resolver was not excluded")
+				}
+				excluded["fourth"] = struct{}{}
+				return recovered, "fourth", nil
+			default:
+				t.Fatalf("unexpected retry call %d", calls)
+				return nil, "", errors.New("unreachable")
+			}
+		},
+	)
+	if !ok || returnCode != PluginsReturnCodePass {
+		t.Fatalf("retry result = (%v, %v), want PASS/recovered", returnCode, ok)
+	}
+	if calls != 3 {
+		t.Fatalf("retry calls = %d, want 3", calls)
+	}
+	if serverName != "fourth" {
+		t.Fatalf("recovered response source = %q, want fourth", serverName)
+	}
+	if original.ID != 1234 || len(original.Question) != 1 || dns.RRToType(original.Question[0]) != dns.TypeRRSIG {
+		t.Fatalf("retry replaced the client transaction: %#v", original)
+	}
+	if original.Rcode != dns.RcodeSuccess || len(original.Answer) != 1 || dns.RRToType(original.Answer[0]) != dns.TypeRRSIG {
+		t.Fatalf("retry did not install the successful response: %#v", original)
+	}
+}
+
+func TestDNSSECResponseSourceReplacesStaleResolverProvenance(t *testing.T) {
+	state := PluginsState{serverName: "first", relayName: "first-relay"}
+
+	setDNSSECResponseSource(&state, "second")
+
+	if state.serverName != "second" {
+		t.Fatalf("response source = %q, want second", state.serverName)
+	}
+	if state.relayName != "" {
+		t.Fatalf("stale relay provenance was retained: %q", state.relayName)
+	}
+}
+
 func TestDNSSECFailureEDEIdentifiesUnsupportedNSEC3Iterations(t *testing.T) {
 	if got := dnssecFailureEDE(dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations); got != dns.ExtendedErrorUnsupportedNSEC3IterValue {
 		t.Fatalf("EDE for unsupported NSEC3 iterations = %d, want %d", got, dns.ExtendedErrorUnsupportedNSEC3IterValue)
@@ -276,6 +374,73 @@ func TestDNSSECValidatorReturnsOPTToAnEDNSClient(t *testing.T) {
 	}
 	if !messageHasEDNS(wire) || wire.UDPSize != 1232 {
 		t.Fatalf("packed response did not contain the required OPT RR: %#v", wire)
+	}
+}
+
+func TestDNSSECValidatorNormalizesAnInvalidUpstreamEDNSPayloadSize(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{}}
+	query := dns.NewMsg("example.test.", dns.TypeA)
+	query.UDPSize = 1232
+	query.Security = true
+	if err := (&PluginDNSSECRequest{}).Eval(&state, query); err != nil {
+		t.Fatal(err)
+	}
+
+	response := dns.NewMsg("example.test.", dns.TypeA)
+	response.Response = true
+	response.Security = true
+	response.UDPSize = 0
+	stripDNSSECForClient(&state, response)
+
+	if response.UDPSize != 1232 || !response.Security {
+		t.Fatalf("restored EDNS response has udp=%d DO=%v, want udp=1232 DO=true", response.UDPSize, response.Security)
+	}
+}
+
+func TestDNSSECResponseChainNormalizesSERVFAILForAnEDNSClient(t *testing.T) {
+	state := PluginsState{
+		action:      PluginsActionContinue,
+		qName:       "example.test.",
+		questionMsg: dns.NewMsg("example.test.", dns.TypeA),
+		sessionData: map[string]any{},
+	}
+	query := dns.NewMsg("example.test.", dns.TypeA)
+	query.UDPSize = 1232
+	query.Security = true
+	query.CheckingDisabled = true
+	if err := (&PluginDNSSECRequest{}).Eval(&state, query); err != nil {
+		t.Fatal(err)
+	}
+
+	response := dns.NewMsg("example.test.", dns.TypeA)
+	response.ID = state.questionMsg.ID
+	response.Response = true
+	response.Rcode = dns.RcodeServerFailure
+	response.Security = true
+	response.CheckingDisabled = true
+	response.UDPSize = 0
+	if err := response.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	responsePlugins := []Plugin{
+		&PluginDNSSECValidate{mode: ValidationLog},
+		&PluginDNSSECStrip{},
+	}
+	globals := PluginsGlobals{responsePlugins: &responsePlugins}
+	packet, err := state.ApplyResponsePlugins(&globals, response.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := &dns.Msg{Data: packet}
+	if err := got.Unpack(); err != nil {
+		t.Fatal(err)
+	}
+	if got.Rcode != dns.RcodeServerFailure || got.UDPSize != 1232 {
+		t.Fatalf("SERVFAIL response has rcode=%d udp=%d, want SERVFAIL/1232", got.Rcode, got.UDPSize)
+	}
+	if !got.Security || !got.CheckingDisabled {
+		t.Fatalf("client bits were not restored: DO=%v CD=%v", got.Security, got.CheckingDisabled)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"codeberg.org/miekg/dns"
 	"github.com/jedisct1/dlog"
 	clocksmith "github.com/jedisct1/go-clocksmith"
 	stamps "github.com/jedisct1/go-dnsstamps"
@@ -943,7 +944,7 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 			exchangeResponse, err := handleDNSExchange(proxy, serverInfo, &pluginsState, query, serverProto)
 
 			// Update server statistics for WP2 strategy
-			success := (err == nil && exchangeResponse != nil)
+			success := upstreamExchangeSucceeded(exchangeResponse, err)
 			proxy.serversInfo.updateServerStats(serverName, success)
 
 			if err != nil || exchangeResponse == nil {
@@ -986,6 +987,14 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 	updateMonitoringMetrics(proxy, &pluginsState)
 
 	return response
+}
+
+// upstreamExchangeSucceeded distinguishes receiving a DNS-level failure from
+// successfully obtaining a usable answer. A SERVFAIL is transport-complete,
+// but rewarding that resolver would make WP2 increasingly likely to select the
+// exact server from which DNSSEC recovery had to escape.
+func upstreamExchangeSucceeded(response []byte, err error) bool {
+	return err == nil && len(response) >= MinDNSPacketSize && Rcode(response) != dns.RcodeServerFailure
 }
 
 func NewProxy() *Proxy {

@@ -26,7 +26,12 @@ const dnssecInternalProto = "internal-dnssec"
 // than proof that the zone is broken. Try fresh encrypted upstreams before
 // making a client wait for SERVFAIL. A signature mismatch still remains a
 // cryptographic failure and is never promoted to a successful answer.
-const dnssecResponseAttempts = 3
+// The deployed resolver set has two independent providers with IPv4 and IPv6
+// endpoints. Trying only three servers can consume the entire budget on both
+// endpoints of one provider plus one transient failure at the other, without
+// ever reaching the fourth configured path. Keep the retry bounded, but cover
+// that complete failure topology.
+const dnssecResponseAttempts = 4
 
 var errDNSSECIncompleteEvidence = errors.New("incomplete DNSSEC evidence")
 
@@ -172,9 +177,19 @@ func (plugin *PluginDNSSECValidate) resolveInternallyExcept(proxy *Proxy, qname 
 }
 
 func (plugin *PluginDNSSECValidate) resolveInternallyExcluding(proxy *Proxy, qname string, qtype uint16, excludedServerNames map[string]struct{}) (*dns.Msg, error) {
+	msg, _, err := plugin.resolveInternallyExcludingWithServer(proxy, qname, qtype, excludedServerNames)
+	return msg, err
+}
+
+// resolveInternallyExcludingWithServer also reports which newly selected
+// resolver supplied the response. processIncomingQueryExcluding adds its
+// selection to the caller-owned exclusion set before exchange, including on a
+// timeout, so comparing the set around this one attempt gives us exact response
+// provenance without changing the ordinary query API.
+func (plugin *PluginDNSSECValidate) resolveInternallyExcludingWithServer(proxy *Proxy, qname string, qtype uint16, excludedServerNames map[string]struct{}) (*dns.Msg, string, error) {
 	msg := dns.NewMsg(qname, qtype)
 	if msg == nil {
-		return nil, fmt.Errorf("cannot build a query for %s/%d", qname, qtype)
+		return nil, "", fmt.Errorf("cannot build a query for %s/%d", qname, qtype)
 	}
 	msg.RecursionDesired = true
 	msg.Security = true // ask for the signatures; without DO there is nothing to check
@@ -184,19 +199,103 @@ func (plugin *PluginDNSSECValidate) resolveInternallyExcluding(proxy *Proxy, qna
 	msg.UDPSize = uint16(MaxDNSPacketSize)
 
 	if err := msg.Pack(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	previouslyExcluded := cloneServerNameSet(excludedServerNames)
 	response := proxy.processIncomingQueryExcluding(
 		dnssecInternalProto, proxy.xTransport.mainProto, msg.Data, nil, nil, time.Now(), false, excludedServerNames,
 	)
+	serverName := newlyExcludedServerName(previouslyExcluded, excludedServerNames)
 	if len(response) == 0 {
-		return nil, fmt.Errorf("no response for %s/%d", qname, qtype)
+		return nil, serverName, fmt.Errorf("no response for %s/%d", qname, qtype)
 	}
 	decoded := &dns.Msg{Data: response}
 	if err := decoded.Unpack(); err != nil {
-		return nil, err
+		return nil, serverName, err
 	}
-	return decoded, nil
+	return decoded, serverName, nil
+}
+
+func cloneServerNameSet(serverNames map[string]struct{}) map[string]struct{} {
+	clone := make(map[string]struct{}, len(serverNames))
+	for name := range serverNames {
+		clone[name] = struct{}{}
+	}
+	return clone
+}
+
+func newlyExcludedServerName(before, after map[string]struct{}) string {
+	for name := range after {
+		if _, existed := before[name]; !existed {
+			return name
+		}
+	}
+	return ""
+}
+
+// setDNSSECResponseSource records the resolver whose bytes the client will
+// actually receive. A relay attached to the original resolver is no longer
+// valid provenance; the internal retry does not currently expose the alternate
+// relay, so clear it rather than logging a false association.
+func setDNSSECResponseSource(pluginsState *PluginsState, serverName string) {
+	if serverName == "" || serverName == "-" {
+		return
+	}
+	pluginsState.serverName = serverName
+	pluginsState.relayName = ""
+}
+
+// retryDNSSECUpstreamSERVFAIL asks distinct configured recursive resolvers for
+// raw data after one of them returned SERVFAIL even though our upstream query
+// carried CD. RFC 6840 section 5.9 recommends CD precisely so a validating
+// forwarder can receive and judge the data itself; a resolver such as Quad9
+// can still reject particular diagnostic QTYPEs, while another configured
+// resolver can provide them. Only NOERROR and NXDOMAIN replace the original
+// failure, and the replacement still passes through local validation.
+func retryDNSSECUpstreamSERVFAIL(
+	msg *dns.Msg,
+	qName string,
+	qtype uint16,
+	originalServerName string,
+	resolve func(string, uint16, map[string]struct{}) (*dns.Msg, string, error),
+) (PluginsReturnCode, string, bool) {
+	excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
+	if originalServerName != "" && originalServerName != "-" {
+		excludedServerNames[originalServerName] = struct{}{}
+	}
+	for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
+		retry, serverName, err := resolve(qName, qtype, excludedServerNames)
+		if err != nil || retry == nil {
+			continue
+		}
+		var returnCode PluginsReturnCode
+		switch retry.Rcode {
+		case dns.RcodeSuccess:
+			returnCode = PluginsReturnCodePass
+		case dns.RcodeNameError:
+			returnCode = PluginsReturnCodeNXDomain
+		default:
+			continue
+		}
+		if err := replaceDNSSECResponse(msg, retry); err != nil {
+			continue
+		}
+		return returnCode, serverName, true
+	}
+	return PluginsReturnCodeServFail, "", false
+}
+
+// replaceDNSSECResponse installs a private retry without copying dns.Msg's
+// decoded atomic state, while preserving the initiating transaction identity.
+func replaceDNSSECResponse(msg, retry *dns.Msg) error {
+	originalID, originalQuestion := msg.ID, msg.Question
+	msg.Data = retry.Data
+	if err := msg.Unpack(); err != nil {
+		return err
+	}
+	msg.ID = originalID
+	msg.Question = originalQuestion
+	return nil
 }
 
 // isInsecureZone reports whether name is at or below a zone validation was
@@ -225,17 +324,33 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	if pluginsState.clientProto == dnssecInternalProto {
 		return nil
 	}
-	// Answers the proxy produced itself were never signed by anyone and are not
-	// upstream's to vouch for.
-	if pluginsState.returnCode != PluginsReturnCodePass &&
-		pluginsState.returnCode != PluginsReturnCodeNXDomain {
-		return nil
-	}
 	if len(msg.Question) == 0 {
 		return nil
 	}
 	qName := pluginsState.qName
 	if qName == "" {
+		return nil
+	}
+	if pluginsState.returnCode == PluginsReturnCodeServFail && plugin.proxy != nil {
+		qtype := dns.RRToType(msg.Question[0])
+		if returnCode, serverName, recovered := retryDNSSECUpstreamSERVFAIL(
+			msg,
+			qName,
+			qtype,
+			pluginsState.serverName,
+			func(name string, recordType uint16, excluded map[string]struct{}) (*dns.Msg, string, error) {
+				return plugin.resolveInternallyExcludingWithServer(plugin.proxy, name, recordType, excluded)
+			},
+		); recovered {
+			pluginsState.returnCode = returnCode
+			setDNSSECResponseSource(pluginsState, serverName)
+		}
+	}
+	// Answers the proxy produced itself were never signed by anyone and are not
+	// upstream's to vouch for. An unrecovered upstream SERVFAIL also carries no
+	// data that this validator can judge.
+	if pluginsState.returnCode != PluginsReturnCodePass &&
+		pluginsState.returnCode != PluginsReturnCodeNXDomain {
 		return nil
 	}
 
@@ -260,20 +375,14 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 			excludedServerNames[pluginsState.serverName] = struct{}{}
 		}
 		for attempt := 1; attempt < dnssecResponseAttempts; attempt++ {
-			retry, err := plugin.resolveInternallyExcluding(plugin.proxy, qName, qtype, excludedServerNames)
+			retry, serverName, err := plugin.resolveInternallyExcludingWithServer(plugin.proxy, qName, qtype, excludedServerNames)
 			if err != nil {
 				continue
 			}
-			// The client transaction and question belong to the original query,
-			// not to this private retry. Unpack into the existing message rather
-			// than copying dns.Msg: its decoded form contains atomic state.
-			originalID, originalQuestion := msg.ID, msg.Question
-			msg.Data = retry.Data
-			if err := msg.Unpack(); err != nil {
+			if err := replaceDNSSECResponse(msg, retry); err != nil {
 				continue
 			}
-			msg.ID = originalID
-			msg.Question = originalQuestion
+			setDNSSECResponseSource(pluginsState, serverName)
 			result, why = plugin.judge(msg, qName)
 			if !retryableDNSSECFailure(result, why) {
 				break
@@ -1170,8 +1279,12 @@ func restoreDNSSECClientBits(pluginsState *PluginsState, msg *dns.Msg) {
 	if hadEDNS, ok := pluginsState.sessionData[dnssecClientHadEDNSKey].(bool); ok {
 		if hadEDNS {
 			// An EDNS request requires an OPT response. A conforming upstream
-			// supplies one, but retain the invariant even if it did not.
-			if !messageHasEDNS(msg) {
+			// supplies one with its receive capacity, but retain the invariant
+			// when it omitted OPT or supplied only DNS's 512-byte minimum. The
+			// decoder already normalizes smaller wire values to 512 as RFC 6891
+			// section 6.2.3 requires; advertising our normal 1232-byte receive
+			// capacity is both valid and consistent with the omitted-OPT path.
+			if !messageHasEDNS(msg) || msg.UDPSize <= dns.MinMsgSize {
 				msg.UDPSize = 1232
 			}
 		} else {
