@@ -842,6 +842,15 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 	case dnssec.Bogus:
 		return dnssec.Bogus, owner.Why
 	default:
+		// The containing-zone walk can be inconclusive when the same broken
+		// authority deliberately withholds the DS denial for this owner. That
+		// must not hide a signature which is already provably invalid under the
+		// securely authenticated key set named by the RRSIG. This fallback can
+		// only turn Indeterminate into Bogus; it never accepts a record or skips
+		// the stricter containing-zone check above.
+		if err, conclusive := plugin.signedSetIsDefinitelyBogus(set, now); conclusive {
+			return dnssec.Bogus, err
+		}
 		return dnssec.Indeterminate, owner.Why
 	}
 
@@ -886,6 +895,41 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		lastErr = fmt.Errorf("no signature over %s could be checked", set.Name)
 	}
 	return dnssec.Bogus, lastErr
+}
+
+// signedSetIsDefinitelyBogus recognizes a failed signature even when a
+// separate walk to the RRset owner could not prove its exact containing zone.
+//
+// RFC 4035 section 5.3 first authenticates the DNSKEY named by an RRSIG and
+// then verifies the RRset. If every offered RRSIG names a securely
+// authenticated signer and fails under that signer's keys, the response is
+// Bogus regardless of whether an auxiliary DS denial for the leaf arrived.
+// A signature which verifies here is not accepted: judgeSet still requires the
+// owner walk above to establish that no intervening delegation makes the
+// claimed signer an ancestor rather than the containing zone.
+func (plugin *PluginDNSSECValidate) signedSetIsDefinitelyBogus(set dnssec.RRSet, now time.Time) (error, bool) {
+	var lastErr error
+	for _, sig := range set.Sigs {
+		if !dnssec.WithinZone(set.Name, sig.SignerName) {
+			lastErr = fmt.Errorf("%s is outside claimed signer zone %s", set.Name, sig.SignerName)
+			continue
+		}
+		signer := dnssec.BuildChain(plugin.fetcher, sig.SignerName, plugin.anchors, now)
+		if signer.Status != dnssec.Secure || !sameDNSName(signer.Zone, sig.SignerName) {
+			return nil, false
+		}
+		result, _, err := dnssec.VerifyRRSetDetail(set.Records, []*dns.RRSIG{sig}, signer.Keys, now)
+		if result != dnssec.Bogus {
+			// A valid signature still needs the containing-zone proof, while an
+			// indeterminate check is not enough evidence to call the data bogus.
+			return nil, false
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		return nil, false
+	}
+	return fmt.Errorf("signature over %s: %w", set.Name, lastErr), true
 }
 
 // chainFor returns the chain to zone, reusing the one already built for the

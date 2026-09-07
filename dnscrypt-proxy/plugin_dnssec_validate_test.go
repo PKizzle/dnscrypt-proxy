@@ -534,6 +534,76 @@ func TestValidatorRejectsAParentSignatureBelowADelegation(t *testing.T) {
 	}
 }
 
+func TestValidatorClassifiesProvablyBadSignatureWhenOwnerWalkIsIncomplete(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	zone := newValidatorTestZone(t, "example.")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	zoneDS := zone.key.ToDS(dns.SHA256)
+	zoneDSSig := root.sign([]dns.RR{zoneDS}, now)
+	zoneKeySig := zone.sign([]dns.RR{zone.key}, now)
+	notADelegation := &dns.NSEC{
+		Hdr:  dns.Header{Name: "www.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "x.example.", TypeBitMap: []uint16{dns.TypeA, dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	notADelegationSig := zone.sign([]dns.RR{notADelegation}, now)
+
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zoneDS, zoneDSSig}, nil), nil
+		case qtype == dns.TypeDNSKEY && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zone.key, zoneKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "www.example.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{notADelegation, notADelegationSig}), nil
+		case qtype == dns.TypeDS && qname == "bad.www.example.":
+			// Model a broken authority which omits the authenticated DS
+			// denial at the exact owner. The owner walk cannot safely accept
+			// anything, but the signer's authenticated keys can still prove
+			// that an offered signature is invalid.
+			return testDNSMessage(dns.RcodeSuccess, nil, nil), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	record := &dns.A{
+		Hdr: dns.Header{Name: "bad.www.example.", Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	validSig := zone.sign([]dns.RR{record}, now)
+	question := []dns.RR{&dns.A{Hdr: dns.Header{Name: record.Header().Name, Class: dns.ClassINET}}}
+
+	for _, tc := range []struct {
+		name string
+		sig  *dns.RRSIG
+		want dnssec.Result
+	}{
+		{name: "valid remains indeterminate", sig: validSig, want: dnssec.Indeterminate},
+		{name: "bad cryptographic signature", sig: func() *dns.RRSIG {
+			bad := *validSig
+			bad.Signature = "AAAA"
+			return &bad
+		}(), want: dnssec.Bogus},
+		{name: "expired signature", sig: func() *dns.RRSIG {
+			expired := *validSig
+			expired.Inception = uint32(now.Add(-2 * time.Hour).Unix())
+			expired.Expiration = uint32(now.Add(-time.Hour).Unix())
+			return &expired
+		}(), want: dnssec.Bogus},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{record, tc.sig}, nil)
+			msg.Question = question
+			result, _ := plugin.judge(msg, record.Header().Name)
+			if result != tc.want {
+				t.Fatalf("judge() = %v, want %v", result, tc.want)
+			}
+		})
+	}
+}
+
 // DS data is the exception to the ordinary owner-zone rule: the RRset is at
 // the child zone cut, but RFC 4035 sections 2.4 and 5.2 put it in the parent
 // zone and require the parent's signature. This is the positive counterpart
