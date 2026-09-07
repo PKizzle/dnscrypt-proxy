@@ -228,12 +228,25 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		return nil
 	}
 	qName := pluginsState.qName
-	if qName == "" || plugin.isInsecureZone(qName) {
+	if qName == "" {
 		return nil
 	}
 
-	result, why := plugin.judge(msg, qName)
-	if plugin.proxy != nil && retryableDNSSECFailure(result, why) {
+	configuredInsecure := plugin.isInsecureZone(qName)
+	var result dnssec.Result
+	var why error
+	if configuredInsecure {
+		// A local policy exception says only that this validator deliberately
+		// did not authenticate the name. It does not authorize an upstream's
+		// AD assertion. Run it through the normal Insecure result path so AD is
+		// cleared and monitoring accounts for the query instead of silently
+		// omitting it from every DNSSEC total.
+		result = dnssec.Insecure
+		why = fmt.Errorf("%s matches a configured insecure zone", qName)
+	} else {
+		result, why = plugin.judge(msg, qName)
+	}
+	if plugin.proxy != nil && !configuredInsecure && retryableDNSSECFailure(result, why) {
 		qtype := dns.RRToType(msg.Question[0])
 		excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
 		if pluginsState.serverName != "" && pluginsState.serverName != "-" {

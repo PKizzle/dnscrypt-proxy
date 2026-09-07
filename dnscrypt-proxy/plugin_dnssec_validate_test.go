@@ -314,6 +314,45 @@ func TestIsInsecureZoneWithNoneConfigured(t *testing.T) {
 	}
 }
 
+// A configured exception means this validator did not authenticate the data;
+// it must never pass through an AD bit asserted by the upstream. It is still a
+// client query and therefore belongs in both exported and dashboard verdict
+// totals instead of disappearing as an unaccounted-for request.
+func TestConfiguredInsecureZoneClearsUpstreamADAndRecordsVerdict(t *testing.T) {
+	plugin := &PluginDNSSECValidate{
+		mode:          ValidationEnforce,
+		insecureZones: []string{"local."},
+	}
+	msg := dns.NewMsg("printer.local.", dns.TypeA)
+	msg.AuthenticatedData = true
+	state := PluginsState{
+		qName:       "printer.local",
+		returnCode:  PluginsReturnCodePass,
+		sessionData: map[string]any{},
+		questionMsg: dns.NewMsg("printer.local.", dns.TypeA),
+	}
+	before := dnssecVerdicts.insecure.Load()
+
+	if err := plugin.Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if msg.AuthenticatedData {
+		t.Fatal("configured insecure zone retained an upstream AD assertion")
+	}
+	if got := state.sessionData[dnssecVerdictKey]; got != "insecure" {
+		t.Fatalf("verdict = %v, want insecure", got)
+	}
+	if reason, _ := state.sessionData[dnssecReasonKey].(string); reason == "" {
+		t.Fatal("configured insecure verdict has no attributable reason")
+	}
+	if got := dnssecVerdicts.insecure.Load(); got != before+1 {
+		t.Fatalf("insecure counter = %d, want %d", got, before+1)
+	}
+	if state.action == PluginsActionReject || state.returnCode == PluginsReturnCodeServFail {
+		t.Fatal("configured insecure zone was rejected in enforce mode")
+	}
+}
+
 // RFC 4035 section 5.3.1 requires the signer name to identify the zone that
 // contains the RRset. A cryptographically genuine parent signature below a
 // delegated child is therefore not an authentication of the child's record.

@@ -273,6 +273,36 @@ func TestDelegationThisBuildCannotCheckIsInsecureNotBogus(t *testing.T) {
 	}
 }
 
+// Once a supported DS has authenticated a key, the child is known to be a
+// signed delegation. RFC 4035 sections 2.2 and 5.5 require its apex DNSKEY
+// RRset to have a usable RRSIG and classify the response BAD when none can be
+// validated. The generic RRset helper cannot know that, but VerifyDNSKEYs can.
+func TestSupportedDelegationWithoutDNSKEYSignatureIsBogus(t *testing.T) {
+	z := newZone(t, "example.test.")
+	ds := z.key.ToDS(dns.SHA256)
+
+	res, err := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, nil, []*dns.DS{ds}, time.Now())
+	if res != Bogus {
+		t.Fatalf("result = %v (%v), want Bogus", res, err)
+	}
+}
+
+// An RRSIG over another RR type does not satisfy the DNSKEY RRset's signature
+// requirement. This is the same authenticated failure as omitting the RRSIG,
+// not a transport ambiguity.
+func TestSupportedDelegationWithoutCoveringDNSKEYSignatureIsBogus(t *testing.T) {
+	z := newZone(t, "example.test.")
+	ds := z.key.ToDS(dns.SHA256)
+	rrset := []dns.RR{aRecord("example.test.", "192.0.2.1")}
+	now := time.Now()
+	unrelated := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	res, err := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, []*dns.RRSIG{unrelated}, []*dns.DS{ds}, now)
+	if res != Bogus {
+		t.Fatalf("result = %v (%v), want Bogus", res, err)
+	}
+}
+
 // RFC 4035 section 5.2 and RFC 6840 section 5.2 apply the same rule to the
 // public-key algorithm named by a DS as to an unsupported DS digest: the DS is
 // disregarded, and a delegation with no supported DS left is treated unsigned.

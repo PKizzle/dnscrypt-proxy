@@ -192,7 +192,14 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 		return Bogus, fmt.Errorf("key set has a signature from another zone")
 	}
 	if res != Secure {
-		return res, fmt.Errorf("key set is not signed by an anchored key: %w", err)
+		// At this point a supported DS has authenticated at least one key in
+		// this DNSKEY RRset.  The generic RRset verifier reports a missing or
+		// non-covering RRSIG as Indeterminate because it has no delegation
+		// context of its own.  We do: RFC 4035 sections 2.2 and 5.5 require the
+		// apex DNSKEY RRset to carry a usable signature and classify the answer
+		// BAD when none validates.  Preserve that as Bogus instead of inflating
+		// the resolver's "unchecked" verdicts for a signed delegation.
+		return Bogus, fmt.Errorf("key set is not signed by an anchored key: %w", err)
 	}
 	return Secure, nil
 }
