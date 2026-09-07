@@ -317,7 +317,7 @@ func hasEDNS0Padding(packet []byte) (bool, error) {
 func addEDNS0PaddingIfNoneFound(msg *dns.Msg, unpaddedPacket []byte, paddingLen int) ([]byte, error) {
 	// Enable EDNS0 if not already enabled
 	if msg.UDPSize == 0 {
-		msg.UDPSize = uint16(MaxDNSPacketSize)
+		msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 	}
 	// Check if padding already exists
 	for _, rr := range msg.Pseudo {
@@ -541,7 +541,7 @@ func _dnsExchange(
 		if _, err := pc.Write(binQuery); err != nil {
 			return DNSExchangeResponse{err: err}
 		}
-		packet = make([]byte, MaxDNSPacketSize)
+		packet = make([]byte, MaxDNSUDPPacketSize)
 		length, err := pc.Read(packet)
 		if err != nil {
 			return DNSExchangeResponse{err: err}
@@ -627,7 +627,7 @@ func packDNSExchangeQuery(query *dns.Msg, paddedLen int, viaRelay bool) ([]byte,
 	paddingRR := &dns.PADDING{}
 	query.Pseudo = append(query.Pseudo, paddingRR)
 	if query.UDPSize == 0 {
-		query.UDPSize = uint16(MaxDNSPacketSize)
+		query.UDPSize = uint16(MaxDNSUDPPacketSize)
 	}
 	if err := query.Pack(); err != nil {
 		return nil, err

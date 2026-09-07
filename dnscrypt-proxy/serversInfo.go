@@ -988,7 +988,7 @@ func dohTestPacket(msgID uint16) *dns.Msg {
 	msg := dns.NewMsg(".", dns.TypeNS)
 	msg.ID = msgID
 	msg.RecursionDesired = true
-	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 	msg.Security = false
 	paddingData := make([]byte, 16)
 	_, _ = crypto_rand.Read(paddingData)
@@ -1009,7 +1009,7 @@ func dohNXTestPacket(msgID uint16) *dns.Msg {
 	msg := dns.NewMsg(string(qName)+".test.dnscrypt.", dns.TypeNS)
 	msg.ID = msgID
 	msg.RecursionDesired = true
-	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 	msg.Security = false
 	paddingData := make([]byte, 16)
 	_, _ = crypto_rand.Read(paddingData)

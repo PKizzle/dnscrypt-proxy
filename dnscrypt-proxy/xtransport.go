@@ -549,7 +549,7 @@ func (xTransport *XTransport) resolveUsingResolver(
 			continue
 		}
 		msg.RecursionDesired = true
-		msg.UDPSize = uint16(MaxDNSPacketSize)
+		msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 		msg.Security = true
 		var in *dns.Msg
 		if in, _, err = dnsClient.Exchange(ctx, msg, proto, resolver); err == nil {

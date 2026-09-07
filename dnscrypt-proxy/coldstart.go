@@ -81,7 +81,7 @@ func HandleCaptivePortalQuery(msg *dns.Msg, question dns.RR, ips *CaptivePortalE
 }
 
 func handleColdStartClient(clientPc *net.UDPConn, cancelChannel chan struct{}, ipsMap *CaptivePortalMap) bool {
-	buffer := make([]byte, MaxDNSPacketSize)
+	buffer := make([]byte, MaxDNSUDPPacketSize)
 	clientPc.SetDeadline(time.Now().Add(time.Duration(1) * time.Second))
 	length, clientAddr, err := clientPc.ReadFrom(buffer)
 	exit := false

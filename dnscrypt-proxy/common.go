@@ -40,7 +40,11 @@ var (
 	CertMagic               = [4]byte{0x44, 0x4e, 0x53, 0x43}
 	ServerMagic             = [8]byte{0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38}
 	MinDNSPacketSize        = 12 + 5
-	MaxDNSPacketSize        = 4096
+	// DNS messages carried by a byte stream have a two-octet length prefix
+	// (RFC 1035 section 4.2.2), so 65535 is the protocol limit.  Keep the
+	// smaller EDNS/UDP working size separate: DNSSEC answers larger than 4096
+	// bytes are valid over TCP, DoH and other stream transports.
+	MaxDNSPacketSize        = 0xffff
 	MaxDNSUDPPacketSize     = 4096
 	MaxDNSUDPSafePacketSize = 1252
 	InitialMinQuestionSize  = 512
@@ -78,7 +82,7 @@ func ReadPrefixed(conn net.Conn) ([]byte, error) {
 		pos += readnb
 		if pos >= 2 && packetLength < 0 {
 			packetLength = int(binary.BigEndian.Uint16(buf[0:2]))
-			if packetLength > MaxDNSPacketSize-1 {
+			if packetLength > MaxDNSPacketSize {
 				return buf, errors.New("Packet too large")
 			}
 			if packetLength < MinDNSPacketSize {

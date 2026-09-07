@@ -459,7 +459,7 @@ func (proxy *Proxy) updateRegisteredServers() error {
 func (proxy *Proxy) udpListener(clientPc *net.UDPConn) {
 	defer clientPc.Close()
 	for {
-		buffer := make([]byte, MaxDNSPacketSize-1)
+		buffer := make([]byte, MaxDNSUDPPacketSize)
 		length, clientAddr, err := clientPc.ReadFrom(buffer)
 		if err != nil {
 			return
@@ -636,7 +636,7 @@ func (proxy *Proxy) exchangeWithUDPServer(
 		proxy.prepareForRelay(serverInfo.UDPAddr.IP, serverInfo.UDPAddr.Port, &query)
 	}
 
-	encryptedResponse := make([]byte, MaxDNSPacketSize)
+	encryptedResponse := make([]byte, MaxDNSUDPPacketSize)
 	var readErr error
 	for tries := 2; tries > 0; tries-- {
 		if _, err := pc.Write(query); err != nil {
@@ -684,7 +684,7 @@ func (proxy *Proxy) exchangeWithUDPServerViaProxy(
 	if serverInfo.Relay != nil && serverInfo.Relay.Dnscrypt != nil {
 		proxy.prepareForRelay(serverInfo.UDPAddr.IP, serverInfo.UDPAddr.Port, &encryptedQuery)
 	}
-	encryptedResponse := make([]byte, MaxDNSPacketSize)
+	encryptedResponse := make([]byte, MaxDNSUDPPacketSize)
 	var readErr error
 	for tries := 2; tries > 0; tries-- {
 		if _, err := pc.Write(encryptedQuery); err != nil {

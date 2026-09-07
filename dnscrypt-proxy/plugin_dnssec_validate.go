@@ -196,7 +196,7 @@ func (plugin *PluginDNSSECValidate) resolveInternallyExcludingWithServer(proxy *
 	// RFC 6840 section 5.9 recommends CD on upstream validation queries so an
 	// upstream validator returns the DNSSEC material we must verify ourselves.
 	msg.CheckingDisabled = true
-	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 
 	if err := msg.Pack(); err != nil {
 		return nil, "", err

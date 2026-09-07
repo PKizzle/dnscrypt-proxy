@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net"
 	"testing"
 )
@@ -84,5 +85,77 @@ func TestExtractClientIPStr(t *testing.T) {
 				t.Errorf("ExtractClientIPStr() OK = %v, want %v", gotOK, tt.wantOK)
 			}
 		})
+	}
+}
+
+func TestDNSStreamMessageLimitIsIndependentOfUDPWorkingSize(t *testing.T) {
+	if MaxDNSPacketSize != 0xffff {
+		t.Fatalf("stream DNS limit = %d, want 65535", MaxDNSPacketSize)
+	}
+	if MaxDNSUDPPacketSize >= MaxDNSPacketSize {
+		t.Fatalf("UDP working size %d must remain below stream limit %d", MaxDNSUDPPacketSize, MaxDNSPacketSize)
+	}
+}
+
+func TestReadPrefixedAcceptsDNSMessageLargerThanEDNSUDPSize(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, MaxDNSUDPPacketSize+236)
+	prefixed, err := PrefixWithSize(append([]byte(nil), payload...))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer := net.Pipe()
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := writer.Write(prefixed)
+		writeErr <- err
+		_ = writer.Close()
+	}()
+
+	got, err := ReadPrefixed(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestReadPrefixedAcceptsMaximumDNSMessage(t *testing.T) {
+	payload := bytes.Repeat([]byte{0xa5}, MaxDNSPacketSize)
+	prefixed, err := PrefixWithSize(append([]byte(nil), payload...))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader, writer := net.Pipe()
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := writer.Write(prefixed)
+		writeErr <- err
+		_ = writer.Close()
+	}()
+
+	got, err := ReadPrefixed(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+func TestLocalDoHPaddingDoesNotExpandLargeAnswersToStreamLimit(t *testing.T) {
+	size := MaxDNSUDPPacketSize + 1
+	if got := dohPaddedLen(size); got != size {
+		t.Fatalf("dohPaddedLen(%d) = %d, want no padding", size, got)
 	}
 }

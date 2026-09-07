@@ -99,7 +99,7 @@ func (handler localDoHHandler) ServeHTTP(writer http.ResponseWriter, request *ht
 func addLocalDoHResponsePadding(msg *dns.Msg) ([]byte, error) {
 	original := append([]byte(nil), msg.Data...)
 	if msg.UDPSize == 0 {
-		msg.UDPSize = uint16(MaxDNSPacketSize)
+		msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 	}
 	var paddingRR *dns.PADDING
 	for _, rr := range msg.Pseudo {
@@ -161,7 +161,7 @@ func dohPaddedLen(unpaddedLen int) int {
 		1152,
 		2688,
 		4080,
-		MaxDNSPacketSize,
+		MaxDNSUDPPacketSize,
 	}
 	for _, boundary := range boundaries {
 		if boundary >= unpaddedLen {

@@ -30,7 +30,7 @@ func resolveQuery(server string, qName string, qType uint16, sendClientSubnet bo
 	}
 	msg.RecursionDesired = true
 	msg.Opcode = dns.OpcodeQuery
-	msg.UDPSize = uint16(MaxDNSPacketSize)
+	msg.UDPSize = uint16(MaxDNSUDPPacketSize)
 	msg.Security = true
 
 	if sendClientSubnet {

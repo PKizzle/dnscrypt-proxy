@@ -194,7 +194,9 @@ func (proxy *Proxy) Encrypt(
 	if serverInfo.knownBugs.fragmentsBlocked && proto == "udp" {
 		paddedLength = MaxDNSUDPSafePacketSize
 	} else if serverInfo.Relay != nil && proto == "tcp" {
-		paddedLength = MaxDNSPacketSize
+		// The relay's next hop is UDP.  Padding to the stream-message limit
+		// would turn every relayed TCP query into a 64 KiB request.
+		paddedLength = MaxDNSUDPPacketSize
 	}
 	if QueryOverhead+len(packet)+1 > paddedLength {
 		err = errors.New("Question too large; cannot be padded")
