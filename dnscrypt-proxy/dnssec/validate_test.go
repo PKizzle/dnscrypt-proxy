@@ -2,6 +2,7 @@ package dnssec
 
 import (
 	"crypto"
+	"encoding/base64"
 	"errors"
 	"net/netip"
 	"testing"
@@ -167,17 +168,111 @@ func TestVerifyRRSetRejectsAlteredData(t *testing.T) {
 	}
 }
 
-// A signature from a key the chain does not reach proves nothing, however
-// well-formed it is.
-func TestVerifyRRSetRejectsAForeignKey(t *testing.T) {
+// RFC 6840 section 5.12: a signature from a key absent from the authenticated
+// DNSKEY RRset is extra material, not evidence that the covered RRset is bad.
+// The containing-zone caller will still reject a signed RRset with no usable
+// signature, but the generic verifier must disregard this RRSIG first.
+func TestVerifyRRSetIgnoresAForeignKey(t *testing.T) {
 	real, attacker := newZone(t, "example.test."), newZone(t, "example.test.")
 	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
 	now := time.Now()
 	sig := attacker.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
 
-	res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{real.key}, now)
-	if res != Bogus {
-		t.Fatalf("VerifyRRSet() with a foreign key = %v, want bogus", res)
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{real.key}, now)
+	if res != Indeterminate || !errors.Is(err, ErrNoSignature) {
+		t.Fatalf("VerifyRRSet() with a foreign key = %v (%v), want Indeterminate/ErrNoSignature", res, err)
+	}
+}
+
+// The validity window is meaningful only after the validator finds the
+// corresponding DNSKEY. Checking it first lets an expired extra signature
+// create a false Bogus result, contrary to RFC 6840 sections 5.4 and 5.12.
+func TestVerifyRRSetIgnoresExpiredSignatureFromUnknownKey(t *testing.T) {
+	real, retired := newZone(t, "example.test."), newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	sig := retired.sign(rrset, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{real.key}, now)
+	if res != Indeterminate || !errors.Is(err, ErrNoSignature) {
+		t.Fatalf("VerifyRRSet() with an expired unknown-key signature = %v (%v), want Indeterminate/ErrNoSignature", res, err)
+	}
+}
+
+func TestVerifyRRSetAcceptsValidSignatureAlongsideExpiredUnknownKey(t *testing.T) {
+	current, retired := newZone(t, "example.test."), newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	sigs := []*dns.RRSIG{
+		retired.sign(rrset, now.Add(-48*time.Hour), now.Add(-24*time.Hour)),
+		current.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour)),
+	}
+
+	res, err := VerifyRRSet(rrset, sigs, []*dns.DNSKEY{current.key}, now)
+	if res != Secure || err != nil {
+		t.Fatalf("VerifyRRSet() with valid and expired-extra signatures = %v (%v), want Secure", res, err)
+	}
+}
+
+// RFC 5702 section 2.2 requires RSA/SHA-512 DNSKEY moduli to be at least
+// 1024 bits. The DNS library's generic RSA decoder accepts a 768-bit modulus,
+// so the validator must not mistake such a key for a usable corresponding
+// DNSKEY under RFC 6840 section 5.12.
+func TestVerifyRRSetIgnoresRSASHA512KeyBelowRFCMinimum(t *testing.T) {
+	key := dns.NewDNSKEY("example.test.", dns.RSASHA512)
+	key.Hdr.TTL = 300
+	key.Flags = dns.FlagZONE
+	key.Protocol = 3
+	// RFC 3110 encoding: one-byte exponent length, 65537, then a 768-bit
+	// modulus. It is syntactically well formed but prohibited by RFC 5702.
+	public := append([]byte{3, 1, 0, 1}, append([]byte{0x80}, make([]byte, 95)...)...)
+	key.PublicKey = base64.StdEncoding.EncodeToString(public)
+
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	sig := dns.NewRRSIG(key.Header().Name, key.Algorithm, key.KeyTag(),
+		uint32(now.Add(-time.Hour).Unix()), uint32(now.Add(time.Hour).Unix()))
+	sig.Hdr = dns.Header{Name: rrset[0].Header().Name, Class: dns.ClassINET, TTL: 300}
+	sig.TypeCovered = dns.TypeA
+	sig.Labels = 3
+	sig.Signature = base64.StdEncoding.EncodeToString([]byte{0})
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{key}, now)
+	if res != Indeterminate || !errors.Is(err, ErrNoSignature) {
+		t.Fatalf("VerifyRRSet() with a 768-bit RSA/SHA-512 key = %v (%v), want Indeterminate/ErrNoSignature", res, err)
+	}
+}
+
+func TestRFC5702RSAKeySizeBoundaries(t *testing.T) {
+	makeKey := func(algorithm uint8, modulusBits int) *dns.DNSKEY {
+		modulus := make([]byte, (modulusBits+7)/8)
+		modulus[0] = 1 << ((modulusBits - 1) % 8)
+		modulus[len(modulus)-1] |= 1
+		key := dns.NewDNSKEY("example.test.", algorithm)
+		key.PublicKey = base64.StdEncoding.EncodeToString(append([]byte{3, 1, 0, 1}, modulus...))
+		return key
+	}
+
+	for _, tc := range []struct {
+		name      string
+		algorithm uint8
+		bits      int
+		want      bool
+	}{
+		{"RSASHA256-511", dns.RSASHA256, 511, false},
+		{"RSASHA256-512", dns.RSASHA256, 512, true},
+		{"RSASHA256-4096", dns.RSASHA256, 4096, true},
+		{"RSASHA256-4097", dns.RSASHA256, 4097, false},
+		{"RSASHA512-1023", dns.RSASHA512, 1023, false},
+		{"RSASHA512-1024", dns.RSASHA512, 1024, true},
+		{"RSASHA512-4096", dns.RSASHA512, 4096, true},
+		{"RSASHA512-4097", dns.RSASHA512, 4097, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dnskeyMeetsAlgorithmConstraints(makeKey(tc.algorithm, tc.bits)); got != tc.want {
+				t.Fatalf("dnskeyMeetsAlgorithmConstraints(%d bits) = %v, want %v", tc.bits, got, tc.want)
+			}
+		})
 	}
 }
 

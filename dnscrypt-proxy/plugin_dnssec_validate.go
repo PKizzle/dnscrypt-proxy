@@ -1068,6 +1068,8 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 
 	var lastErr error
 	var policyInsecureErr error
+	var conclusiveBogusErr error
+	missingUsableSignature := false
 	for _, sig := range set.Sigs {
 		if !dns.EqualName(owner.Zone, sig.SignerName) {
 			lastErr = fmt.Errorf("%s belongs to %s, not %s", set.Name, owner.Zone, sig.SignerName)
@@ -1120,10 +1122,26 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 			policyInsecureErr = err
 			continue
 		}
+		if res == dnssec.Bogus {
+			conclusiveBogusErr = err
+		} else if errors.Is(err, dnssec.ErrNoSignature) {
+			// RFC 6840 section 5.12 made an unknown-key RRSIG disappear
+			// from the validation input. In a securely authenticated zone the
+			// RRset is therefore Bogus, just like an omitted RRSIG, but another
+			// recursive upstream may have the current rollover material.
+			missingUsableSignature = true
+		}
 		lastErr = err
 	}
 	if policyInsecureErr != nil {
 		return dnssec.Insecure, policyInsecureErr
+	}
+	if conclusiveBogusErr != nil {
+		return dnssec.Bogus, conclusiveBogusErr
+	}
+	if missingUsableSignature {
+		return dnssec.Bogus, fmt.Errorf("%w: no usable signature over %s matches the authenticated DNSKEY set",
+			errDNSSECIncompleteEvidence, set.Name)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no signature over %s could be checked", set.Name)

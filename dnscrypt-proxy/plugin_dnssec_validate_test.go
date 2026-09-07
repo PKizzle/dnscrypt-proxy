@@ -150,6 +150,63 @@ func (z *validatorTestZone) sign(rrset []dns.RR, now time.Time) *dns.RRSIG {
 	return sig
 }
 
+// RFC 6840 section 5.12 requires the extra RRSIG to be ignored. Because the
+// containing zone is securely authenticated, that leaves the RRset without a
+// usable signature: Bogus to the client, but incomplete evidence worth
+// retrying against another upstream before enforcement returns SERVFAIL.
+func TestValidatorTreatsUnknownKeySignatureAsRetryableMissingEvidence(t *testing.T) {
+	now := time.Now()
+	zone := newValidatorTestZone(t, "example.")
+	retired := newValidatorTestZone(t, "example.")
+	record := &dns.A{
+		Hdr: dns.Header{Name: "example.", Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	sig := retired.sign([]dns.RR{record}, now)
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{record, sig}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: record.Header().Name, Class: dns.ClassINET}}}
+	set := dnssec.GroupRRSets(msg.Answer)[0]
+	chain := dnssec.ChainResult{
+		Status: dnssec.Secure,
+		Zone:   zone.name,
+		Keys:   []*dns.DNSKEY{zone.key},
+	}
+
+	result, why := (&PluginDNSSECValidate{}).judgeSet(set, chain, msg, now)
+	if result != dnssec.Bogus || !errors.Is(why, errDNSSECIncompleteEvidence) {
+		t.Fatalf("unknown-key signature = %v (%v), want retryable Bogus", result, why)
+	}
+}
+
+func TestValidatorDoesNotRetryAConclusiveBadSignatureBecauseOfAnUnknownExtra(t *testing.T) {
+	now := time.Now()
+	zone := newValidatorTestZone(t, "example.")
+	retired := newValidatorTestZone(t, "example.")
+	original := &dns.A{
+		Hdr: dns.Header{Name: "example.", Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	badSig := zone.sign([]dns.RR{original}, now)
+	tampered := &dns.A{
+		Hdr: dns.Header{Name: original.Header().Name, Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("198.51.100.66")},
+	}
+	extraSig := retired.sign([]dns.RR{tampered}, now)
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{tampered, extraSig, badSig}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: tampered.Header().Name, Class: dns.ClassINET}}}
+	set := dnssec.GroupRRSets(msg.Answer)[0]
+	chain := dnssec.ChainResult{
+		Status: dnssec.Secure,
+		Zone:   zone.name,
+		Keys:   []*dns.DNSKEY{zone.key},
+	}
+
+	result, why := (&PluginDNSSECValidate{}).judgeSet(set, chain, msg, now)
+	if result != dnssec.Bogus || errors.Is(why, errDNSSECIncompleteEvidence) || retryableDNSSECFailure(result, why) {
+		t.Fatalf("bad known-key plus unknown-key signatures = %v (%v), want conclusive non-retryable Bogus", result, why)
+	}
+}
+
 func TestParseValidationMode(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

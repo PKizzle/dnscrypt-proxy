@@ -7,8 +7,10 @@
 package dnssec
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"math/bits"
 	"strings"
 	"time"
 
@@ -29,9 +31,11 @@ const (
 	// Secure: every record checked carried a signature that verified against a
 	// key the chain reaches.
 	Secure
-	// Bogus: signatures exist and do not verify, or verify outside their
-	// validity, or no key matches them. This is the case worth refusing: an
-	// answer that claims to be signed and is not what the zone published.
+	// Bogus: at least one applicable signature exists but none verifies, or an
+	// applicable signature is outside its validity. Signatures with no
+	// corresponding authenticated DNSKEY are ignored (RFC 6840 section 5.12).
+	// This is the case worth refusing: an answer that claims to be signed and
+	// is not what the zone published.
 	Bogus
 )
 
@@ -422,15 +426,19 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 		if !covers(sig, rrset) {
 			continue
 		}
+		// RFC 6840 section 5.12: an extra RRSIG is not applicable until its
+		// algorithm, key tag, and signer identify a usable DNSKEY in the
+		// authenticated zone key set. Disregard it before inspecting its
+		// validity window or signature bytes; a stale rollover signature must
+		// not turn otherwise missing evidence into a false Bogus result.
+		if !hasCorrespondingDNSKEY(sig, keys, rrset) {
+			continue
+		}
 		if !acceptedDNSKEYAlgorithm(sig.Algorithm) {
-			// RFC 6840 section 5.12 requires extra signatures whose
-			// algorithm/key does not exist in the authenticated DNSKEY RRset
-			// to be disregarded. Only a signature with a corresponding usable
-			// zone key can establish that this RRset relies on an algorithm the
-			// operator has deliberately classified as unsupported.
-			if hasCorrespondingDNSKEY(sig, keys, rrset) {
-				unsupportedOnly = true
-			}
+			// Only a signature with a corresponding usable zone key can
+			// establish that this RRset relies on an algorithm the operator has
+			// deliberately classified as unsupported.
+			unsupportedOnly = true
 			continue
 		}
 		if !ValidAt(sig, now) {
@@ -438,25 +446,7 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 			continue
 		}
 		for _, key := range keys {
-			if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag {
-				continue
-			}
-			if key.Flags&dns.FlagZONE == 0 {
-				continue
-			}
-			// RFC 5011 section 2.1: a revoked key is permanently invalid
-			// except for authenticating the RRSIG it made over its own DNSKEY
-			// RRset so that the revocation can be established.  In particular,
-			// retaining the key in an authenticated DNSKEY set does not let it
-			// continue signing ordinary zone data.
-			if key.Flags&dns.FlagREVOKE != 0 &&
-				(dns.RRToType(rrset[0]) != dns.TypeDNSKEY ||
-					!dns.EqualName(rrset[0].Header().Name, key.Header().Name)) {
-				continue
-			}
-			// RFC 4034 section 2.1.2: any other value means the key is not
-			// usable for DNSSEC, and must not be treated as though it were.
-			if key.Protocol != 3 {
+			if !usableDNSKEYForSignature(key, sig, rrset) {
 				continue
 			}
 			if err := sig.Verify(key, rrset, &dns.SignOption{}); err != nil {
@@ -464,9 +454,6 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 				continue
 			}
 			return Secure, sig, nil
-		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no key matches signature by key %d", sig.KeyTag)
 		}
 	}
 	if unsupportedOnly {
@@ -489,19 +476,74 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 
 func hasCorrespondingDNSKEY(sig *dns.RRSIG, keys []*dns.DNSKEY, rrset []dns.RR) bool {
 	for _, key := range keys {
-		if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag ||
-			key.Flags&dns.FlagZONE == 0 || key.Protocol != 3 ||
-			!dns.EqualName(key.Header().Name, sig.SignerName) {
-			continue
+		if usableDNSKEYForSignature(key, sig, rrset) {
+			return true
 		}
-		if key.Flags&dns.FlagREVOKE != 0 &&
-			(dns.RRToType(rrset[0]) != dns.TypeDNSKEY ||
-				!dns.EqualName(rrset[0].Header().Name, key.Header().Name)) {
-			continue
-		}
-		return true
 	}
 	return false
+}
+
+func usableDNSKEYForSignature(key *dns.DNSKEY, sig *dns.RRSIG, rrset []dns.RR) bool {
+	if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag ||
+		key.Flags&dns.FlagZONE == 0 || key.Protocol != 3 ||
+		!dns.EqualName(key.Header().Name, sig.SignerName) ||
+		!dnskeyMeetsAlgorithmConstraints(key) {
+		return false
+	}
+	// RFC 5011 section 2.1: a revoked key is permanently invalid except for
+	// authenticating the RRSIG it made over its own DNSKEY RRset so that the
+	// revocation can be established. Retaining it in an authenticated DNSKEY
+	// set does not let it continue signing ordinary zone data.
+	if key.Flags&dns.FlagREVOKE != 0 &&
+		(dns.RRToType(rrset[0]) != dns.TypeDNSKEY ||
+			!dns.EqualName(rrset[0].Header().Name, key.Header().Name)) {
+		return false
+	}
+	return true
+}
+
+// dnskeyMeetsAlgorithmConstraints applies wire-format constraints that are
+// part of an algorithm's DNSSEC definition, rather than leaving them to the
+// generic crypto backend. In particular, Go can parse and attempt to verify
+// RSA/SHA-512 keys below the minimum that RFC 5702 section 2.2 permits.
+func dnskeyMeetsAlgorithmConstraints(key *dns.DNSKEY) bool {
+	var minBits int
+	switch key.Algorithm {
+	case dns.RSASHA256:
+		minBits = 512
+	case dns.RSASHA512:
+		minBits = 1024
+	default:
+		return true
+	}
+	bits, ok := rsaDNSKEYModulusBits(key.PublicKey)
+	return ok && bits >= minBits && bits <= 4096
+}
+
+// rsaDNSKEYModulusBits decodes the exponent-length framing from RFC 3110
+// section 2 and returns the actual modulus bit length. A leading zero is not a
+// valid DNSKEY integer encoding and must not be used to disguise an oversized
+// modulus as an allowed one.
+func rsaDNSKEYModulusBits(publicKey string) (int, bool) {
+	wire, err := base64.StdEncoding.DecodeString(publicKey)
+	if err != nil || len(wire) < 3 {
+		return 0, false
+	}
+	exponentLength := int(wire[0])
+	offset := 1
+	if exponentLength == 0 {
+		if len(wire) < 4 {
+			return 0, false
+		}
+		exponentLength = int(wire[1])<<8 | int(wire[2])
+		offset = 3
+	}
+	modulusOffset := offset + exponentLength
+	if exponentLength == 0 || modulusOffset >= len(wire) || wire[offset] == 0 || wire[modulusOffset] == 0 {
+		return 0, false
+	}
+	modulus := wire[modulusOffset:]
+	return (len(modulus)-1)*8 + bits.Len8(modulus[0]), true
 }
 
 // SignatureExpiry returns the moment a signature stops being valid.
