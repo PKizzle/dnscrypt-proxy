@@ -930,7 +930,11 @@ func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg
 	pluginsState.sessionData[dnssecClientWantedKey] = msg.Security
 	pluginsState.sessionData[dnssecClientAskedADKey] = msg.AuthenticatedData
 	pluginsState.sessionData[dnssecClientCheckingDisabledKey] = msg.CheckingDisabled
-	pluginsState.sessionData[dnssecClientHadEDNSKey] = messageHasEDNS(msg)
+	hadEDNS := messageHasEDNS(msg)
+	if pluginsState.clientEDNSStateRecorded {
+		hadEDNS = pluginsState.clientHadEDNS
+	}
+	pluginsState.sessionData[dnssecClientHadEDNSKey] = hadEDNS
 	// RFC 4035 section 4.6 requires a resolver to clear AD in an outgoing
 	// query. The client bit is only a request to receive our verdict; sending
 	// it upstream lets a buggy server reflect a client-controlled assertion.

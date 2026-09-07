@@ -84,6 +84,9 @@ type PluginsState struct {
 	maxPayloadSize                   int
 	originalMaxPayloadSize           int
 	maxUnencryptedUDPSafePayloadSize int
+	clientHadEDNS                    bool
+	clientUDPSize                    uint16
+	clientEDNSStateRecorded          bool
 	rejectTTL                        uint32
 	cacheMaxTTL                      uint32
 	cacheNegMaxTTL                   uint32
@@ -298,6 +301,13 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 	if len(msg.Question) != 1 {
 		return packet, errors.New("Unexpected number of questions")
 	}
+	// Keep the client's EDNS capabilities before ECS, DNSSEC validation, or
+	// the payload-size plugin adds or enlarges an OPT RR for the upstream
+	// transaction. Response shaping and the UDP truncation limit must use what
+	// the client actually advertised, not those internal mutations.
+	pluginsState.clientHadEDNS = messageHasEDNS(&msg)
+	pluginsState.clientUDPSize = msg.UDPSize
+	pluginsState.clientEDNSStateRecorded = true
 	qName, err := NormalizeQName(msg.Question[0].Header().Name)
 	if err != nil {
 		return packet, err

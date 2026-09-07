@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -275,6 +276,67 @@ func TestDNSSECValidatorReturnsOPTToAnEDNSClient(t *testing.T) {
 	}
 	if !messageHasEDNS(wire) || wire.UDPSize != 1232 {
 		t.Fatalf("packed response did not contain the required OPT RR: %#v", wire)
+	}
+}
+
+func TestDNSSECIngressKeepsClientEDNSStateBeforeECSMutation(t *testing.T) {
+	_, ecsNet, err := net.ParseCIDR("0.0.0.0/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryPlugins := []Plugin{
+		&PluginECS{nets: []*net.IPNet{ecsNet}},
+		&PluginDNSSECRequest{},
+		&PluginGetSetPayloadSize{},
+	}
+	responsePlugins := []Plugin{&PluginDNSSECStrip{}}
+	globals := &PluginsGlobals{
+		queryPlugins:    &queryPlugins,
+		responsePlugins: &responsePlugins,
+	}
+	state := NewPluginsState(&Proxy{}, "udp", nil, "", time.Now())
+	query := dns.NewMsg("example.test.", dns.TypeA)
+	query.ID = 2345
+	if err := query.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	outboundPacket, err := state.ApplyQueryPlugins(globals, query.Data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound := &dns.Msg{Data: outboundPacket}
+	if err := outbound.Unpack(); err != nil {
+		t.Fatal(err)
+	}
+	if !messageHasEDNS(outbound) || !outbound.Security {
+		t.Fatalf("upstream query lacks internally required EDNS/DO: %#v", outbound)
+	}
+	if hadEDNS, ok := state.sessionData[dnssecClientHadEDNSKey].(bool); !ok || hadEDNS {
+		t.Fatalf("recorded client EDNS = %v (present %v), want false", hadEDNS, ok)
+	}
+	if state.maxUnencryptedUDPSafePayloadSize != dns.MinMsgSize {
+		t.Fatalf("legacy client UDP limit = %d, want %d", state.maxUnencryptedUDPSafePayloadSize, dns.MinMsgSize)
+	}
+
+	response := dns.NewMsg("example.test.", dns.TypeA)
+	response.ID = query.ID
+	response.Response = true
+	response.UDPSize = 1232
+	response.Security = true
+	if err := response.Pack(); err != nil {
+		t.Fatal(err)
+	}
+	clientPacket, err := state.ApplyResponsePlugins(globals, response.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientResponse := &dns.Msg{Data: clientPacket}
+	if err := clientResponse.Unpack(); err != nil {
+		t.Fatal(err)
+	}
+	if messageHasEDNS(clientResponse) {
+		t.Fatalf("internally added EDNS leaked to the client: %#v", clientResponse)
 	}
 }
 
