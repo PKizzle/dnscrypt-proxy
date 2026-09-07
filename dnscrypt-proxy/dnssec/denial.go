@@ -1,6 +1,7 @@
 package dnssec
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base32"
 	"errors"
@@ -278,6 +279,14 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 		if !WithinZone(set.Name, zone) {
 			continue
 		}
+		if set.Type == dns.TypeNSEC3 && canonicalCompare(parentName(set.Name), zone) != 0 {
+			// An NSEC3 owner is exactly one hash label below its zone. Merely
+			// being somewhere beneath the signer is not enough; otherwise an
+			// ordinary signed name with an NSEC3-shaped first label could be
+			// repurposed as denial data. This is Unbound's filter_init zone
+			// check and follows the owner construction in RFC 5155 section 3.
+			continue
+		}
 		if res, err := VerifyRRSet(set.Records, set.Sigs, keys, now); res != Secure || err != nil {
 			continue
 		}
@@ -374,6 +383,38 @@ func (d Denial) HasOnlyUnsupportedNSEC3Iterations() bool {
 	return true
 }
 
+// HasMixedNSEC3Parameters reports whether authenticated NSEC3 records from
+// the same response belong to different hash chains. RFC 5155 section 8.2
+// permits treating such a response as bogus. More importantly, the individual
+// closest-encloser, next-closer, and wildcard facts must not be assembled from
+// different chains. Unbound applies the same check in param_set_same().
+func (d Denial) HasMixedNSEC3Parameters() bool {
+	var (
+		first     *dns.NSEC3
+		firstSalt []byte
+	)
+	for _, rr := range d.NSEC3 {
+		// Unknown hash algorithms are ignored by RFC 5155 section 8.1 and
+		// therefore do not participate in a known chain's parameters.
+		if rr.Hash != 1 {
+			continue
+		}
+		salt, err := hexDecode(rr.Salt)
+		if err != nil {
+			continue
+		}
+		if first == nil {
+			first = rr
+			firstSalt = salt
+			continue
+		}
+		if rr.Hash != first.Hash || rr.Iterations != first.Iterations || !bytes.Equal(salt, firstSalt) {
+			return true
+		}
+	}
+	return false
+}
+
 // ProvesNoData reports whether the zone proved that name exists but holds no
 // record of rrtype.
 //
@@ -420,6 +461,18 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 // secure NODATA even when no wildcard exists; accepting only the second would
 // let a wildcard be used below a closer existing name.
 func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
+	return d.WildcardNoDataStatus(name, zone, rrtype) == Secure
+}
+
+// WildcardNoDataStatus reports how completely an authenticated denial proves
+// that a wildcard, rather than the queried name, exists without rrtype.
+//
+// An NSEC3 Opt-Out span over the next-closer name is a valid response, but it
+// can hide an unsigned delegation at that name. RFC 5155 section 9.2 therefore
+// forbids AD on the response. Keeping that as Insecure instead of collapsing
+// it into either Secure or "no proof" lets callers serve the valid response
+// without authenticating what the Opt-Out span deliberately did not prove.
+func (d Denial) WildcardNoDataStatus(name, zone string, rrtype uint16) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
@@ -427,18 +480,21 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 			}
 			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
 			if closest != "" && d.ProvesNoData(wildcardName(closest), rrtype) {
-				return true
+				return Secure
 			}
 		}
-		return false
+		return Indeterminate
 	}
 
 	closest, ok := d.closestEncloser(name, zone)
 	if !ok {
-		return false
+		return Indeterminate
 	}
 	nextCloser := nextCloserName(name, closest)
-	return nextCloser != "" && d.coveredWithoutOptOut(nextCloser) && d.ProvesNoData(wildcardName(closest), rrtype)
+	if nextCloser == "" || !d.ProvesNoData(wildcardName(closest), rrtype) {
+		return Indeterminate
+	}
+	return d.nsec3CoverageStatus(nextCloser)
 }
 
 // ProvesNoDS reports whether the zone proved that name is delegated without a
@@ -450,14 +506,26 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 // is a second route: a delegation the zone opted out of is covered rather than
 // matched, and the opt-out flag has to be set for that to mean anything.
 func (d Denial) ProvesNoDS(name string) bool {
+	return d.NoDSStatus(name) != Indeterminate
+}
+
+// NoDSStatus distinguishes an exact authenticated denial from an NSEC3
+// Opt-Out denial. Both establish that the parent supplies no usable DS for a
+// child, but only the exact proof itself can carry AD. The Opt-Out form means
+// the child is insecure and RFC 5155 section 9.2 forbids authenticating the
+// response as a whole.
+func (d Denial) NoDSStatus(name string) Result {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			continue
 		}
 		if coversType(rr.TypeBitMap, dns.TypeDS) || coversType(rr.TypeBitMap, dns.TypeSOA) {
-			return false
+			return Indeterminate
 		}
-		return coversType(rr.TypeBitMap, dns.TypeNS)
+		if coversType(rr.TypeBitMap, dns.TypeNS) {
+			return Secure
+		}
+		return Indeterminate
 	}
 	for _, rr := range d.NSEC3 {
 		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
@@ -466,23 +534,30 @@ func (d Denial) ProvesNoDS(name string) bool {
 		}
 		if hashed == strings.ToUpper(firstLabel(rr.Header().Name)) {
 			if coversType(rr.TypeBitMap, dns.TypeDS) || coversType(rr.TypeBitMap, dns.TypeSOA) {
-				return false
+				return Indeterminate
 			}
-			return coversType(rr.TypeBitMap, dns.TypeNS)
+			if coversType(rr.TypeBitMap, dns.TypeNS) {
+				return Secure
+			}
+			return Indeterminate
 		}
 	}
-	// Opt-out: the delegation was never given a record of its own, and the gap
-	// containing it is flagged as one where that is allowed.
-	for _, rr := range d.NSEC3 {
-		if rr.Flags&1 == 0 {
-			continue
-		}
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
-			return true
-		}
+	// Opt-Out is not proved by an arbitrary covering span. RFC 5155 sections
+	// 8.6 and 8.9 require a full closest-provable-encloser proof, and require
+	// its next-closer span to carry Opt-Out. Without the matching encloser, a
+	// signed interval elsewhere in the hash ring says nothing about this cut.
+	if d.zone == "" || d.HasMixedNSEC3Parameters() {
+		return Indeterminate
 	}
-	return false
+	closest, ok := d.closestEncloser(name, d.zone)
+	if !ok {
+		return Indeterminate
+	}
+	nextCloser := nextCloserName(name, closest)
+	if nextCloser != "" && d.nsec3CoverageStatus(nextCloser) == Insecure {
+		return Insecure
+	}
+	return Indeterminate
 }
 
 // ProvesNameError reports whether the zone proved that name does not exist at
@@ -494,6 +569,14 @@ func (d Denial) ProvesNoDS(name string) bool {
 // a denial that ignores the wildcard denies something the zone would actually
 // have answered.
 func (d Denial) ProvesNameError(name, zone string) bool {
+	return d.NameErrorStatus(name, zone) == Secure
+}
+
+// NameErrorStatus reports whether a name error is fully authenticated or
+// rests on an NSEC3 Opt-Out closest-encloser proof. The latter is Insecure:
+// the next-closer span may hide an unsigned delegation, so RFC 5155 section
+// 9.2 explicitly says the response MUST NOT carry AD.
+func (d Denial) NameErrorStatus(name, zone string) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
@@ -507,10 +590,10 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 			// "*.b.zone" actually exists.
 			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
 			if closest != "" && d.nsecCovers(wildcardName(closest)) {
-				return true
+				return Secure
 			}
 		}
-		return false
+		return Indeterminate
 	}
 
 	// NSEC3 proves it in three parts: the deepest ancestor that does exist, the
@@ -518,13 +601,17 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 	// that ancestor.
 	closest, ok := d.closestEncloser(name, zone)
 	if !ok {
-		return false
+		return Indeterminate
 	}
 	nextCloser := nextCloserName(name, closest)
-	if nextCloser == "" || !d.covered(nextCloser) {
-		return false
+	if nextCloser == "" {
+		return Indeterminate
 	}
-	return d.covered(wildcardName(closest))
+	status := d.nsec3CoverageStatus(nextCloser)
+	if status == Indeterminate || !d.covered(wildcardName(closest)) {
+		return Indeterminate
+	}
+	return status
 }
 
 // nsecClosestEncloser derives the closest enclosing name retained by an NSEC
@@ -644,22 +731,30 @@ func (d Denial) covered(name string) bool {
 	return false
 }
 
-// coveredWithoutOptOut reports a covering NSEC3 span that proves the name is
-// absent rather than merely allowing an unsigned delegation at that point.
-// RFC 5155 section 3.1.2.1 says an Opt-Out span may cover unsigned
-// delegations, so it cannot establish the nonexistence that wildcard proofs
-// require.
-func (d Denial) coveredWithoutOptOut(name string) bool {
+// nsec3CoverageStatus returns Secure when an authenticated non-Opt-Out span
+// covers name, Insecure when only Opt-Out spans do, and Indeterminate when no
+// usable span does. Prefer a non-Opt-Out proof if a response contains both:
+// that proof establishes absence without the delegation ambiguity Opt-Out
+// intentionally creates.
+func (d Denial) nsec3CoverageStatus(name string) Result {
+	if d.HasMixedNSEC3Parameters() {
+		return Indeterminate
+	}
+	optOut := false
 	for _, rr := range d.NSEC3 {
-		if rr.Flags&1 != 0 {
+		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
+		if hashed == "" || !nsec3Covers(rr, hashed) || !d.nsec3MayProveAbsence(rr, name) {
 			continue
 		}
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
-			return true
+		if rr.Flags&1 == 0 {
+			return Secure
 		}
+		optOut = true
 	}
-	return false
+	if optOut {
+		return Insecure
+	}
+	return Indeterminate
 }
 
 // nextCloserName is the ancestor of name one label below closest.
@@ -707,21 +802,22 @@ const maxNSEC3Iterations = 100
 // which name should have been answered. Only the absence of anything closer
 // does that.
 func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
+	return d.NoCloserMatchStatus(nextCloser) == Secure
+}
+
+// NoCloserMatchStatus is the wildcard-answer counterpart of
+// NameErrorStatus. A signed wildcard RRset plus an Opt-Out span still cannot
+// authenticate that no unsigned delegation exists closer to QNAME.
+func (d Denial) NoCloserMatchStatus(nextCloser string) Result {
 	for _, rr := range d.NSEC {
 		if d.nsecMayProveAbsence(rr, nextCloser) {
-			return true
+			return Secure
 		}
 	}
-	for _, rr := range d.NSEC3 {
-		if rr.Iterations > maxNSEC3Iterations {
-			continue
-		}
-		hashed := NSEC3Hash(nextCloser, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, nextCloser) {
-			return true
-		}
+	if len(d.NSEC) > 0 {
+		return Indeterminate
 	}
-	return false
+	return d.nsec3CoverageStatus(nextCloser)
 }
 
 // ProvesNotADelegation reports whether the zone showed that name is an ordinary

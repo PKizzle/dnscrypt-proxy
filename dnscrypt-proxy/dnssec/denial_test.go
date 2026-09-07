@@ -1,6 +1,7 @@
 package dnssec
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,33 @@ func nsec3(ownerHash, nextHash string, flags uint8, types ...uint16) *dns.NSEC3 
 	rr.NextDomain = nextHash
 	rr.TypeBitMap = types
 	return rr
+}
+
+func adjacentNSEC3Hash(t *testing.T, hash string, direction int) string {
+	t.Helper()
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+	if direction != -1 && direction != 1 {
+		t.Fatalf("invalid NSEC3 hash direction %d", direction)
+	}
+	out := []byte(strings.ToUpper(hash))
+	for i := len(out) - 1; i >= 0; i-- {
+		digit := strings.IndexByte(alphabet, out[i])
+		if digit < 0 {
+			t.Fatalf("invalid base32hex digit %q in %q", out[i], hash)
+		}
+		next := digit + direction
+		if 0 <= next && next < len(alphabet) {
+			out[i] = alphabet[next]
+			return string(out)
+		}
+		if direction > 0 {
+			out[i] = alphabet[0]
+		} else {
+			out[i] = alphabet[len(alphabet)-1]
+		}
+	}
+	t.Fatalf("cannot move %q one base32hex value in direction %d", hash, direction)
+	return ""
 }
 
 // DNSSEC orders names by label from the right. Comparing the strings instead
@@ -190,6 +218,9 @@ func TestProvesNSEC3WildcardNoData(t *testing.T) {
 	d.NSEC3[1].Flags = 1
 	if d.ProvesWildcardNoData(name, zone, dns.TypeAAAA) {
 		t.Fatal("an Opt-Out span proved wildcard NODATA")
+	}
+	if got := d.WildcardNoDataStatus(name, zone, dns.TypeAAAA); got != Insecure {
+		t.Fatalf("Opt-Out wildcard NODATA status = %v, want insecure", got)
 	}
 }
 
@@ -374,6 +405,38 @@ func TestDenialIdentifiesOnlyUnsupportedNSEC3Iterations(t *testing.T) {
 	}
 }
 
+func TestMixedNSEC3ParameterChainsAreDetected(t *testing.T) {
+	base := nsec3("00000000000000000000000000000000", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0)
+	for _, tc := range []struct {
+		name   string
+		change func(*dns.NSEC3)
+	}{
+		{"iterations", func(rr *dns.NSEC3) { rr.Iterations++ }},
+		{"salt", func(rr *dns.NSEC3) { rr.Salt = "A0" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			other := *base
+			tc.change(&other)
+			if !(Denial{NSEC3: []*dns.NSEC3{base, &other}}).HasMixedNSEC3Parameters() {
+				t.Fatal("different NSEC3 parameter chains were combined")
+			}
+		})
+	}
+
+	lowerSalt := *base
+	lowerSalt.Salt = "a0"
+	upperSalt := *base
+	upperSalt.Salt = "A0"
+	if (Denial{NSEC3: []*dns.NSEC3{&lowerSalt, &upperSalt}}).HasMixedNSEC3Parameters() {
+		t.Fatal("equivalent hexadecimal salt encodings were treated as different chains")
+	}
+	unknown := *base
+	unknown.Hash = 2
+	if (Denial{NSEC3: []*dns.NSEC3{base, &unknown}}).HasMixedNSEC3Parameters() {
+		t.Fatal("an unknown hash algorithm was allowed to contaminate a known NSEC3 chain")
+	}
+}
+
 func TestNSEC3ClosestEncloserRefusesDNAMEAndDelegationRecords(t *testing.T) {
 	owner := NSEC3Hash("example.test.", 1, 0, "-")
 	for _, types := range [][]uint16{
@@ -390,22 +453,65 @@ func TestNSEC3ClosestEncloserRefusesDNAMEAndDelegationRecords(t *testing.T) {
 // Opt-out lets a zone leave unsigned delegations without records of their own,
 // but only where the flag says so.
 func TestProvesNoDSUnderOptOut(t *testing.T) {
-	name := "child.example.test."
+	const (
+		name = "child.example.test."
+		zone = "example.test."
+	)
 	h := NSEC3Hash(name, 1, 0, "-")
-	// A gap that contains the name, flagged opt-out.
-	before, after := "0000000000000000000000000000000A", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
-	if h < before || h > after {
-		t.Skipf("hash %s falls outside the constructed gap", h)
-	}
+	before, after := adjacentNSEC3Hash(t, h, -1), adjacentNSEC3Hash(t, h, 1)
+	closestHash := NSEC3Hash(zone, 1, 0, "-")
+	closest := nsec3(closestHash, adjacentNSEC3Hash(t, closestHash, 1), 0,
+		dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeNSEC3PARAM)
+	gap := nsec3(before, after, 1, dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC3)
 
-	optOut := Denial{NSEC3: []*dns.NSEC3{nsec3(before, after, 1, dns.TypeNS)}}
+	optOut := Denial{NSEC3: []*dns.NSEC3{closest, gap}, zone: zone}
 	if !optOut.ProvesNoDS(name) {
 		t.Error("an opt-out gap containing the delegation should prove there is no signer")
 	}
+	if got := optOut.NoDSStatus(name); got != Insecure {
+		t.Errorf("opt-out DS denial status = %v, want insecure", got)
+	}
 
-	notOptOut := Denial{NSEC3: []*dns.NSEC3{nsec3(before, after, 0, dns.TypeNS)}}
+	spanOnly := Denial{NSEC3: []*dns.NSEC3{gap}, zone: zone}
+	if spanOnly.ProvesNoDS(name) {
+		t.Error("an Opt-Out span without its closest-encloser proof proved no DS")
+	}
+
+	notOptOutGap := *gap
+	notOptOutGap.Flags = 0
+	notOptOut := Denial{NSEC3: []*dns.NSEC3{closest, &notOptOutGap}, zone: zone}
 	if notOptOut.ProvesNoDS(name) {
 		t.Error("without the opt-out flag, a covering gap proves nothing about a delegation")
+	}
+}
+
+// RFC 5155 section 9.2: a closest-encloser proof whose next-closer name is
+// covered by Opt-Out can be a valid insecure response, but MUST NOT result in
+// AD. It may hide an unsigned delegation at the queried name.
+func TestNSEC3OptOutNameErrorIsInsecure(t *testing.T) {
+	const (
+		name = "missing.example.test."
+		zone = "example.test."
+	)
+	closestHash := NSEC3Hash(zone, 1, 0, "-")
+	nextCloserHash := NSEC3Hash(name, 1, 0, "-")
+	wildcardHash := NSEC3Hash("*."+zone, 1, 0, "-")
+	d := Denial{NSEC3: []*dns.NSEC3{
+		nsec3(closestHash, adjacentNSEC3Hash(t, closestHash, 1), 0,
+			dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeNSEC3),
+		nsec3(adjacentNSEC3Hash(t, nextCloserHash, -1), adjacentNSEC3Hash(t, nextCloserHash, 1), 1,
+			dns.TypeRRSIG, dns.TypeNSEC3),
+		nsec3(adjacentNSEC3Hash(t, wildcardHash, -1), adjacentNSEC3Hash(t, wildcardHash, 1), 0,
+			dns.TypeRRSIG, dns.TypeNSEC3),
+	}, zone: zone}
+	if got := d.NameErrorStatus(name, zone); got != Insecure {
+		t.Fatalf("Opt-Out name-error status = %v, want insecure", got)
+	}
+	if d.ProvesNameError(name, zone) {
+		t.Fatal("an Opt-Out name-error proof was treated as fully authenticated")
+	}
+	if got := d.NoCloserMatchStatus(name); got != Insecure {
+		t.Fatalf("Opt-Out wildcard next-closer status = %v, want insecure", got)
 	}
 }
 
@@ -483,6 +589,19 @@ func TestVerifiedDenialRejectsNSEC3WithUnknownFlags(t *testing.T) {
 	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
 	if !verified.Empty() {
 		t.Error("an NSEC3 with an unknown flag bit must not prove absence")
+	}
+}
+
+func TestVerifiedDenialRequiresNSEC3OwnerDirectlyBelowTheZone(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec3("0000000000000000000000000000000A", "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV", 0)
+	rr.Hdr.Name = "0000000000000000000000000000000A.sub.example.test."
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Error("an NSEC3 owner with an extra label below its zone was accepted")
 	}
 }
 

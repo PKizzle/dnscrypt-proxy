@@ -141,6 +141,21 @@ nextChild:
 			}
 
 			denial = denial.Verified(current.Keys, current.Zone, now)
+			if denial.HasMixedNSEC3Parameters() {
+				// RFC 5155 section 8.2 permits rejecting records from distinct
+				// NSEC3 chains in one response, and combining them could fabricate
+				// a proof none of the chains supplies by itself. Unbound makes the
+				// same conservative choice. A different upstream may have a clean
+				// response, so evict and retry before returning Bogus.
+				if attempt+1 < chainFetchAttempts {
+					forget(f, child)
+					continue
+				}
+				return ChainResult{
+					Status: Bogus, Zone: current.Zone,
+					Why: fmt.Errorf("delegation denial for %s mixes NSEC3 parameter chains", child),
+				}
+			}
 			// No delegation signer has two very different meanings, and reading
 			// the wrong one costs either coverage or correctness.
 			//

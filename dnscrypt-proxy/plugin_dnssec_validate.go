@@ -482,6 +482,21 @@ func (plugin *PluginDNSSECValidate) judgeNegativeAuthority(msg *dns.Msg, chain d
 	return dnssec.Secure, nil
 }
 
+// finishDenial authenticates the signed authority data and then preserves the
+// strength of the denial proof itself. An NSEC3 Opt-Out proof is legitimate,
+// but RFC 5155 section 9.2 forbids setting AD because the covered next-closer
+// name may be an unsigned delegation.
+func (plugin *PluginDNSSECValidate) finishDenial(msg *dns.Msg, chain dnssec.ChainResult, now time.Time, proof dnssec.Result, why error) (dnssec.Result, error) {
+	result, err := plugin.judgeNegativeAuthority(msg, chain, now)
+	if result != dnssec.Secure {
+		return result, err
+	}
+	if proof == dnssec.Insecure {
+		return dnssec.Insecure, why
+	}
+	return dnssec.Secure, nil
+}
+
 // judgeNegative validates an answer with no ordinary RRsets.  An authenticated
 // denial is signed by the zone that generated the NSEC/NSEC3 proof, not by a
 // made-up zone at every label of the queried name.  In particular, an NXDOMAIN
@@ -560,13 +575,17 @@ func (plugin *PluginDNSSECValidate) judgeNegativeWithChain(msg *dns.Msg, qName s
 		return dnssec.Indeterminate, chain.Why
 	}
 	denial := dnssec.CollectDenial(msg.Ns).Verified(chain.Keys, chain.Zone, now)
+	if denial.HasMixedNSEC3Parameters() {
+		return dnssec.Bogus, fmt.Errorf("%w: denial for %s mixes NSEC3 parameter chains", errDNSSECIncompleteEvidence, qName)
+	}
 	if denial.Empty() {
 		return dnssec.Bogus, fmt.Errorf("%w: a signed zone answered nothing and proved nothing", errDNSSECIncompleteEvidence)
 	}
 	qtype := dns.RRToType(msg.Question[0])
 	if msg.Rcode == dns.RcodeNameError {
-		if denial.ProvesNameError(qName, chain.Zone) {
-			return plugin.judgeNegativeAuthority(msg, chain, now)
+		if proof := denial.NameErrorStatus(qName, chain.Zone); proof != dnssec.Indeterminate {
+			return plugin.finishDenial(msg, chain, now, proof,
+				fmt.Errorf("%s name-error proof uses NSEC3 Opt-Out", qName))
 		}
 		if denial.HasOnlyUnsupportedNSEC3Iterations() {
 			return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
@@ -586,15 +605,17 @@ func (plugin *PluginDNSSECValidate) judgeNegativeWithChain(msg *dns.Msg, qName s
 		// ancestor-delegation NSEC may deny at the cut. ProvesNoData rejects
 		// that shape for ordinary types, while ProvesNoDS requires exactly the
 		// parent-side NS-present, SOA/DS-absent bitmap (or NSEC3 Opt-Out).
-		if denial.ProvesNoDS(qName) {
-			return plugin.judgeNegativeAuthority(msg, chain, now)
+		if proof := denial.NoDSStatus(qName); proof != dnssec.Indeterminate {
+			return plugin.finishDenial(msg, chain, now, proof,
+				fmt.Errorf("%s DS denial uses NSEC3 Opt-Out", qName))
 		}
 	}
 	if denial.ProvesNoData(qName, qtype) {
 		return plugin.judgeNegativeAuthority(msg, chain, now)
 	}
-	if denial.ProvesWildcardNoData(qName, chain.Zone, qtype) {
-		return plugin.judgeNegativeAuthority(msg, chain, now)
+	if proof := denial.WildcardNoDataStatus(qName, chain.Zone, qtype); proof != dnssec.Indeterminate {
+		return plugin.finishDenial(msg, chain, now, proof,
+			fmt.Errorf("%s wildcard NODATA proof uses NSEC3 Opt-Out", qName))
 	}
 	if denial.HasOnlyUnsupportedNSEC3Iterations() {
 		return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
@@ -781,11 +802,25 @@ func dnameAppliesToName(dname *dns.DNAME, name string) bool {
 // child would let it impersonate the child. The chain walk establishes the
 // actual containing zone and the RRSIG must name that exact zone.
 func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.ChainResult, msg *dns.Msg, now time.Time) (dnssec.Result, error) {
+	chainName := set.Name
+	if set.Type == dns.TypeDS {
+		// DS is the one RRset whose owner is the child zone cut but whose data
+		// and signature belong to the parent zone (RFC 4035 sections 2.4 and
+		// 5.2). Walk to the textual parent; BuildChain will discover the actual
+		// enclosing zone if one or more labels between it and the owner are not
+		// themselves zone cuts. Requiring the RRSIG signer to equal the zone that
+		// walk establishes still rejects a higher ancestor impersonating the
+		// real parent across an intervening delegation.
+		zones := dnssec.AncestorZones(set.Name)
+		if len(zones) > 1 {
+			chainName = zones[len(zones)-2]
+		}
+	}
 	if len(set.Sigs) == 0 {
 		// Nothing claims to have signed this. Whether that is a forgery or an
 		// ordinary unsigned answer depends on whether the zone holding the name
 		// signs at all, which is what the walk to the name decides.
-		owner := plugin.chainFor(set.Name, chain, now)
+		owner := plugin.chainFor(chainName, chain, now)
 		switch owner.Status {
 		case dnssec.Secure:
 			return dnssec.Bogus, fmt.Errorf("%w: %s is signed, but its %s record for %s is not", errDNSSECIncompleteEvidence,
@@ -799,7 +834,7 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		}
 	}
 
-	owner := plugin.chainFor(set.Name, chain, now)
+	owner := plugin.chainFor(chainName, chain, now)
 	switch owner.Status {
 	case dnssec.Secure:
 	case dnssec.Insecure:
@@ -824,7 +859,17 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 			// has to have shown that nothing closer to the name does exist.
 			if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
 				denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
-				if !denial.ProvesNoCloserMatch(nextCloser) {
+				if denial.HasMixedNSEC3Parameters() {
+					return dnssec.Bogus, fmt.Errorf(
+						"%w: wildcard proof for %s mixes NSEC3 parameter chains",
+						errDNSSECIncompleteEvidence, set.Name)
+				}
+				switch proof := denial.NoCloserMatchStatus(nextCloser); proof {
+				case dnssec.Secure:
+				case dnssec.Insecure:
+					return dnssec.Insecure, fmt.Errorf(
+						"%s wildcard proof for %s uses NSEC3 Opt-Out", set.Name, nextCloser)
+				default:
 					if denial.HasOnlyUnsupportedNSEC3Iterations() {
 						return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
 					}
