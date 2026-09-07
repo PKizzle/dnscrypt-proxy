@@ -4,7 +4,10 @@ import (
 	"crypto"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/netip"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +82,117 @@ func TestVerifyRRSetAcceptsAGenuineSignature(t *testing.T) {
 	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
 	if res != Secure {
 		t.Fatalf("VerifyRRSet() = %v (%v), want secure", res, err)
+	}
+}
+
+// This independently signed production RRset guards the RFC 4034 section 6.3
+// ordering rule that exposed the original failure. RFC 8659 section 4.1 gives
+// CAA Value no length octet, so canonical order compares its bytes directly.
+// A signer and verifier sharing the same broken sorter would make a generated
+// test vector pass, which is why this fixture comes from the public zone.
+func TestVerifyRRSetAcceptsIndependentlySignedCAASet(t *testing.T) {
+	mustRR := func(text string) dns.RR {
+		t.Helper()
+		rr, err := dns.New(text)
+		if err != nil {
+			t.Fatalf("parse DNS fixture: %v", err)
+		}
+		return rr
+	}
+	key := mustRR("cloudflare.com. 3600 IN DNSKEY 256 3 13 oJMRESz5E4gYzS/q6XDrvU1qMPYIjCWzJaOau8XNEZeqCYKD5ar0IRd8KqXXFJkqmVfRvMGPmM1x8fGAa2XhSA==").(*dns.DNSKEY)
+	sig := mustRR("cloudflare.com. 300 IN RRSIG CAA 13 2 300 20260908113506 20260906093506 34505 cloudflare.com. YQGLdNWiEvMvQp+Zrz7+k0jBma9ocT1aWNTaLo8Pl47GHjdFdNdm6cMV5ZdK/CTQKBh1dljb97pgvWlgC8f59w==").(*dns.RRSIG)
+	rrset := []dns.RR{
+		mustRR(`cloudflare.com. 300 IN CAA 0 iodef "mailto:tls-abuse@cloudflare.com"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issue "comodoca.com"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issue "digicert.com; cansignhttpexchanges=yes"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issue "letsencrypt.org"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issue "pki.goog; cansignhttpexchanges=yes"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issue "ssl.com"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issuewild "comodoca.com"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issuewild "digicert.com; cansignhttpexchanges=yes"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issuewild "letsencrypt.org"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issuewild "pki.goog; cansignhttpexchanges=yes"`),
+		mustRR(`cloudflare.com. 300 IN CAA 0 issuewild "ssl.com"`),
+	}
+	now := time.Date(2026, time.September, 7, 10, 0, 0, 0, time.UTC)
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{key}, now)
+	if res != Secure {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Secure", res, err)
+	}
+}
+
+// Validation is read-only. The vendored crypto helper canonicalizes records,
+// restores their original TTL, sorts the RRset, and temporarily clears the
+// RRSIG in place. Calling it directly would both alter the answer returned to
+// a client and race when cached DNSKEY/denial material is shared by requests.
+func TestVerifyRRSetDoesNotMutateItsInputs(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	signed := []dns.RR{&dns.CNAME{
+		Hdr:   dns.Header{Name: "alias.example.test.", Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: "target.example.test."},
+	}}
+	sig := z.sign(signed, now.Add(-time.Hour), now.Add(time.Hour))
+
+	response := []dns.RR{&dns.CNAME{
+		Hdr:   dns.Header{Name: "Alias.Example.Test.", Class: dns.ClassINET, TTL: 42},
+		CNAME: rdata.CNAME{Target: "Target.Example.Test."},
+	}}
+	sig.Hdr.Name = "Alias.Example.Test."
+	sig.Hdr.TTL = 42
+	key := *z.key
+	key.Tag = 0
+	beforeRR := response[0].String()
+	beforeSig := sig.String()
+
+	res, err := VerifyRRSet(response, []*dns.RRSIG{sig}, []*dns.DNSKEY{&key}, now)
+	if res != Secure || err != nil {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Secure", res, err)
+	}
+	if got := response[0].String(); got != beforeRR {
+		t.Fatalf("record mutated during verification:\n before %s\n after  %s", beforeRR, got)
+	}
+	if got := sig.String(); got != beforeSig {
+		t.Fatalf("signature mutated during verification:\n before %s\n after  %s", beforeSig, got)
+	}
+	if key.Tag != 0 {
+		t.Fatalf("DNSKEY tag cache mutated during verification: %d", key.Tag)
+	}
+}
+
+func TestVerifyRRSetSafelySharesCachedInputsAcrossRequests(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+	key := *z.key
+	key.Tag = 0
+
+	const workers = 16
+	const iterations = 20
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range iterations {
+				res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{&key}, now)
+				if res != Secure || err != nil {
+					errs <- fmt.Errorf("VerifyRRSet() = %v (%v)", res, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if key.Tag != 0 {
+		t.Fatalf("shared key tag cache mutated: %d", key.Tag)
 	}
 }
 
@@ -211,6 +325,48 @@ func TestVerifyRRSetAcceptsValidSignatureAlongsideExpiredUnknownKey(t *testing.T
 	res, err := VerifyRRSet(rrset, sigs, []*dns.DNSKEY{current.key}, now)
 	if res != Secure || err != nil {
 		t.Fatalf("VerifyRRSet() with valid and expired-extra signatures = %v (%v), want Secure", res, err)
+	}
+}
+
+// RFC 4035 erratum 8037 documents why an implementation may not let one
+// RRset force an unbounded key/signature cross-product: doing so enabled the
+// KeyTrap CPU-exhaustion attack.  Match Unbound's eight-cryptographic-check
+// ceiling and fail closed before a ninth bad signature can consume more work.
+func TestVerifyRRSetBoundsCryptographicWorkPerRRSet(t *testing.T) {
+	z := newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	valid := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+	sigs := make([]*dns.RRSIG, 0, 9)
+	for range 8 {
+		bad := *valid
+		bad.Signature = base64.StdEncoding.EncodeToString([]byte{0})
+		sigs = append(sigs, &bad)
+	}
+	sigs = append(sigs, valid)
+
+	res, err := VerifyRRSet(rrset, sigs, []*dns.DNSKEY{z.key}, now)
+	if res != Bogus || err == nil || !strings.Contains(err.Error(), "too many") {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Bogus/too-many-validations", res, err)
+	}
+}
+
+func TestVerifyRRSetAcceptsAValidSignatureWithinTheWorkLimit(t *testing.T) {
+	z := newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	valid := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+	sigs := make([]*dns.RRSIG, 0, 8)
+	for range 7 {
+		bad := *valid
+		bad.Signature = base64.StdEncoding.EncodeToString([]byte{0})
+		sigs = append(sigs, &bad)
+	}
+	sigs = append(sigs, valid)
+
+	res, err := VerifyRRSet(rrset, sigs, []*dns.DNSKEY{z.key}, now)
+	if res != Secure || err != nil {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Secure at the work-limit boundary", res, err)
 	}
 }
 
@@ -700,6 +856,34 @@ func TestWildcardExpansionIsReportedWithTheNameToDisprove(t *testing.T) {
 	}
 }
 
+// RFC 6840 section 5.4 says any valid RRSIG is sufficient. If an RRset has
+// both a valid exact-owner signature and a valid wildcard signature, return
+// the exact signature even when the wildcard is listed first: the exact path
+// needs no denial proof and must not be rejected because the other valid path
+// would need one.
+func TestVerifyRRSetPrefersAValidExactSignatureOverAWildcardSignature(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	expanded := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	wildcard := []dns.RR{aRecord("*.example.test.", "192.0.2.1")}
+	wildcardSig := z.sign(wildcard, now.Add(-time.Hour), now.Add(time.Hour))
+	wildcardSig.Hdr.Name = expanded[0].Header().Name
+	exactSig := z.sign(expanded, now.Add(-time.Hour), now.Add(time.Hour))
+
+	res, verified, err := VerifyRRSetDetail(
+		expanded,
+		[]*dns.RRSIG{wildcardSig, exactSig},
+		[]*dns.DNSKEY{z.key},
+		now,
+	)
+	if res != Secure || err != nil {
+		t.Fatalf("VerifyRRSetDetail() = %v (%v), want Secure", res, err)
+	}
+	if verified != exactSig {
+		t.Fatal("wildcard signature was preferred over the available exact signature")
+	}
+}
+
 // A literal query for an existing wildcard owner is an exact-owner answer,
 // not wildcard synthesis. Its RRSIG Labels field still omits the leading "*"
 // (RFC 4034 section 3.1.3), so label count alone cannot distinguish the two.
@@ -792,10 +976,13 @@ func TestMalformedSupportedKeyIsBogusNotInsecure(t *testing.T) {
 	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
 
 	malformed := *z.key
-	malformed.PublicKey = "not-base64"
-	// Preserve the already authenticated key tag so verification reaches the
-	// key parser rather than taking the unrelated no-matching-key branch.
-	malformed.Tag = sig.KeyTag
+	// Keep the DNSKEY wire format and key tag computable while supplying an
+	// impossibly short ECDSA public point, so verification reaches the key
+	// parser rather than taking the unrelated no-matching-key branch. Tag is a
+	// library-side cache and is deliberately not trusted as wire data.
+	malformed.PublicKey = base64.StdEncoding.EncodeToString([]byte{1, 2, 3})
+	malformed.Tag = 0
+	sig.KeyTag = immutableDNSKEYTag(&malformed)
 
 	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{&malformed}, now)
 	if res != Bogus {

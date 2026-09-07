@@ -46,6 +46,6 @@ require (
 // crypto/rsa refuses public exponents above 2^31-1 (golang/go#3161), so a
 // DNSKEY using a larger one -- the F5 exponent 2^32+1 that BIND's dnssec-keygen
 // offers, still in use in signed zones -- cannot be verified by any Go DNS
-// library. The fork adds a verification path for those keys and changes nothing
-// for the keys crypto/rsa already accepts.
-replace codeberg.org/miekg/dns => github.com/PKizzle/dns v0.0.0-20260826195542-aa9351af91aa
+// library. The fork adds a verification path for those keys. It also fixes
+// RFC 4034 canonical ordering for lengthless RDATA tails (notably CAA values).
+replace codeberg.org/miekg/dns => github.com/PKizzle/dns v0.0.0-20260907103838-3e90d0ad749a

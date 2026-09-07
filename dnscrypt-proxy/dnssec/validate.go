@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"reflect"
 	"strings"
 	"time"
 
@@ -69,6 +70,14 @@ var ErrSignatureOutsideValidity = errors.New("signature is outside its validity"
 // requires operators to treat RSASHA1 and RSASHA1-NSEC3-SHA1 this way even
 // though implementations must retain the code needed to verify them.
 var ErrUnsupportedSignatureAlgorithm = errors.New("unsupported DNSSEC signing algorithm")
+
+// ErrTooManySignatureValidations reports that one RRset exhausted the bounded
+// cryptographic-work budget. RFC 4035 erratum 8037 documents why trying an
+// attacker-controlled key/signature cross-product without a ceiling is unsafe
+// (the KeyTrap class of CPU-exhaustion attacks). Unbound uses the same limit.
+var ErrTooManySignatureValidations = errors.New("too many RRSIG validations")
+
+const maxSignatureValidations = 8
 
 // VerifyRRSet reports whether rrset is covered by a signature that verifies
 // against one of keys and is valid at now.
@@ -148,29 +157,39 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 	// never delegated is forged, and must stay refused -- that is the case this
 	// whole function exists for.
 	checkable := false
+	checkableDS := make(map[dnskeyID]map[uint8]map[string]struct{})
 	for _, ds := range dss {
 		if acceptedDNSKEYAlgorithm(ds.Algorithm) && supportedDSDigest(ds.DigestType) {
 			checkable = true
-			break
+			id := dnskeyID{algorithm: ds.Algorithm, tag: ds.KeyTag}
+			byDigestType := checkableDS[id]
+			if byDigestType == nil {
+				byDigestType = make(map[uint8]map[string]struct{})
+				checkableDS[id] = byDigestType
+			}
+			digests := byDigestType[ds.DigestType]
+			if digests == nil {
+				digests = make(map[string]struct{})
+				byDigestType[ds.DigestType] = digests
+			}
+			digests[strings.ToLower(ds.Digest)] = struct{}{}
 		}
 	}
 
 	anchored := make([]*dns.DNSKEY, 0, len(keys))
 	for _, key := range keys {
-		for _, ds := range dss {
-			if !acceptedDNSKEYAlgorithm(ds.Algorithm) || !supportedDSDigest(ds.DigestType) {
-				continue
-			}
-			if key.KeyTag() != ds.KeyTag || key.Algorithm != ds.Algorithm {
-				continue
-			}
-			computed := key.ToDS(ds.DigestType)
+		tag := immutableDNSKEYTag(key)
+		byDigestType := checkableDS[dnskeyID{algorithm: key.Algorithm, tag: tag}]
+		for digestType, digests := range byDigestType {
+			keyCopy := *key
+			keyCopy.Tag = tag
+			computed := keyCopy.ToDS(digestType)
 			if computed == nil {
 				// A digest this build cannot compute is not a mismatch; it
 				// simply proves nothing.
 				continue
 			}
-			if equalFold(computed.Digest, ds.Digest) {
+			if _, ok := digests[strings.ToLower(computed.Digest)]; ok {
 				anchored = append(anchored, key)
 				break
 			}
@@ -269,27 +288,6 @@ func hasCoveringSignatureFromAnotherZone(rrset []dns.RR, sigs []*dns.RRSIG, zone
 		}
 	}
 	return false
-}
-
-// equalFold compares hex digests without caring about case, which zones publish
-// inconsistently.
-func equalFold(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		x, y := a[i], b[i]
-		if 'A' <= x && x <= 'Z' {
-			x += 'a' - 'A'
-		}
-		if 'A' <= y && y <= 'Z' {
-			y += 'a' - 'A'
-		}
-		if x != y {
-			return false
-		}
-	}
-	return true
 }
 
 // SplitSignatures separates an answer section into the records and the
@@ -420,40 +418,56 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 		return Indeterminate, nil, fmt.Errorf("no keys to verify against")
 	}
 
+	keyIndex := indexDNSKEYs(keys)
 	var lastErr error
 	unsupportedOnly := false
-	for _, sig := range sigs {
-		if !covers(sig, rrset) {
-			continue
-		}
-		// RFC 6840 section 5.12: an extra RRSIG is not applicable until its
-		// algorithm, key tag, and signer identify a usable DNSKEY in the
-		// authenticated zone key set. Disregard it before inspecting its
-		// validity window or signature bytes; a stale rollover signature must
-		// not turn otherwise missing evidence into a false Bogus result.
-		if !hasCorrespondingDNSKEY(sig, keys, rrset) {
-			continue
-		}
-		if !acceptedDNSKEYAlgorithm(sig.Algorithm) {
-			// Only a signature with a corresponding usable zone key can
-			// establish that this RRset relies on an algorithm the operator has
-			// deliberately classified as unsupported.
-			unsupportedOnly = true
-			continue
-		}
-		if !ValidAt(sig, now) {
-			lastErr = fmt.Errorf("%w: signature by key %d", ErrSignatureOutsideValidity, sig.KeyTag)
-			continue
-		}
-		for _, key := range keys {
-			if !usableDNSKEYForSignature(key, sig, rrset) {
+	validations := 0
+	owner := rrset[0].Header().Name
+	// Try exact-owner signatures before wildcard-expanded signatures. RFC
+	// 6840 section 5.4 says any valid path is sufficient; returning a wildcard
+	// first can make a caller demand (and possibly fail) a denial proof even
+	// though a valid exact signature in the same RRset needs no such proof.
+	for pass := 0; pass < 2; pass++ {
+		wantWildcard := pass == 1
+		for _, sig := range sigs {
+			_, wildcard := WildcardNextCloser(sig, owner)
+			if wildcard != wantWildcard || !covers(sig, rrset) {
 				continue
 			}
-			if err := sig.Verify(key, rrset, &dns.SignOption{}); err != nil {
-				lastErr = err
+			candidates := keyIndex[dnskeyID{algorithm: sig.Algorithm, tag: sig.KeyTag}]
+			// RFC 6840 section 5.12: an extra RRSIG is not applicable until
+			// its algorithm, key tag, and signer identify a usable DNSKEY in
+			// the authenticated zone key set. Disregard it before inspecting
+			// validity or signature bytes.
+			if !hasUsableDNSKEYCandidate(candidates, sig, rrset) {
 				continue
 			}
-			return Secure, sig, nil
+			if !acceptedDNSKEYAlgorithm(sig.Algorithm) {
+				unsupportedOnly = true
+				continue
+			}
+			if !ValidAt(sig, now) {
+				lastErr = fmt.Errorf("%w: signature by key %d", ErrSignatureOutsideValidity, sig.KeyTag)
+				continue
+			}
+			for _, candidate := range candidates {
+				if !usableDNSKEYForSignatureWithTag(candidate.key, candidate.tag, sig, rrset) {
+					continue
+				}
+				if validations >= maxSignatureValidations {
+					return Bogus, nil, fmt.Errorf("%w for %s (limit %d)",
+						ErrTooManySignatureValidations, owner, maxSignatureValidations)
+				}
+				validations++
+				keyCopy := *candidate.key
+				keyCopy.Tag = candidate.tag
+				sigCopy := *sig
+				if err := sigCopy.Verify(&keyCopy, cloneRRSet(rrset), &dns.SignOption{}); err != nil {
+					lastErr = err
+					continue
+				}
+				return Secure, sig, nil
+			}
 		}
 	}
 	if unsupportedOnly {
@@ -474,9 +488,55 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 	return Bogus, nil, lastErr
 }
 
-func hasCorrespondingDNSKEY(sig *dns.RRSIG, keys []*dns.DNSKEY, rrset []dns.RR) bool {
+// cloneRRSet isolates the caller from the vendored verifier's in-place
+// canonicalization. DNS RRs are pointers to concrete structs; a shallow
+// concrete copy is sufficient because canonicalization assigns Header/string
+// fields and sorts the containing slice but does not modify referenced byte or
+// bitmap slices.
+func cloneRRSet(rrset []dns.RR) []dns.RR {
+	cloned := make([]dns.RR, len(rrset))
+	for i, rr := range rrset {
+		value := reflect.ValueOf(rr)
+		if !value.IsValid() || value.Kind() != reflect.Pointer || value.IsNil() {
+			cloned[i] = rr
+			continue
+		}
+		copyValue := reflect.New(value.Elem().Type())
+		copyValue.Elem().Set(value.Elem())
+		cloned[i] = copyValue.Interface().(dns.RR)
+	}
+	return cloned
+}
+
+type dnskeyID struct {
+	algorithm uint8
+	tag       uint16
+}
+
+type dnskeyCandidate struct {
+	key *dns.DNSKEY
+	tag uint16
+}
+
+func indexDNSKEYs(keys []*dns.DNSKEY) map[dnskeyID][]dnskeyCandidate {
+	index := make(map[dnskeyID][]dnskeyCandidate, len(keys))
 	for _, key := range keys {
-		if usableDNSKEYForSignature(key, sig, rrset) {
+		tag := immutableDNSKEYTag(key)
+		id := dnskeyID{algorithm: key.Algorithm, tag: tag}
+		index[id] = append(index[id], dnskeyCandidate{key: key, tag: tag})
+	}
+	return index
+}
+
+func immutableDNSKEYTag(key *dns.DNSKEY) uint16 {
+	keyCopy := *key
+	keyCopy.Tag = 0
+	return keyCopy.KeyTag()
+}
+
+func hasUsableDNSKEYCandidate(candidates []dnskeyCandidate, sig *dns.RRSIG, rrset []dns.RR) bool {
+	for _, candidate := range candidates {
+		if usableDNSKEYForSignatureWithTag(candidate.key, candidate.tag, sig, rrset) {
 			return true
 		}
 	}
@@ -484,7 +544,11 @@ func hasCorrespondingDNSKEY(sig *dns.RRSIG, keys []*dns.DNSKEY, rrset []dns.RR) 
 }
 
 func usableDNSKEYForSignature(key *dns.DNSKEY, sig *dns.RRSIG, rrset []dns.RR) bool {
-	if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag ||
+	return usableDNSKEYForSignatureWithTag(key, immutableDNSKEYTag(key), sig, rrset)
+}
+
+func usableDNSKEYForSignatureWithTag(key *dns.DNSKEY, tag uint16, sig *dns.RRSIG, rrset []dns.RR) bool {
+	if key.Algorithm != sig.Algorithm || tag != sig.KeyTag ||
 		key.Flags&dns.FlagZONE == 0 || key.Protocol != 3 ||
 		!dns.EqualName(key.Header().Name, sig.SignerName) ||
 		!dnskeyMeetsAlgorithmConstraints(key) {

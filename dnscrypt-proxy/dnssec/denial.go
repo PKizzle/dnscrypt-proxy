@@ -53,18 +53,18 @@ func NSEC3Hash(name string, algorithm uint8, iterations uint16, salt string) str
 	if algorithm != 1 {
 		return ""
 	}
+	if iterations > maxNSEC3Iterations {
+		// Check the authenticated cost before doing even the first SHA-1. A
+		// response may contain many unusable records, and none of them should
+		// consume hashing work merely to be declined.
+		return ""
+	}
 	saltBytes, err := hexDecode(salt)
 	if err != nil {
 		return ""
 	}
 	digest := sha1.Sum(append(wireName(name), saltBytes...)) // #nosec G401 -- RFC 5155 defines SHA-1 here
 	buf := digest[:]
-	if iterations > maxNSEC3Iterations {
-		// Refusing here rather than at each call site keeps the limit in one
-		// place: an empty hash is already how this reports "nothing can be
-		// concluded", and every caller already handles it.
-		return ""
-	}
 	for i := uint16(0); i < iterations; i++ {
 		next := sha1.Sum(append(buf, saltBytes...)) // #nosec G401 -- as above
 		buf = next[:]
@@ -376,21 +376,18 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 // record to prove wildcard NODATA. Inspect every usable signature rather than
 // relying on whichever valid one VerifyRRSet finds first.
 func exactNSECSignatureStatus(set RRSet, keys []*dns.DNSKEY, now time.Time) Result {
-	policyInsecure := false
+	exactSigs := make([]*dns.RRSIG, 0, len(set.Sigs))
 	for _, sig := range set.Sigs {
 		labels := CountLabels(set.Name)
 		exactWildcardOwner := strings.HasPrefix(canonicalName(set.Name), "*.") && int(sig.Labels) == labels-1
 		if int(sig.Labels) != labels && !exactWildcardOwner {
 			continue
 		}
-		if res, _ := VerifyRRSet(set.Records, []*dns.RRSIG{sig}, keys, now); res == Secure {
-			return Secure
-		} else if res == Insecure {
-			policyInsecure = true
-		}
+		exactSigs = append(exactSigs, sig)
 	}
-	if policyInsecure {
-		return Insecure
+	res, _ := VerifyRRSet(set.Records, exactSigs, keys, now)
+	if res == Secure || res == Insecure {
+		return res
 	}
 	return Indeterminate
 }
@@ -473,6 +470,76 @@ func (d Denial) HasMixedNSEC3Parameters() bool {
 	return false
 }
 
+// maxNSEC3Calculations is a final bound on distinct names hashed during one
+// denial proof. A legal DNS name can contain at most 127 one-octet labels, so
+// 256 leaves room for every ancestor plus the next-closer and wildcard names.
+// The ordinary bound comes from memoization: authenticated response records
+// can multiply cheap comparisons, but can no longer multiply SHA-1 work.
+const maxNSEC3Calculations = 256
+
+type nsec3Proof struct {
+	algorithm    uint8
+	iterations   uint16
+	salt         string
+	saltBytes    []byte
+	usable       bool
+	hashes       map[string]string
+	calculations int
+	exhausted    bool
+}
+
+// newNSEC3Proof chooses the one usable parameter chain for a proof. RFC 5155
+// section 8.2 permits a mixed-chain response to be treated as bogus; combining
+// facts from those chains would be unsound and would also defeat hash caching.
+func newNSEC3Proof(d Denial) *nsec3Proof {
+	proof := &nsec3Proof{hashes: make(map[string]string)}
+	if d.HasMixedNSEC3Parameters() {
+		return proof
+	}
+	for _, rr := range d.NSEC3 {
+		if rr.Hash != 1 || rr.Iterations > maxNSEC3Iterations {
+			continue
+		}
+		salt, err := hexDecode(rr.Salt)
+		if err != nil {
+			continue
+		}
+		proof.algorithm = rr.Hash
+		proof.iterations = rr.Iterations
+		proof.salt = rr.Salt
+		proof.saltBytes = salt
+		proof.usable = true
+		break
+	}
+	return proof
+}
+
+func (proof *nsec3Proof) matches(rr *dns.NSEC3) bool {
+	if proof == nil || !proof.usable || rr == nil || rr.Hash != proof.algorithm || rr.Iterations != proof.iterations {
+		return false
+	}
+	salt, err := hexDecode(rr.Salt)
+	return err == nil && bytes.Equal(salt, proof.saltBytes)
+}
+
+func (proof *nsec3Proof) hash(name string) string {
+	if proof == nil || !proof.usable {
+		return ""
+	}
+	name = canonicalName(name)
+	if hashed, ok := proof.hashes[name]; ok {
+		return hashed
+	}
+	if proof.calculations >= maxNSEC3Calculations {
+		proof.exhausted = true
+		return ""
+	}
+	proof.calculations++
+	hashed := NSEC3Hash(name, proof.algorithm, proof.iterations, proof.salt)
+	proof.hashes[name] = hashed
+	return hashed
+}
+
 // ProvesNoData reports whether the zone securely proved that name exists but
 // holds no record of rrtype.
 //
@@ -490,16 +557,21 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 // a corresponding but disabled algorithm may establish an Insecure answer,
 // but can never contribute to a Secure proof.
 func (d Denial) NoDataStatus(name string, rrtype uint16) Result {
-	if d.provesNoData(name, rrtype) {
+	if d.provesNoDataWithProof(name, rrtype, newNSEC3Proof(d)) {
 		return Secure
 	}
-	if combined, ok := d.withPolicyRecords(); ok && combined.provesNoData(name, rrtype) {
+	if combined, ok := d.withPolicyRecords(); ok &&
+		combined.provesNoDataWithProof(name, rrtype, newNSEC3Proof(combined)) {
 		return Insecure
 	}
 	return Indeterminate
 }
 
 func (d Denial) provesNoData(name string, rrtype uint16) bool {
+	return d.provesNoDataWithProof(name, rrtype, newNSEC3Proof(d))
+}
+
+func (d Denial) provesNoDataWithProof(name string, rrtype uint16, proof *nsec3Proof) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			// RFC 4035 section 5.4 also permits an NSEC interval to prove
@@ -529,9 +601,12 @@ func (d Denial) provesNoData(name string, rrtype uint16) bool {
 		}
 		return true
 	}
+	hashed := proof.hash(name)
+	if hashed == "" {
+		return false
+	}
 	for _, rr := range d.NSEC3 {
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed == "" || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
+		if !proof.matches(rr) || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
 			continue
 		}
 		if rrtype == dns.TypeANY {
@@ -574,39 +649,44 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 // it into either Secure or "no proof" lets callers serve the valid response
 // without authenticating what the Opt-Out span deliberately did not prove.
 func (d Denial) WildcardNoDataStatus(name, zone string, rrtype uint16) Result {
-	status := d.wildcardNoDataStatus(name, zone, rrtype)
+	status := d.wildcardNoDataStatusWithProof(name, zone, rrtype, newNSEC3Proof(d))
 	if status != Indeterminate {
 		return status
 	}
-	if combined, ok := d.withPolicyRecords(); ok && combined.wildcardNoDataStatus(name, zone, rrtype) != Indeterminate {
+	if combined, ok := d.withPolicyRecords(); ok &&
+		combined.wildcardNoDataStatusWithProof(name, zone, rrtype, newNSEC3Proof(combined)) != Indeterminate {
 		return Insecure
 	}
 	return Indeterminate
 }
 
 func (d Denial) wildcardNoDataStatus(name, zone string, rrtype uint16) Result {
+	return d.wildcardNoDataStatusWithProof(name, zone, rrtype, newNSEC3Proof(d))
+}
+
+func (d Denial) wildcardNoDataStatusWithProof(name, zone string, rrtype uint16, proof *nsec3Proof) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
 				continue
 			}
 			closest := nsecClosestEncloser(name, rr, zone)
-			if closest != "" && d.provesNoData(wildcardName(closest), rrtype) {
+			if closest != "" && d.provesNoDataWithProof(wildcardName(closest), rrtype, proof) {
 				return Secure
 			}
 		}
 		return Indeterminate
 	}
 
-	closest, ok := d.closestEncloser(name, zone)
+	closest, ok := d.closestEncloserWithProof(name, zone, proof)
 	if !ok {
 		return Indeterminate
 	}
 	nextCloser := nextCloserName(name, closest)
-	if nextCloser == "" || !d.provesNoData(wildcardName(closest), rrtype) {
+	if nextCloser == "" || !d.provesNoDataWithProof(wildcardName(closest), rrtype, proof) {
 		return Indeterminate
 	}
-	return d.nsec3CoverageStatus(nextCloser)
+	return d.nsec3CoverageStatusWithProof(nextCloser, proof)
 }
 
 // ProvesNoDS reports whether the zone proved that name is delegated without a
@@ -627,17 +707,22 @@ func (d Denial) ProvesNoDS(name string) bool {
 // the child is insecure and RFC 5155 section 9.2 forbids authenticating the
 // response as a whole.
 func (d Denial) NoDSStatus(name string) Result {
-	status := d.noDSStatus(name)
+	status := d.noDSStatusWithProof(name, newNSEC3Proof(d))
 	if status != Indeterminate {
 		return status
 	}
-	if combined, ok := d.withPolicyRecords(); ok && combined.noDSStatus(name) != Indeterminate {
+	if combined, ok := d.withPolicyRecords(); ok &&
+		combined.noDSStatusWithProof(name, newNSEC3Proof(combined)) != Indeterminate {
 		return Insecure
 	}
 	return Indeterminate
 }
 
 func (d Denial) noDSStatus(name string) Result {
+	return d.noDSStatusWithProof(name, newNSEC3Proof(d))
+}
+
+func (d Denial) noDSStatusWithProof(name string, proof *nsec3Proof) Result {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			continue
@@ -650,9 +735,9 @@ func (d Denial) noDSStatus(name string) Result {
 		}
 		return Indeterminate
 	}
+	hashed := proof.hash(name)
 	for _, rr := range d.NSEC3 {
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed == "" {
+		if hashed == "" || !proof.matches(rr) {
 			continue
 		}
 		if hashed == strings.ToUpper(firstLabel(rr.Header().Name)) {
@@ -669,15 +754,15 @@ func (d Denial) noDSStatus(name string) Result {
 	// 8.6 and 8.9 require a full closest-provable-encloser proof, and require
 	// its next-closer span to carry Opt-Out. Without the matching encloser, a
 	// signed interval elsewhere in the hash ring says nothing about this cut.
-	if d.zone == "" || d.HasMixedNSEC3Parameters() {
+	if d.zone == "" || hashed == "" {
 		return Indeterminate
 	}
-	closest, ok := d.closestEncloser(name, d.zone)
+	closest, ok := d.closestEncloserWithProof(name, d.zone, proof)
 	if !ok {
 		return Indeterminate
 	}
 	nextCloser := nextCloserName(name, closest)
-	if nextCloser != "" && d.nsec3CoverageStatus(nextCloser) == Insecure {
+	if nextCloser != "" && d.nsec3CoverageStatusWithProof(nextCloser, proof) == Insecure {
 		return Insecure
 	}
 	return Indeterminate
@@ -700,17 +785,22 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 // the next-closer span may hide an unsigned delegation, so RFC 5155 section
 // 9.2 explicitly says the response MUST NOT carry AD.
 func (d Denial) NameErrorStatus(name, zone string) Result {
-	status := d.nameErrorStatus(name, zone)
+	status := d.nameErrorStatusWithProof(name, zone, newNSEC3Proof(d))
 	if status != Indeterminate {
 		return status
 	}
-	if combined, ok := d.withPolicyRecords(); ok && combined.nameErrorStatus(name, zone) != Indeterminate {
+	if combined, ok := d.withPolicyRecords(); ok &&
+		combined.nameErrorStatusWithProof(name, zone, newNSEC3Proof(combined)) != Indeterminate {
 		return Insecure
 	}
 	return Indeterminate
 }
 
 func (d Denial) nameErrorStatus(name, zone string) Result {
+	return d.nameErrorStatusWithProof(name, zone, newNSEC3Proof(d))
+}
+
+func (d Denial) nameErrorStatusWithProof(name, zone string, proof *nsec3Proof) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
@@ -733,7 +823,7 @@ func (d Denial) nameErrorStatus(name, zone string) Result {
 	// NSEC3 proves it in three parts: the deepest ancestor that does exist, the
 	// absence of the next label down from it, and the absence of a wildcard at
 	// that ancestor.
-	closest, ok := d.closestEncloser(name, zone)
+	closest, ok := d.closestEncloserWithProof(name, zone, proof)
 	if !ok {
 		return Indeterminate
 	}
@@ -741,8 +831,8 @@ func (d Denial) nameErrorStatus(name, zone string) Result {
 	if nextCloser == "" {
 		return Indeterminate
 	}
-	status := d.nsec3CoverageStatus(nextCloser)
-	if status == Indeterminate || !d.covered(wildcardName(closest)) {
+	status := d.nsec3CoverageStatusWithProof(nextCloser, proof)
+	if status == Indeterminate || !d.coveredWithProof(wildcardName(closest), proof) {
 		return Indeterminate
 	}
 	return status
@@ -832,12 +922,19 @@ func (d Denial) nsecMayProveAbsence(rr *dns.NSEC, name string) bool {
 // closestEncloser finds the deepest ancestor of name that the zone has a
 // matching record for.
 func (d Denial) closestEncloser(name, zone string) (string, bool) {
+	return d.closestEncloserWithProof(name, zone, newNSEC3Proof(d))
+}
+
+func (d Denial) closestEncloserWithProof(name, zone string, proof *nsec3Proof) (string, bool) {
 	candidate := canonicalName(name)
 	zone = canonicalName(zone)
 	for {
+		hashed := proof.hash(candidate)
+		if hashed == "" {
+			return "", false
+		}
 		for _, rr := range d.NSEC3 {
-			hashed := NSEC3Hash(candidate, rr.Hash, rr.Iterations, rr.Salt)
-			if hashed != "" && hashed == strings.ToUpper(firstLabel(rr.Header().Name)) {
+			if proof.matches(rr) && hashed == strings.ToUpper(firstLabel(rr.Header().Name)) {
 				// RFC 5155 section 8.3 requires the closest-encloser record
 				// to be authoritative for this zone: a DNAME cannot be used,
 				// and NS is acceptable only together with SOA at the apex.
@@ -861,9 +958,16 @@ func (d Denial) closestEncloser(name, zone string) (string, bool) {
 
 // covered reports whether some NSEC3 covers the gap containing name.
 func (d Denial) covered(name string) bool {
+	return d.coveredWithProof(name, newNSEC3Proof(d))
+}
+
+func (d Denial) coveredWithProof(name string, proof *nsec3Proof) bool {
+	hashed := proof.hash(name)
+	if hashed == "" {
+		return false
+	}
 	for _, rr := range d.NSEC3 {
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed != "" && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
+		if proof.matches(rr) && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsenceWithProof(rr, name, proof) {
 			return true
 		}
 	}
@@ -876,13 +980,18 @@ func (d Denial) covered(name string) bool {
 // that proof establishes absence without the delegation ambiguity Opt-Out
 // intentionally creates.
 func (d Denial) nsec3CoverageStatus(name string) Result {
-	if d.HasMixedNSEC3Parameters() {
+	return d.nsec3CoverageStatusWithProof(name, newNSEC3Proof(d))
+}
+
+func (d Denial) nsec3CoverageStatusWithProof(name string, proof *nsec3Proof) Result {
+	hashed := proof.hash(name)
+	if hashed == "" {
 		return Indeterminate
 	}
 	optOut := false
 	for _, rr := range d.NSEC3 {
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed == "" || !nsec3Covers(rr, hashed) || !d.nsec3MayProveAbsence(rr, name) {
+		if !proof.matches(rr) || !nsec3Covers(rr, hashed) ||
+			!d.nsec3MayProveAbsenceWithProof(rr, name, proof) {
 			continue
 		}
 		if rr.Flags&1 == 0 {
@@ -991,16 +1100,21 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 // NotADelegationStatus distinguishes a fully authenticated proof from one
 // whose necessary RRsets use only a policy-disabled signing algorithm.
 func (d Denial) NotADelegationStatus(name string) Result {
-	if d.provesNotADelegation(name) {
+	if d.provesNotADelegationWithProof(name, newNSEC3Proof(d)) {
 		return Secure
 	}
-	if combined, ok := d.withPolicyRecords(); ok && combined.provesNotADelegation(name) {
+	if combined, ok := d.withPolicyRecords(); ok &&
+		combined.provesNotADelegationWithProof(name, newNSEC3Proof(combined)) {
 		return Insecure
 	}
 	return Indeterminate
 }
 
 func (d Denial) provesNotADelegation(name string) bool {
+	return d.provesNotADelegationWithProof(name, newNSEC3Proof(d))
+}
+
+func (d Denial) provesNotADelegationWithProof(name string, proof *nsec3Proof) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			if d.nsecMayProveAbsence(rr, name) {
@@ -1015,16 +1129,16 @@ func (d Denial) provesNotADelegation(name string) bool {
 		}
 		return true
 	}
+	hashed := proof.hash(name)
 	for _, rr := range d.NSEC3 {
-		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
-		if hashed == "" {
+		if hashed == "" || !proof.matches(rr) {
 			continue
 		}
 		if hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
 			// RFC 5155 section 8.9 permits an NSEC3 span to hide an unsigned
 			// delegation only with Opt-Out. Without that bit, a covered name is
 			// known not to be a zone cut.
-			if rr.Flags == 0 && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsence(rr, name) {
+			if rr.Flags == 0 && nsec3Covers(rr, hashed) && d.nsec3MayProveAbsenceWithProof(rr, name, proof) {
 				return true
 			}
 			continue
@@ -1044,7 +1158,8 @@ func (d Denial) provesNotADelegation(name string) bool {
 	// that name would have stopped wildcard synthesis, so this is positive
 	// evidence that the name is not a zone cut. RFC 5155 section 8.7 requires
 	// the closest-encloser and wildcard proofs used here.
-	return d.zone != "" && d.wildcardNoDataStatus(name, d.zone, dns.TypeDS) == Secure
+	return d.zone != "" &&
+		d.wildcardNoDataStatusWithProof(name, d.zone, dns.TypeDS, proof) == Secure
 }
 
 // nsec3MayProveAbsence is the NSEC3 form of the RFC 6840 section 4.1 guard.
@@ -1053,6 +1168,13 @@ func (d Denial) provesNotADelegation(name string) bool {
 // DNAME or delegation bitmap belongs to an ancestor rather than an unrelated
 // point in the hash ring.
 func (d Denial) nsec3MayProveAbsence(rr *dns.NSEC3, name string) bool {
+	return d.nsec3MayProveAbsenceWithProof(rr, name, newNSEC3Proof(d))
+}
+
+func (d Denial) nsec3MayProveAbsenceWithProof(rr *dns.NSEC3, name string, proof *nsec3Proof) bool {
+	if !proof.matches(rr) {
+		return false
+	}
 	if !coversType(rr.TypeBitMap, dns.TypeDNAME) &&
 		!(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
 		return true
@@ -1064,7 +1186,11 @@ func (d Denial) nsec3MayProveAbsence(rr *dns.NSEC3, name string) bool {
 	candidate := canonicalName(name)
 	owner := strings.ToUpper(firstLabel(rr.Header().Name))
 	for {
-		if NSEC3Hash(candidate, rr.Hash, rr.Iterations, rr.Salt) == owner {
+		hashed := proof.hash(candidate)
+		if hashed == "" {
+			return false
+		}
+		if hashed == owner {
 			return false
 		}
 		if canonicalCompare(candidate, zone) == 0 {

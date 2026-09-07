@@ -190,13 +190,6 @@ func compare(a, b RR) int {
 }
 
 func (rr *NULL) compare(b RR) (x int) {
-	x = len(rr.Null) - len(b.(*NULL).Null)
-	if x != 0 {
-		if x < 0 {
-			return -1
-		}
-		return 1
-	}
 	x = strings.Compare(rr.Null, b.(*NULL).Null)
 	if x != 0 {
 		if x < 0 {
@@ -1317,13 +1310,6 @@ func (rr *URI) compare(b RR) (x int) {
 		}
 		return 1
 	}
-	x = len(rr.Target) - len(b.(*URI).Target)
-	if x != 0 {
-		if x < 0 {
-			return -1
-		}
-		return 1
-	}
 	x = strings.Compare(rr.Target, b.(*URI).Target)
 	if x != 0 {
 		if x < 0 {
@@ -1579,13 +1565,6 @@ func (rr *CAA) compare(b RR) (x int) {
 		return 1
 	}
 	x = strings.Compare(rr.Tag, b.(*CAA).Tag)
-	if x != 0 {
-		if x < 0 {
-			return -1
-		}
-		return 1
-	}
-	x = len(rr.Value) - len(b.(*CAA).Value)
 	if x != 0 {
 		if x < 0 {
 			return -1

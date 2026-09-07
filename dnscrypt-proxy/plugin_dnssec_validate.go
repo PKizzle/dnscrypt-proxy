@@ -274,6 +274,12 @@ func retryDNSSECUpstreamSERVFAIL(
 			returnCode = PluginsReturnCodePass
 		case dns.RcodeNameError:
 			returnCode = PluginsReturnCodeNXDomain
+		case dns.RcodeYXDomain:
+			// RFC 6672 section 3.2 uses YXDOMAIN for a DNAME
+			// substitution that exceeds the DNS wire-name limit. Preserve it
+			// for the ordinary validator instead of discarding a potentially
+			// authenticated recovery response with the other error RCODEs.
+			returnCode = PluginsReturnCodeResponseError
 		default:
 			continue
 		}
@@ -355,7 +361,8 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	// upstream's to vouch for. An unrecovered upstream SERVFAIL also carries no
 	// data that this validator can judge.
 	if pluginsState.returnCode != PluginsReturnCodePass &&
-		pluginsState.returnCode != PluginsReturnCodeNXDomain {
+		pluginsState.returnCode != PluginsReturnCodeNXDomain &&
+		!(pluginsState.returnCode == PluginsReturnCodeResponseError && msg.Rcode == dns.RcodeYXDomain) {
 		return nil
 	}
 
@@ -524,6 +531,11 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		worstErr = errDNSSECRRSIGNotAuthenticated
 	}
 	sets := dnssec.GroupRRSets(msg.Answer)
+	if msg.Rcode == dns.RcodeYXDomain {
+		if err := validateDNAMEOverflowShape(qName, msg.Question[0].Header().Class, sets); err != nil {
+			return dnssec.Bogus, err
+		}
+	}
 	dnames := make([]validatedDNAME, 0)
 
 	// RFC 4035 section 3.2.3 permits an unsigned CNAME only when it is
@@ -581,6 +593,15 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 				worst, worstErr = res, err
 			}
 		}
+	}
+
+	// RFC 6672 section 3.2 defines an overflowing DNAME substitution as a
+	// positive, authenticated YXDOMAIN response. validateDNAMEOverflowShape
+	// already bound the error to this question and an actually overflowing
+	// substitution; all Answer RRsets, including that DNAME and any preceding
+	// CNAME chain, have now passed their ordinary signature checks.
+	if msg.Rcode == dns.RcodeYXDomain {
+		return worst, worstErr
 	}
 
 	// Authentication of the bytes in the Answer section is necessary but not
@@ -962,21 +983,89 @@ func synthesizedCNAMEFromDNAME(set dnssec.RRSet, dnames []validatedDNAME) (dnsse
 }
 
 func dnameSynthesizesCNAME(dname *dns.DNAME, cname *dns.CNAME) bool {
-	if !dnameAppliesToName(dname, cname.Header().Name) {
+	if dname.Header().Class != cname.Header().Class {
 		return false
+	}
+	expected, ok := dnameSubstitutedName(dname, cname.Header().Name)
+	if !ok {
+		return false
+	}
+	return sameDNSName(cname.Target, expected)
+}
+
+// validateDNAMEOverflowShape ties a YXDOMAIN response to the question before
+// signatures are fetched.  A signed DNAME is replayable data; it proves this
+// error only if following the response's CNAME chain reaches a name to which
+// that DNAME applies and the specified substitution exceeds DNS's 255-octet
+// wire-name limit.
+func validateDNAMEOverflowShape(qName string, qclass uint16, sets []dnssec.RRSet) error {
+	terminal, _, err := cnameChainTerminal(qName, sets)
+	if err != nil {
+		return err
+	}
+	for _, set := range sets {
+		if set.Type != dns.TypeDNAME {
+			continue
+		}
+		for _, rr := range set.Records {
+			dname, ok := rr.(*dns.DNAME)
+			if ok && dname.Header().Class == qclass && dnameSubstitutionOverflows(dname, terminal) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("YXDOMAIN for %s has no overflowing DNAME substitution", qName)
+}
+
+func dnameSubstitutionOverflows(dname *dns.DNAME, name string) bool {
+	substituted, ok := dnameSubstitutedName(dname, name)
+	if !ok {
+		return false
+	}
+	length, validLabels := dnsNameWireLength(substituted)
+	return validLabels && length > 255
+}
+
+// dnameSubstitutedName performs the suffix replacement from RFC 6672 section
+// 2.2. In particular, a root target removes the DNAME owner while retaining
+// every unmatched label to its left.
+func dnameSubstitutedName(dname *dns.DNAME, name string) (string, bool) {
+	if !dnameAppliesToName(dname, name) {
+		return "", false
 	}
 	ownerName := strings.TrimSuffix(strings.ToLower(dname.Header().Name), ".")
 	ownerLabels := strings.Split(ownerName, ".")
-	cnameName := strings.TrimSuffix(strings.ToLower(cname.Header().Name), ".")
-	cnameLabels := strings.Split(cnameName, ".")
-	prefix := cnameLabels[:len(cnameLabels)-len(ownerLabels)]
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	nameLabels := strings.Split(name, ".")
+	prefix := nameLabels[:len(nameLabels)-len(ownerLabels)]
 	target := strings.TrimSuffix(strings.ToLower(dname.Target), ".")
-	expectedLabels := append(prefix, strings.Split(target, ".")...)
-	expected := "."
+	expectedLabels := append([]string(nil), prefix...)
 	if target != "" {
+		expectedLabels = append(expectedLabels, strings.Split(target, ".")...)
+	}
+	expected := "."
+	if len(expectedLabels) != 0 {
 		expected = strings.Join(expectedLabels, ".") + "."
 	}
-	return dns.EqualName(cname.Target, expected)
+	return expected, true
+}
+
+// dnsNameWireLength returns the uncompressed DNS wire length of a fully
+// qualified name. The vendored DNS package intentionally does not support
+// presentation-format escapes, so every byte between dots is one label byte.
+func dnsNameWireLength(name string) (int, bool) {
+	name = strings.TrimSuffix(name, ".")
+	if name == "" {
+		return 1, true
+	}
+	length := 1 // terminating root label
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return 0, false
+		}
+		length += 1 + len(label)
+	}
+	return length, true
 }
 
 func dnameAppliesToName(dname *dns.DNAME, name string) bool {
@@ -1066,87 +1155,78 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 		return dnssec.Indeterminate, owner.Why
 	}
 
-	var lastErr error
-	var policyInsecureErr error
-	var conclusiveBogusErr error
-	missingUsableSignature := false
+	zoneSigs := make([]*dns.RRSIG, 0, len(set.Sigs))
+	var signerErr error
 	for _, sig := range set.Sigs {
 		if !dns.EqualName(owner.Zone, sig.SignerName) {
-			lastErr = fmt.Errorf("%s belongs to %s, not %s", set.Name, owner.Zone, sig.SignerName)
+			signerErr = fmt.Errorf("%s belongs to %s, not %s", set.Name, owner.Zone, sig.SignerName)
 			continue
 		}
-		res, verified, err := dnssec.VerifyRRSetDetail(set.Records, []*dns.RRSIG{sig}, owner.Keys, now)
-		if res == dnssec.Secure {
-			// RFC 4035 section 5.3.3: a signature made over a wildcard verifies
-			// for every name beneath it, so it is evidence that the wildcard
-			// exists rather than that it was the right answer here. The zone
-			// has to have shown that nothing closer to the name does exist.
-			if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
-				if set.Type == dns.TypeDNAME && dns.RRToType(msg.Question[0]) != dns.TypeDNAME {
-					// RFC 4592 section 4.4 and RFC 6672 sections 3.3 and 8:
-					// wildcard-synthesized DNAME rewrite rules are
-					// non-deterministic across caches, while their generated CNAME
-					// has no signature of its own. Unbound rejects the same shape.
-					// A literal QTYPE=DNAME query remains allowed because it asks
-					// for the authenticated DNAME RRset rather than following it.
-					return dnssec.Bogus, fmt.Errorf("wildcard-synthesized DNAME %s cannot be used for redirection", set.Name)
-				}
-				denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
-				if denial.HasMixedNSEC3Parameters() {
-					return dnssec.Bogus, fmt.Errorf(
-						"%w: wildcard proof for %s mixes NSEC3 parameter chains",
-						errDNSSECIncompleteEvidence, set.Name)
-				}
-				switch proof := denial.NoCloserMatchStatus(nextCloser); proof {
-				case dnssec.Secure:
-				case dnssec.Insecure:
-					return dnssec.Insecure, fmt.Errorf(
-						"%s wildcard proof for %s uses NSEC3 Opt-Out", set.Name, nextCloser)
-				default:
-					if denial.HasOnlyUnsupportedNSEC3Iterations() {
-						return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
-					}
-					return dnssec.Bogus, fmt.Errorf(
-						"%s was answered from a wildcard in %s with no proof that %s does not exist",
-						set.Name, owner.Zone, nextCloser)
-				}
+		zoneSigs = append(zoneSigs, sig)
+	}
+	if len(zoneSigs) == 0 {
+		if signerErr == nil {
+			signerErr = fmt.Errorf("no signature over %s could be checked", set.Name)
+		}
+		return dnssec.Bogus, signerErr
+	}
+
+	res, verified, err := dnssec.VerifyRRSetDetail(set.Records, zoneSigs, owner.Keys, now)
+	switch res {
+	case dnssec.Secure:
+		// RFC 4035 section 5.3.3: a signature made over a wildcard verifies
+		// for every name beneath it, so it is evidence that the wildcard
+		// exists rather than that it was the right answer here. The zone
+		// has to have shown that nothing closer to the name does exist.
+		if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
+			if set.Type == dns.TypeDNAME && dns.RRToType(msg.Question[0]) != dns.TypeDNAME {
+				// RFC 4592 section 4.4 and RFC 6672 sections 3.3 and 8:
+				// wildcard-synthesized DNAME rewrite rules are
+				// non-deterministic across caches, while their generated CNAME
+				// has no signature of its own. Unbound rejects the same shape.
+				// A literal QTYPE=DNAME query remains allowed because it asks
+				// for the authenticated DNAME RRset rather than following it.
+				return dnssec.Bogus, fmt.Errorf("wildcard-synthesized DNAME %s cannot be used for redirection", set.Name)
 			}
-			return dnssec.Secure, nil
+			denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
+			if denial.HasMixedNSEC3Parameters() {
+				return dnssec.Bogus, fmt.Errorf(
+					"%w: wildcard proof for %s mixes NSEC3 parameter chains",
+					errDNSSECIncompleteEvidence, set.Name)
+			}
+			switch proof := denial.NoCloserMatchStatus(nextCloser); proof {
+			case dnssec.Secure:
+			case dnssec.Insecure:
+				return dnssec.Insecure, fmt.Errorf(
+					"%s wildcard proof for %s uses NSEC3 Opt-Out", set.Name, nextCloser)
+			default:
+				if denial.HasOnlyUnsupportedNSEC3Iterations() {
+					return dnssec.Indeterminate, dnssec.ErrUnsupportedNSEC3Iterations
+				}
+				return dnssec.Bogus, fmt.Errorf(
+					"%s was answered from a wildcard in %s with no proof that %s does not exist",
+					set.Name, owner.Zone, nextCloser)
+			}
 		}
-		if res == dnssec.Insecure {
-			// RFC 9905 section 2: a corresponding DNSKEY exists, but this
-			// RRset relies only on a signing algorithm disabled by operator
-			// policy. Preserve Insecure so enforce mode does not turn an
-			// explicit algorithm-policy downgrade into SERVFAIL. A later valid
-			// accepted signature can still return Secure above.
-			policyInsecureErr = err
-			continue
-		}
-		if res == dnssec.Bogus {
-			conclusiveBogusErr = err
-		} else if errors.Is(err, dnssec.ErrNoSignature) {
-			// RFC 6840 section 5.12 made an unknown-key RRSIG disappear
-			// from the validation input. In a securely authenticated zone the
-			// RRset is therefore Bogus, just like an omitted RRSIG, but another
-			// recursive upstream may have the current rollover material.
-			missingUsableSignature = true
-		}
-		lastErr = err
+		return dnssec.Secure, nil
+	case dnssec.Insecure:
+		// RFC 9905 section 2: a corresponding DNSKEY exists, but this
+		// RRset relies only on a signing algorithm disabled by operator
+		// policy. Preserve Insecure so enforce mode does not turn an
+		// explicit algorithm-policy downgrade into SERVFAIL.
+		return dnssec.Insecure, err
+	case dnssec.Bogus:
+		return dnssec.Bogus, err
 	}
-	if policyInsecureErr != nil {
-		return dnssec.Insecure, policyInsecureErr
-	}
-	if conclusiveBogusErr != nil {
-		return dnssec.Bogus, conclusiveBogusErr
-	}
-	if missingUsableSignature {
+	if errors.Is(err, dnssec.ErrNoSignature) {
+		// RFC 6840 section 5.12 made unknown-key RRSIGs disappear from
+		// validation. In a securely authenticated zone this is Bogus like an
+		// omitted RRSIG, but another recursive upstream may have current
+		// rollover material, so retain the incomplete-evidence marker.
 		return dnssec.Bogus, fmt.Errorf("%w: no usable signature over %s matches the authenticated DNSKEY set",
 			errDNSSECIncompleteEvidence, set.Name)
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no signature over %s could be checked", set.Name)
-	}
-	return dnssec.Bogus, lastErr
+	return dnssec.Bogus, err
 }
 
 // signedSetIsDefinitelyBogus recognizes a failed signature even when a

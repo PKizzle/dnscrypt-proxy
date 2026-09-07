@@ -1,6 +1,7 @@
 package dnssec
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -458,6 +459,64 @@ func TestNSEC3HashRefusesAnUnknownAlgorithm(t *testing.T) {
 func TestNSEC3HashRefusesAnOddLengthSalt(t *testing.T) {
 	if got := NSEC3Hash("a.example.", 1, 0, "a"); got != "" {
 		t.Errorf("NSEC3Hash() with an odd-length salt = %q, want empty", got)
+	}
+}
+
+func TestNSEC3ProofHashesEachCandidateOnlyOnce(t *testing.T) {
+	const (
+		name = "x.d.example.test."
+		zone = "example.test."
+	)
+	ancestorHash := NSEC3Hash("d.example.test.", 1, 100, "A0")
+	record := nsec3(ancestorHash, ancestorHash, 0, dns.TypeDNAME, dns.TypeNSEC3, dns.TypeRRSIG)
+	record.Iterations = 100
+	record.Salt = "A0"
+
+	// Repeating an authenticated NSEC3 RRset must add only cheap comparisons,
+	// not another 101 SHA-1 operations per record and per ancestor. This is the
+	// CVE-2023-50868 shape: response cardinality must not multiply hash work.
+	records := make([]*dns.NSEC3, 512)
+	for i := range records {
+		records[i] = record
+	}
+	d := Denial{NSEC3: records, zone: zone}
+	proof := newNSEC3Proof(d)
+	if got := d.nsec3CoverageStatusWithProof(name, proof); got != Indeterminate {
+		t.Fatalf("ancestor DNAME coverage status = %v, want indeterminate", got)
+	}
+	// name and d.example.test.: the same two hashes are reused for all 512
+	// records, and the matching DNAME ancestor ends the search.
+	if got, want := proof.calculations, 2; got != want {
+		t.Fatalf("NSEC3 calculations = %d, want %d", got, want)
+	}
+}
+
+func TestNSEC3ProofRejectsMixedParametersBeforeHashing(t *testing.T) {
+	first := nsec3("AAAA", "BBBB", 0, dns.TypeNSEC3, dns.TypeRRSIG)
+	second := nsec3("CCCC", "DDDD", 0, dns.TypeNSEC3, dns.TypeRRSIG)
+	second.Salt = "A0"
+	proof := newNSEC3Proof(Denial{NSEC3: []*dns.NSEC3{first, second}})
+	if got := proof.hash("example.test."); got != "" {
+		t.Fatalf("mixed-chain hash = %q, want empty", got)
+	}
+	if proof.calculations != 0 {
+		t.Fatalf("mixed-chain calculations = %d, want 0", proof.calculations)
+	}
+}
+
+func TestNSEC3ProofCalculationLimitIsAboveAnyLegalDNSName(t *testing.T) {
+	rr := nsec3("AAAA", "BBBB", 0, dns.TypeNSEC3, dns.TypeRRSIG)
+	proof := newNSEC3Proof(Denial{NSEC3: []*dns.NSEC3{rr}})
+	for i := 0; i < maxNSEC3Calculations; i++ {
+		if got := proof.hash(fmt.Sprintf("label-%03d.example.test.", i)); got == "" {
+			t.Fatalf("calculation %d was refused before the limit", i+1)
+		}
+	}
+	if got := proof.hash("one-too-many.example.test."); got != "" {
+		t.Fatalf("hash beyond calculation limit = %q, want empty", got)
+	}
+	if !proof.exhausted {
+		t.Fatal("proof did not record exhaustion")
 	}
 }
 

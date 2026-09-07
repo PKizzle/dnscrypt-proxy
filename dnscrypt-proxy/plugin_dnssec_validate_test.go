@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -395,6 +396,39 @@ func TestDNSSECUpstreamSERVFAILRetriesDistinctResolvers(t *testing.T) {
 	}
 	if original.Rcode != dns.RcodeSuccess || len(original.Answer) != 1 || dns.RRToType(original.Answer[0]) != dns.TypeRRSIG {
 		t.Fatalf("retry did not install the successful response: %#v", original)
+	}
+}
+
+func TestDNSSECUpstreamSERVFAILCanRecoverWithDNAMEOverflowYXDOMAIN(t *testing.T) {
+	original := dns.NewMsg("too-long.example.", dns.TypeA)
+	original.ID = 1234
+	original.Response = true
+	original.Rcode = dns.RcodeServerFailure
+	if err := original.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := dns.NewMsg("too-long.example.", dns.TypeA)
+	recovered.Response = true
+	recovered.Rcode = dns.RcodeYXDomain
+	if err := recovered.Pack(); err != nil {
+		t.Fatal(err)
+	}
+
+	returnCode, serverName, ok := retryDNSSECUpstreamSERVFAIL(
+		original,
+		"too-long.example.",
+		dns.TypeA,
+		"first",
+		func(string, uint16, map[string]struct{}) (*dns.Msg, string, error) {
+			return recovered, "second", nil
+		},
+	)
+	if !ok || returnCode != PluginsReturnCodeResponseError {
+		t.Fatalf("retry result = (%v, %v), want RESPONSE_ERROR/recovered", returnCode, ok)
+	}
+	if serverName != "second" || original.Rcode != dns.RcodeYXDomain {
+		t.Fatalf("recovered response = server %q rcode %d, want second/YXDOMAIN", serverName, original.Rcode)
 	}
 }
 
@@ -875,6 +909,45 @@ func TestValidatorRejectsAParentSignatureBelowADelegation(t *testing.T) {
 	}
 }
 
+func TestValidatorBoundsSignatureChecksAcrossAnRRSet(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	soa := &dns.SOA{
+		Hdr: dns.Header{Name: ".", Class: dns.ClassINET, TTL: 300},
+		SOA: rdata.SOA{
+			Ns:      "a.root-servers.net.",
+			Mbox:    "hostmaster.root.",
+			Refresh: 3600,
+			Retry:   600,
+			Expire:  86400,
+			Minttl:  300,
+		},
+	}
+	valid := root.sign([]dns.RR{soa}, now)
+	answer := []dns.RR{soa}
+	for range 8 {
+		bad := *valid
+		bad.Signature = base64.StdEncoding.EncodeToString([]byte{0})
+		answer = append(answer, &bad)
+	}
+	answer = append(answer, valid)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		if qname == "." && qtype == dns.TypeDNSKEY {
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	msg := testDNSMessage(dns.RcodeSuccess, answer, nil)
+	msg.Question = []dns.RR{&dns.SOA{Hdr: dns.Header{Name: ".", Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, ".")
+	if result != dnssec.Bogus || why == nil || !strings.Contains(why.Error(), "too many") {
+		t.Fatalf("validator result = %v (%v), want Bogus/too-many-validations", result, why)
+	}
+}
+
 // RFC 4035 sections 3.2.3 and 5.5 require AD to cover the answer to the
 // question, not merely some authentic RRset that happens to be in the Answer
 // section. A recursive upstream (or an attacker replaying its signed data)
@@ -1197,6 +1270,188 @@ func TestValidatorAcceptsOnlyCNAMEsSynthesizedByASecureDNAME(t *testing.T) {
 			}
 		})
 	}
+}
+
+// RFC 6672 section 2.2, Table 1: replacing a DNAME owner with the root
+// retains the unmatched labels.  In the RFC's example, shortloop.x.x. under
+// "x. DNAME ." becomes shortloop.x., not the root itself.
+func TestDNAMEToRootRetainsTheUnmatchedPrefix(t *testing.T) {
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: "."},
+	}
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "shortloop.x.x.", Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: "shortloop.x."},
+	}
+	if !dnameSynthesizesCNAME(dname, cname) {
+		t.Fatal("valid DNAME-to-root synthesis was rejected")
+	}
+}
+
+// RFC 4035 section 5.3.1 binds validation to the RRset class.  The unsigned
+// CNAME exception for DNAME synthesis must not let a CNAME from another class
+// inherit the authenticated DNAME's security status.
+func TestDNAMESynthesisRejectsACNAMEFromAnotherClass(t *testing.T) {
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "foo.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: "bar."},
+	}
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "www.foo.", Class: dns.ClassCHAOS, TTL: 300},
+		CNAME: rdata.CNAME{Target: "www.bar."},
+	}
+	if dnameSynthesizesCNAME(dname, cname) {
+		t.Fatal("DNAME synthesis accepted a CNAME from another DNS class")
+	}
+}
+
+// RFC 6672 sections 2.2 and 3.2 require YXDOMAIN when replacing a DNAME
+// owner would produce a domain name longer than 255 wire octets.  The signed
+// DNAME is the proof for that response, so a validator must authenticate it
+// rather than skipping the non-NOERROR/NXDOMAIN RCODE.
+func TestValidatorAuthenticatesDNAMEOverflowYXDOMAIN(t *testing.T) {
+	now := time.Now()
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: longDNAMETarget()},
+	}
+	plugin, dnameSig := rootDNAMEValidator(t, dname, now)
+	qname := strings.Repeat("p", 20) + ".x."
+	msg := testDNSMessage(dns.RcodeYXDomain, []dns.RR{dname, dnameSig}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: qname, Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, qname)
+	if result != dnssec.Secure {
+		t.Fatalf("DNAME overflow YXDOMAIN = %v (%v), want secure", result, why)
+	}
+
+	// ApplyResponsePlugins classifies every non-NOERROR/NXDOMAIN/SERVFAIL
+	// RCODE as RESPONSE_ERROR. Eval must deliberately admit YXDOMAIN from that
+	// category or the successful judge result above is unreachable in service.
+	plugin.mode = ValidationEnforce
+	state := PluginsState{
+		qName:       qname,
+		returnCode:  PluginsReturnCodeResponseError,
+		sessionData: map[string]any{},
+		questionMsg: dns.NewMsg(qname, dns.TypeA),
+	}
+	if err := plugin.Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if got := state.sessionData[dnssecVerdictKey]; got != "secure" {
+		t.Fatalf("YXDOMAIN verdict = %v, want secure", got)
+	}
+	if !msg.AuthenticatedData {
+		t.Fatal("authenticated DNAME-overflow YXDOMAIN did not receive AD")
+	}
+	if state.action == PluginsActionReject || state.returnCode == PluginsReturnCodeServFail {
+		t.Fatal("authenticated DNAME-overflow YXDOMAIN was rejected in enforce mode")
+	}
+}
+
+// A signed DNAME authenticates YXDOMAIN only when the substitution really
+// overflows.  Otherwise an attacker could replay any signed DNAME to forge an
+// authenticated error response.
+func TestValidatorRejectsYXDOMAINWithoutDNAMEOverflow(t *testing.T) {
+	now := time.Now()
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: longDNAMETarget()},
+	}
+	plugin, dnameSig := rootDNAMEValidator(t, dname, now)
+	qname := "short.x."
+	msg := testDNSMessage(dns.RcodeYXDomain, []dns.RR{dname, dnameSig}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: qname, Class: dns.ClassINET}}}
+
+	result, _ := plugin.judge(msg, qname)
+	if result != dnssec.Bogus {
+		t.Fatalf("non-overflow YXDOMAIN = %v, want bogus", result)
+	}
+
+	plugin.mode = ValidationEnforce
+	state := PluginsState{
+		qName:       qname,
+		returnCode:  PluginsReturnCodeResponseError,
+		sessionData: map[string]any{},
+		questionMsg: dns.NewMsg(qname, dns.TypeA),
+	}
+	if err := plugin.Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if got := state.sessionData[dnssecVerdictKey]; got != "bogus" {
+		t.Fatalf("non-overflow YXDOMAIN verdict = %v, want bogus", got)
+	}
+	if state.action != PluginsActionReject || state.returnCode != PluginsReturnCodeServFail {
+		t.Fatal("non-overflow YXDOMAIN was not rejected in enforce mode")
+	}
+}
+
+func TestDNAMEOverflowHonorsThe255OctetBoundary(t *testing.T) {
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: longDNAMETarget()},
+	}
+	for _, tc := range []struct {
+		prefixLength int
+		wantOverflow bool
+	}{
+		{prefixLength: 9, wantOverflow: false}, // exactly 255 wire octets
+		{prefixLength: 10, wantOverflow: true}, // 256 wire octets
+	} {
+		qname := strings.Repeat("p", tc.prefixLength) + ".x."
+		if got := dnameSubstitutionOverflows(dname, qname); got != tc.wantOverflow {
+			t.Errorf("overflow for %s = %v, want %v", qname, got, tc.wantOverflow)
+		}
+	}
+}
+
+func TestDNAMEOverflowFollowsThePrecedingCNAMEChain(t *testing.T) {
+	dname := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: longDNAMETarget()},
+	}
+	cname := &dns.CNAME{
+		Hdr:   dns.Header{Name: "alias.", Class: dns.ClassINET, TTL: 300},
+		CNAME: rdata.CNAME{Target: strings.Repeat("p", 20) + ".x."},
+	}
+	sets := dnssec.GroupRRSets([]dns.RR{cname, dname})
+	if err := validateDNAMEOverflowShape("alias.", dns.ClassINET, sets); err != nil {
+		t.Fatalf("CNAME-to-DNAME overflow was rejected: %v", err)
+	}
+	if err := validateDNAMEOverflowShape("unrelated.", dns.ClassINET, sets); err == nil {
+		t.Fatal("an unrelated question inherited another CNAME chain's DNAME overflow")
+	}
+}
+
+func longDNAMETarget() string {
+	label := strings.Repeat("a", 60)
+	return strings.Join([]string{label, label, label, label}, ".") + "."
+}
+
+func rootDNAMEValidator(t *testing.T, dname *dns.DNAME, now time.Time) (*PluginDNSSECValidate, *dns.RRSIG) {
+	t.Helper()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	dnameSig := root.sign([]dns.RR{dname}, now)
+	notADelegation := &dns.NSEC{
+		Hdr:  dns.Header{Name: dname.Header().Name, Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "z.", TypeBitMap: []uint16{dns.TypeDNAME, dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	notADelegationSig := root.sign([]dns.RR{notADelegation}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == dname.Header().Name:
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{notADelegation, notADelegationSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	return &PluginDNSSECValidate{
+		fetcher: fetcher,
+		anchors: []*dns.DS{root.key.ToDS(dns.SHA256)},
+	}, dnameSig
 }
 
 // RFC 4592 section 4.4 and RFC 6672 sections 3.3 and 8 warn that a DNAME

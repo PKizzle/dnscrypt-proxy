@@ -1,4 +1,4 @@
-# codeberg.org/miekg/dns v0.6.101 => github.com/PKizzle/dns v0.0.0-20260826195542-aa9351af91aa
+# codeberg.org/miekg/dns v0.6.101 => github.com/PKizzle/dns v0.0.0-20260907103838-3e90d0ad749a
 ## explicit; go 1.25.0
 codeberg.org/miekg/dns
 codeberg.org/miekg/dns/deleg
@@ -182,4 +182,4 @@ golang.org/x/text/unicode/norm
 # gopkg.in/natefinch/lumberjack.v2 v2.2.1
 ## explicit; go 1.13
 gopkg.in/natefinch/lumberjack.v2
-# codeberg.org/miekg/dns => github.com/PKizzle/dns v0.0.0-20260826195542-aa9351af91aa
+# codeberg.org/miekg/dns => github.com/PKizzle/dns v0.0.0-20260907103838-3e90d0ad749a
