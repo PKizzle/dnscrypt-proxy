@@ -573,6 +573,23 @@ func (plugin *PluginDNSSECValidate) judgeNegativeWithChain(msg *dns.Msg, qName s
 		}
 		return dnssec.Bogus, fmt.Errorf("%w: no proof that %s does not exist", errDNSSECIncompleteEvidence, qName)
 	}
+	if qtype == dns.TypeDS && !sameDNSName(qName, ".") {
+		// DS data exists only on the parent's side of a zone cut. RFC 4035
+		// section 5.2 requires a validator to use the parent NSEC when proving
+		// that it is absent; an authenticated child-apex NSEC proves only that
+		// the child does not store its own DS RRset. Accepting that child proof
+		// would let a recursive upstream hide the parent's secure delegation.
+		if sameDNSName(qName, chain.Zone) {
+			return dnssec.Bogus, fmt.Errorf("%w: %s supplied child-side evidence for its parent-side DS RRset", errDNSSECIncompleteEvidence, qName)
+		}
+		// RFC 6840 sections 4.1 and 4.4 make DS the one RR type an
+		// ancestor-delegation NSEC may deny at the cut. ProvesNoData rejects
+		// that shape for ordinary types, while ProvesNoDS requires exactly the
+		// parent-side NS-present, SOA/DS-absent bitmap (or NSEC3 Opt-Out).
+		if denial.ProvesNoDS(qName) {
+			return plugin.judgeNegativeAuthority(msg, chain, now)
+		}
+	}
 	if denial.ProvesNoData(qName, qtype) {
 		return plugin.judgeNegativeAuthority(msg, chain, now)
 	}

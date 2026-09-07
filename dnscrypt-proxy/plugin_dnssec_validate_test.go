@@ -554,6 +554,60 @@ func TestValidatorAcceptsDeepNegativeAnswerSignedByEnclosingZone(t *testing.T) {
 	}
 }
 
+// DS is the exception to the rule that a delegation NSEC cannot deny data at
+// a child zone cut. RFC 4035 section 5.2 requires the parent's NSEC for this
+// decision, and RFC 6840 sections 4.1 and 4.4 identify the exact bitmap:
+// parent-side NS present, with SOA and DS absent. The child's equally genuine
+// apex NSEC says nothing about whether the parent publishes a DS and must not
+// be accepted as a downgrade.
+func TestValidatorUsesOnlyParentSideDenialForDSNoData(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	zone := newValidatorTestZone(t, "example.")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	ds := zone.key.ToDS(dns.SHA256)
+	dsSig := root.sign([]dns.RR{ds}, now)
+	zoneKeySig := zone.sign([]dns.RR{zone.key}, now)
+
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{ds, dsSig}, nil), nil
+		case qtype == dns.TypeDNSKEY && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zone.key, zoneKeySig}, nil), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+
+	parentNSEC := &dns.NSEC{
+		Hdr:  dns.Header{Name: "child.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "d.example.", TypeBitMap: []uint16{dns.TypeNS, dns.TypeRRSIG, dns.TypeNSEC}},
+	}
+	parentSig := zone.sign([]dns.RR{parentNSEC}, now)
+	parentMsg := testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{parentNSEC, parentSig})
+	parentMsg.Question = []dns.RR{&dns.DS{Hdr: dns.Header{Name: "child.example.", Class: dns.ClassINET}}}
+	if result, why := plugin.judge(parentMsg, "child.example."); result != dnssec.Secure {
+		t.Fatalf("parent-side DS denial = %v (%v), want secure", result, why)
+	}
+
+	childNSEC := &dns.NSEC{
+		Hdr: dns.Header{Name: "example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "a.example.", TypeBitMap: []uint16{
+			dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeDNSKEY,
+		}},
+	}
+	childSig := zone.sign([]dns.RR{childNSEC}, now)
+	childMsg := testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{childNSEC, childSig})
+	childMsg.Question = []dns.RR{&dns.DS{Hdr: dns.Header{Name: "example.", Class: dns.ClassINET}}}
+	result, why := plugin.judge(childMsg, "example.")
+	if result != dnssec.Bogus || !errors.Is(why, errDNSSECIncompleteEvidence) {
+		t.Fatalf("child-side DS denial = %v (%v), want retryable bogus", result, why)
+	}
+}
+
 // A CNAME is only an intermediate answer to an A query. RFC 4035 section
 // 3.2.3 requires the final negative answer to be authenticated before AD can
 // be set; accepting just the signed alias would make a stripped NODATA proof
