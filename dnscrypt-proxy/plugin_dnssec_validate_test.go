@@ -210,6 +210,74 @@ func TestDNSSECRequestUsesCDUpstreamButRemembersTheClientBit(t *testing.T) {
 	}
 }
 
+func TestDNSSECValidatorDoesNotLeakEDNSToAnUnawareClient(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{}}
+	query := dns.NewMsg("example.test.", dns.TypeA)
+	if messageHasEDNS(query) {
+		t.Fatal("fresh query unexpectedly uses EDNS")
+	}
+	if err := (&PluginDNSSECRequest{}).Eval(&state, query); err != nil {
+		t.Fatal(err)
+	}
+	if !messageHasEDNS(query) || !query.Security {
+		t.Fatal("validator did not add EDNS and DO to its upstream query")
+	}
+
+	response := dns.NewMsg("example.test.", dns.TypeA)
+	response.Response = true
+	response.UDPSize = 1232
+	response.Security = true
+	response.Pseudo = []dns.RR{&dns.EDE{InfoCode: dns.ExtendedErrorDNSBogus}}
+	stripDNSSECForClient(&state, response)
+
+	if messageHasEDNS(response) || response.UDPSize != 0 || len(response.Pseudo) != 0 {
+		t.Fatalf("upstream EDNS leaked to unaware client: %#v", response)
+	}
+	if err := response.Pack(); err != nil {
+		t.Fatal(err)
+	}
+	wire := &dns.Msg{Data: response.Data}
+	if err := wire.Unpack(); err != nil {
+		t.Fatal(err)
+	}
+	if messageHasEDNS(wire) {
+		t.Fatalf("packed response contains an OPT RR: %#v", wire)
+	}
+}
+
+func TestDNSSECValidatorReturnsOPTToAnEDNSClient(t *testing.T) {
+	state := PluginsState{sessionData: map[string]any{}}
+	query := dns.NewMsg("example.test.", dns.TypeA)
+	// Exercise the minimum-size empty OPT case as well as the ordinary path.
+	query.UDPSize = dns.MinMsgSize
+	if err := (&PluginDNSSECRequest{}).Eval(&state, query); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even if a nonconforming upstream omitted OPT, our client-side
+	// transaction must honor the OPT request independently.
+	response := dns.NewMsg("example.test.", dns.TypeA)
+	response.Response = true
+	stripDNSSECForClient(&state, response)
+
+	if !messageHasEDNS(response) || response.UDPSize != 1232 {
+		t.Fatalf("EDNS client response has UDP size %d, want an OPT advertising 1232", response.UDPSize)
+	}
+	if response.Security {
+		t.Fatal("internally-added DO bit leaked to an EDNS client that did not set it")
+	}
+	if err := response.Pack(); err != nil {
+		t.Fatal(err)
+	}
+	wire := &dns.Msg{Data: response.Data}
+	if err := wire.Unpack(); err != nil {
+		t.Fatal(err)
+	}
+	if !messageHasEDNS(wire) || wire.UDPSize != 1232 {
+		t.Fatalf("packed response did not contain the required OPT RR: %#v", wire)
+	}
+}
+
 func TestDNSSECFailureResponseIsSERVFAILAndKeepsCD(t *testing.T) {
 	query := dns.NewMsg("example.test.", dns.TypeA)
 	query.ID = 1234

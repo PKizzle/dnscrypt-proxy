@@ -930,6 +930,7 @@ func (plugin *PluginDNSSECRequest) Eval(pluginsState *PluginsState, msg *dns.Msg
 	pluginsState.sessionData[dnssecClientWantedKey] = msg.Security
 	pluginsState.sessionData[dnssecClientAskedADKey] = msg.AuthenticatedData
 	pluginsState.sessionData[dnssecClientCheckingDisabledKey] = msg.CheckingDisabled
+	pluginsState.sessionData[dnssecClientHadEDNSKey] = messageHasEDNS(msg)
 	// RFC 4035 section 4.6 requires a resolver to clear AD in an outgoing
 	// query. The client bit is only a request to receive our verdict; sending
 	// it upstream lets a buggy server reflect a client-controlled assertion.
@@ -957,6 +958,12 @@ const dnssecClientAskedADKey = "dnssec_client_asked_ad"
 // dnssecClientCheckingDisabledKey keeps the client's CD bit while the proxy
 // sets CD on its own upstream query to retrieve raw material for validation.
 const dnssecClientCheckingDisabledKey = "dnssec_client_checking_disabled"
+
+// dnssecClientHadEDNSKey remembers whether the client supplied an OPT RR.
+// The validator adds one upstream so it can request DNSSEC records, but RFC
+// 6891 section 7 forbids including that OPT RR in a response to a client that
+// did not implement EDNS.
+const dnssecClientHadEDNSKey = "dnssec_client_had_edns"
 
 // dnssecVerdictKey and dnssecReasonKey carry what validation concluded about an
 // answer, and why, to whatever reports on the query afterwards. The wire has
@@ -1079,11 +1086,13 @@ func stripDNSSECForClient(pluginsState *PluginsState, msg *dns.Msg) {
 	}
 }
 
-// restoreDNSSECClientBits removes the two upstream-only query mutations from
-// a client-facing reply. RFC 3225 section 3 requires DO to be copied from the
-// client query, while RFC 4035 section 3.2.2 says the same for CD. The
-// validator sets both on its upstream query so it can obtain unfiltered DNSSEC
-// material; neither change may leak back to the client.
+// restoreDNSSECClientBits removes the upstream-only query mutations from a
+// client-facing reply. RFC 3225 section 3 requires DO to be copied from the
+// client query, while RFC 4035 section 3.2.2 says the same for CD. RFC 6891
+// section 7 additionally forbids an OPT response when the client sent no OPT
+// request. The validator adds both EDNS and DO upstream so it can obtain
+// unfiltered DNSSEC material; none of that state may leak back to an
+// EDNS-unaware client.
 func restoreDNSSECClientBits(pluginsState *PluginsState, msg *dns.Msg) {
 	if wanted, ok := pluginsState.sessionData[dnssecClientWantedKey].(bool); ok {
 		msg.Security = wanted
@@ -1091,6 +1100,53 @@ func restoreDNSSECClientBits(pluginsState *PluginsState, msg *dns.Msg) {
 	if checkingDisabled, ok := pluginsState.sessionData[dnssecClientCheckingDisabledKey].(bool); ok {
 		msg.CheckingDisabled = checkingDisabled
 	}
+	if hadEDNS, ok := pluginsState.sessionData[dnssecClientHadEDNSKey].(bool); ok {
+		if hadEDNS {
+			// An EDNS request requires an OPT response. A conforming upstream
+			// supplies one, but retain the invariant even if it did not.
+			if !messageHasEDNS(msg) {
+				msg.UDPSize = 1232
+			}
+		} else {
+			removeEDNS(msg)
+		}
+	}
+}
+
+func messageHasEDNS(msg *dns.Msg) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.UDPSize != 0 || msg.Security || msg.CompactAnswers || msg.Delegation || msg.Rcode > 0xf {
+		return true
+	}
+	for _, rr := range msg.Pseudo {
+		if _, ok := rr.(dns.EDNS0); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func removeEDNS(msg *dns.Msg) {
+	msg.UDPSize = 0
+	msg.Version = 0
+	msg.Security = false
+	msg.CompactAnswers = false
+	msg.Delegation = false
+	if msg.Rcode > 0xf {
+		// An extended RCODE cannot be represented without OPT. Preserve an
+		// explicit failure instead of truncating it to a misleading low nibble.
+		msg.Rcode = dns.RcodeServerFailure
+	}
+	kept := msg.Pseudo[:0]
+	for _, rr := range msg.Pseudo {
+		if _, ok := rr.(dns.EDNS0); ok {
+			continue
+		}
+		kept = append(kept, rr)
+	}
+	msg.Pseudo = kept
 }
 
 func clientCheckingDisabled(pluginsState *PluginsState) bool {
