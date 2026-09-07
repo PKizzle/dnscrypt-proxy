@@ -18,6 +18,13 @@ import (
 // used to validate a key set does not terminate.
 type QueryFunc func(qname string, qtype uint16) (*dns.Msg, error)
 
+// QueryExcludingFunc is the retry-aware form used when the caller can select
+// among multiple recursive resolvers.  excluded is shared by every attempt
+// for one RRset; the caller adds the endpoint it selected before exchanging
+// the query, so a timeout advances to independent upstream evidence instead
+// of allowing the load balancer to choose the same failed endpoint again.
+type QueryExcludingFunc func(qname string, qtype uint16, excluded map[string]struct{}) (*dns.Msg, error)
+
 // CachingFetcher answers DNSKEY and DS lookups for a chain walk, remembering
 // what it learns.
 //
@@ -27,7 +34,8 @@ type QueryFunc func(qname string, qtype uint16) (*dns.Msg, error)
 // Entries expire on the TTL the zone published, so a rollover is picked up
 // when the zone says it will be.
 type CachingFetcher struct {
-	Query QueryFunc
+	Query          QueryFunc
+	QueryExcluding QueryExcludingFunc
 	// Now allows tests to control expiry; time.Now when nil.
 	Now func() time.Time
 
@@ -58,6 +66,16 @@ func NewCachingFetcher(query QueryFunc) *CachingFetcher {
 	}
 }
 
+// NewCachingFetcherExcluding returns a fetcher whose retries can exclude the
+// recursive endpoints already attempted for the current RRset.
+func NewCachingFetcherExcluding(query QueryExcludingFunc) *CachingFetcher {
+	return &CachingFetcher{
+		QueryExcluding: query,
+		keys:           map[string]*keyEntry{},
+		dss:            map[string]*dsEntry{},
+	}
+}
+
 // chainFetchAttempts is how many times a key or delegation signer is asked for
 // before the chain is given up on.
 //
@@ -85,8 +103,15 @@ const maxStale = 24 * time.Hour
 // ask sends a query, retrying a failure or an empty reply.
 func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
 	var lastErr error
+	excluded := map[string]struct{}{}
 	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
-		msg, err := f.Query(zone, qtype)
+		var msg *dns.Msg
+		var err error
+		if f.QueryExcluding != nil {
+			msg, err = f.QueryExcluding(zone, qtype, excluded)
+		} else {
+			msg, err = f.Query(zone, qtype)
+		}
 		if err == nil && msg != nil {
 			return msg, nil
 		}

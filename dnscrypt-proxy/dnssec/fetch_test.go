@@ -302,6 +302,36 @@ func TestFetcherRetriesADroppedFetch(t *testing.T) {
 	}
 }
 
+// A pool-aware caller must see one exclusion set for the entire RRset fetch.
+// Otherwise every retry starts from an empty set and weighted selection can
+// repeatedly choose the endpoint that just timed out.
+func TestFetcherCarriesEndpointExclusionsAcrossRetries(t *testing.T) {
+	calls := 0
+	selected := []string{"resolver-a", "resolver-b", "resolver-c"}
+	f := NewCachingFetcherExcluding(func(_ string, _ uint16, excluded map[string]struct{}) (*dns.Msg, error) {
+		if len(excluded) != calls {
+			t.Fatalf("attempt %d received %d exclusions, want %d", calls+1, len(excluded), calls)
+		}
+		server := selected[calls]
+		if _, duplicate := excluded[server]; duplicate {
+			t.Fatalf("attempt %d selected excluded endpoint %q", calls+1, server)
+		}
+		excluded[server] = struct{}{}
+		calls++
+		if calls < chainFetchAttempts {
+			return nil, fmt.Errorf("%s timed out", server)
+		}
+		return msgWith(dns.RcodeSuccess, nil, nil), nil
+	})
+
+	if _, _, _, err := f.DS("example.test."); err != nil {
+		t.Fatalf("DS() = %v, want the distinct final endpoint to succeed", err)
+	}
+	if calls != chainFetchAttempts {
+		t.Fatalf("upstream asked %d time(s), want %d distinct attempts", calls, chainFetchAttempts)
+	}
+}
+
 // Retrying forever would turn an upstream that is simply down into a hang.
 func TestFetcherGivesUpAfterTheRetries(t *testing.T) {
 	calls := 0

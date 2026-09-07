@@ -122,8 +122,8 @@ func (plugin *PluginDNSSECValidate) Init(proxy *Proxy) error {
 		plugin.insecureZones = append(plugin.insecureZones, zone)
 	}
 
-	plugin.fetcher = dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
-		return plugin.resolveInternally(proxy, qname, qtype)
+	plugin.fetcher = dnssec.NewCachingFetcherExcluding(func(qname string, qtype uint16, excludedServerNames map[string]struct{}) (*dns.Msg, error) {
+		return plugin.resolveInternallyExcluding(proxy, qname, qtype, excludedServerNames)
 	})
 
 	switch plugin.mode {
