@@ -504,6 +504,38 @@ func TestValidatorAcceptsOnlyCNAMEsSynthesizedByASecureDNAME(t *testing.T) {
 	}
 }
 
+// RFC 6672 section 2.3: a DNAME redirects names subordinate to its owner, not
+// the owner itself. A signed exact-owner NSEC may consequently prove ordinary
+// NODATA there; rejecting its DNAME bitmap misclassifies a valid answer bogus.
+func TestValidatorAcceptsSignedNoDataAtExactDNAMEOwner(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	dnameOwner := &dns.NSEC{
+		Hdr:  dns.Header{Name: "foo.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "g.", TypeBitMap: []uint16{dns.TypeDNAME, dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	dnameOwnerSig := root.sign([]dns.RR{dnameOwner}, now)
+
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "foo.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{dnameOwner, dnameOwnerSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	msg := testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{dnameOwner, dnameOwnerSig})
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "foo.", Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, "foo.")
+	if result != dnssec.Secure {
+		t.Fatalf("judge() = %v (%v), want secure exact-owner DNAME NODATA", result, why)
+	}
+}
+
 // RFC 4035 appendix B.7: a wildcard NODATA response is secure when an NSEC
 // proves no closer name exists and the wildcard's own NSEC omits the requested
 // type. Treating it as an ordinary exact-name NODATA would reject a valid

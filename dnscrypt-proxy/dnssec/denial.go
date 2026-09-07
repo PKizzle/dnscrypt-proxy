@@ -419,9 +419,11 @@ func (d Denial) HasMixedNSEC3Parameters() bool {
 // record of rrtype.
 //
 // The proof is a record matching the name whose bitmap omits the type. The
-// bitmap is what carries the meaning, so two entries in it have to be refused
-// as well: a CNAME would mean the answer should have followed it, and a DNAME
-// likewise -- accepting either lets a zone deny a name it actually redirects.
+// bitmap is what carries the meaning, so a CNAME entry has to be refused as
+// well: the answer should have followed that alias. A DNAME entry is different:
+// RFC 6672 section 2.3 says the DNAME owner itself is not redirected and may
+// hold other RR types, so an exact-owner proof may legitimately omit rrtype.
+// DNAME remains disallowed when an NSEC/NSEC3 is used to deny a descendant.
 func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
@@ -429,7 +431,6 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 		}
 		if coversType(rr.TypeBitMap, rrtype) ||
 			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
-			coversType(rr.TypeBitMap, dns.TypeDNAME) ||
 			(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
 			return false
 		}
@@ -442,7 +443,6 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 		}
 		if coversType(rr.TypeBitMap, rrtype) ||
 			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
-			coversType(rr.TypeBitMap, dns.TypeDNAME) ||
 			(coversType(rr.TypeBitMap, dns.TypeNS) && !coversType(rr.TypeBitMap, dns.TypeSOA)) {
 			return false
 		}

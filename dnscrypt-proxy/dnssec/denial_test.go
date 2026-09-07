@@ -152,13 +152,21 @@ func TestProvesNoDataRefusesToDenyACNAME(t *testing.T) {
 	}
 }
 
-// DNAME redirects all names below its owner. It cannot coexist with ordinary
-// data, so a denial that ignores it would accept a NODATA reply where the zone
-// should have supplied the redirection.
-func TestProvesNoDataRefusesToDenyADNAME(t *testing.T) {
-	d := Denial{NSEC: []*dns.NSEC{nsec("www.example.", "x.example.", dns.TypeDNAME, dns.TypeRRSIG)}}
-	if d.ProvesNoData("www.example.", dns.TypeA) {
-		t.Error("a name holding a DNAME must not be denied")
+// RFC 6672 section 2.3: DNAME redirects names below its owner, but not the
+// owner itself. RFC 5155 section 8.5 likewise excludes only QTYPE and CNAME
+// from a matching NSEC3 NODATA bitmap. Both denial formats may therefore prove
+// that another type is absent at the exact DNAME owner.
+func TestProvesNoDataAtExactDNAMEOwner(t *testing.T) {
+	const name = "d.example.test."
+	d := Denial{NSEC: []*dns.NSEC{nsec(name, "x.example.test.", dns.TypeDNAME, dns.TypeRRSIG)}}
+	if !d.ProvesNoData(name, dns.TypeA) {
+		t.Error("an NSEC at a DNAME owner should prove that the owner has no A record")
+	}
+
+	owner := NSEC3Hash(name, 1, 0, "-")
+	d = Denial{NSEC3: []*dns.NSEC3{nsec3(owner, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ", 0, dns.TypeDNAME, dns.TypeRRSIG)}}
+	if !d.ProvesNoData(name, dns.TypeA) {
+		t.Error("an NSEC3 at a DNAME owner should prove that the owner has no A record")
 	}
 }
 
