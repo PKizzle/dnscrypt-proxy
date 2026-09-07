@@ -1048,6 +1048,73 @@ func TestAClientThatAskedForSignaturesKeepsThem(t *testing.T) {
 	}
 }
 
+// RFC 4035 section 3.2.1: DO=0 suppresses auxiliary authentication records,
+// but never a DNSSEC RR type the initiating query explicitly requested.
+func TestAClientKeepsAnExplicitlyRequestedDNSSECTypeWithoutDO(t *testing.T) {
+	const name = "example.test."
+	records := []dns.RR{
+		&dns.DS{Hdr: dns.Header{Name: name, Class: dns.ClassINET}},
+		&dns.DNSKEY{Hdr: dns.Header{Name: name, Class: dns.ClassINET}},
+		&dns.NSEC{Hdr: dns.Header{Name: name, Class: dns.ClassINET}},
+		&dns.NSEC3{Hdr: dns.Header{Name: "hash." + name, Class: dns.ClassINET}},
+		&dns.RRSIG{Hdr: dns.Header{Name: name, Class: dns.ClassINET}},
+	}
+	for _, requested := range []uint16{
+		dns.TypeDS,
+		dns.TypeDNSKEY,
+		dns.TypeNSEC,
+		dns.TypeNSEC3,
+		dns.TypeRRSIG,
+	} {
+		t.Run(dns.TypeToString[requested], func(t *testing.T) {
+			question := dns.NewMsg(name, requested)
+			msg := dns.NewMsg(name, requested)
+			msg.Answer = append([]dns.RR(nil), records...)
+			msg.AuthenticatedData = true
+			state := PluginsState{
+				questionMsg: question,
+				sessionData: map[string]any{
+					dnssecClientWantedKey: false,
+				},
+			}
+
+			stripDNSSECForClient(&state, msg)
+
+			if len(msg.Answer) != 1 || dns.RRToType(msg.Answer[0]) != requested {
+				t.Fatalf("answer after DO=0 stripping = %v, want only explicitly requested %s",
+					msg.Answer, dns.TypeToString[requested])
+			}
+			if msg.AuthenticatedData {
+				t.Fatal("AD survived for a client that requested neither DO nor AD")
+			}
+		})
+	}
+}
+
+// RFC 5155 section 4 says that NSEC3PARAM is apex zone data and is not used
+// by validators or resolvers.  It therefore is not an auxiliary
+// authentication RR to remove under RFC 4035 section 3.2.1.
+func TestAClientKeepsNSEC3PARAMWithoutDO(t *testing.T) {
+	const name = "example.test."
+	msg := dns.NewMsg(name, dns.TypeA)
+	msg.Answer = []dns.RR{
+		&dns.NSEC3PARAM{Hdr: dns.Header{Name: name, Class: dns.ClassINET}},
+		&dns.NSEC3{Hdr: dns.Header{Name: "hash." + name, Class: dns.ClassINET}},
+	}
+	state := PluginsState{
+		questionMsg: dns.NewMsg(name, dns.TypeA),
+		sessionData: map[string]any{
+			dnssecClientWantedKey: false,
+		},
+	}
+
+	stripDNSSECForClient(&state, msg)
+
+	if len(msg.Answer) != 1 || dns.RRToType(msg.Answer[0]) != dns.TypeNSEC3PARAM {
+		t.Fatalf("answer after DO=0 stripping = %v, want only NSEC3PARAM", msg.Answer)
+	}
+}
+
 // A client that asked for none of this gets the answer it expected, and the
 // verdict is withheld: RFC 6840 section 5.8 reserves the AD bit for clients
 // that set DO or AD, and to anything else it is a bit nobody can act on.

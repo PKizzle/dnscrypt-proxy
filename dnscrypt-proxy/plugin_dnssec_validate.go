@@ -994,20 +994,28 @@ func verdictName(result dnssec.Result) string {
 }
 
 // stripDNSSECRecords removes the records only the validator needed, for a
-// client that did not ask to see them.
-func stripDNSSECRecords(msg *dns.Msg) {
-	msg.Answer = withoutDNSSEC(msg.Answer)
-	msg.Ns = withoutDNSSEC(msg.Ns)
-	msg.Extra = withoutDNSSEC(msg.Extra)
+// client that did not ask to see them. RFC 4035 section 3.2.1 makes an
+// explicit query for a DNSSEC RR type the exception: the requested type is
+// ordinary answer data in that transaction and MUST NOT be stripped merely
+// because DO was clear.
+func stripDNSSECRecords(msg *dns.Msg, explicitlyRequested uint16) {
+	msg.Answer = withoutDNSSEC(msg.Answer, explicitlyRequested)
+	msg.Ns = withoutDNSSEC(msg.Ns, explicitlyRequested)
+	msg.Extra = withoutDNSSEC(msg.Extra, explicitlyRequested)
 }
 
-func withoutDNSSEC(rrs []dns.RR) []dns.RR {
+func withoutDNSSEC(rrs []dns.RR, explicitlyRequested uint16) []dns.RR {
 	if len(rrs) == 0 {
 		return rrs
 	}
 	kept := rrs[:0]
 	for _, rr := range rrs {
-		switch dns.RRToType(rr) {
+		rrtype := dns.RRToType(rr)
+		if rrtype == explicitlyRequested {
+			kept = append(kept, rr)
+			continue
+		}
+		switch rrtype {
 		case dns.TypeRRSIG, dns.TypeDNSKEY, dns.TypeNSEC, dns.TypeNSEC3, dns.TypeDS:
 			continue
 		}
@@ -1058,7 +1066,13 @@ func stripDNSSECForClient(pluginsState *PluginsState, msg *dns.Msg) {
 	wanted, _ := pluginsState.sessionData[dnssecClientWantedKey].(bool)
 	askedForVerdict, _ := pluginsState.sessionData[dnssecClientAskedADKey].(bool)
 	if !wanted {
-		stripDNSSECRecords(msg)
+		var explicitlyRequested uint16
+		if pluginsState.questionMsg != nil && len(pluginsState.questionMsg.Question) > 0 {
+			explicitlyRequested = dns.RRToType(pluginsState.questionMsg.Question[0])
+		} else if len(msg.Question) > 0 {
+			explicitlyRequested = dns.RRToType(msg.Question[0])
+		}
+		stripDNSSECRecords(msg, explicitlyRequested)
 	}
 	if !wanted && !askedForVerdict {
 		msg.AuthenticatedData = false
