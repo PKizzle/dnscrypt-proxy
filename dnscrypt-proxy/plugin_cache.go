@@ -44,7 +44,17 @@ func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	if pluginsState.dnssec {
 		tmp[4] = 1
 	}
-	if msg.CheckingDisabled {
+	// The DNSSEC request plugin forces CD on the upstream transaction so the
+	// local validator receives raw data (RFC 6840 section 5.9). Keep cache
+	// isolation based on the client's original CD bit, saved before that
+	// mutation. Otherwise a CD client can put a Bogus answer in the shared cache
+	// and a later non-CD client in enforce mode receives it without traversing
+	// the response validator, contrary to RFC 4035 section 5.5.
+	checkingDisabled := msg.CheckingDisabled
+	if original, ok := pluginsState.sessionData[dnssecClientCheckingDisabledKey].(bool); ok {
+		checkingDisabled = original
+	}
+	if checkingDisabled {
 		tmp[4] |= 2
 	}
 	h.Write(tmp[:])
