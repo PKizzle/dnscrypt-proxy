@@ -741,29 +741,33 @@ func TestValidatorClassifiesProvablyBadSignatureWhenOwnerWalkIsIncomplete(t *tes
 	question := []dns.RR{&dns.A{Hdr: dns.Header{Name: record.Header().Name, Class: dns.ClassINET}}}
 
 	for _, tc := range []struct {
-		name string
-		sig  *dns.RRSIG
-		want dnssec.Result
+		name       string
+		sig        *dns.RRSIG
+		want       dnssec.Result
+		wantReason string
 	}{
-		{name: "valid signature cannot repair missing delegation proof", sig: validSig, want: dnssec.Bogus},
+		{name: "valid signature cannot repair missing delegation proof", sig: validSig, want: dnssec.Bogus, wantReason: "DS response omitted"},
 		{name: "bad cryptographic signature", sig: func() *dns.RRSIG {
 			bad := *validSig
 			bad.Signature = "AAAA"
 			return &bad
-		}(), want: dnssec.Bogus},
+		}(), want: dnssec.Bogus, wantReason: "signature over"},
 		{name: "expired signature", sig: func() *dns.RRSIG {
 			expired := *validSig
 			expired.Inception = uint32(now.Add(-2 * time.Hour).Unix())
 			expired.Expiration = uint32(now.Add(-time.Hour).Unix())
 			return &expired
-		}(), want: dnssec.Bogus},
+		}(), want: dnssec.Bogus, wantReason: "signature over"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{record, tc.sig}, nil)
 			msg.Question = question
-			result, _ := plugin.judge(msg, record.Header().Name)
+			result, why := plugin.judge(msg, record.Header().Name)
 			if result != tc.want {
 				t.Fatalf("judge() = %v, want %v", result, tc.want)
+			}
+			if why == nil || !strings.Contains(why.Error(), tc.wantReason) {
+				t.Fatalf("judge() reason = %v, want substring %q", why, tc.wantReason)
 			}
 		})
 	}

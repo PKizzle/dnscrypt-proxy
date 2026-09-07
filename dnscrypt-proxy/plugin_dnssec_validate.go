@@ -968,6 +968,14 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 	case dnssec.Insecure:
 		return dnssec.Insecure, owner.Why
 	case dnssec.Bogus:
+		// A completed but incomplete delegation walk is already Bogus. If the
+		// answer also carries a signature that independently fails under its
+		// securely authenticated signer, prefer that more specific diagnosis.
+		// This does not rescue a valid ancestor signature across a possible zone
+		// cut: the helper only reports signatures that are conclusively bad.
+		if err, conclusive := plugin.signedSetIsDefinitelyBogus(set, now); conclusive {
+			return dnssec.Bogus, err
+		}
 		return dnssec.Bogus, owner.Why
 	default:
 		// The containing-zone walk can be inconclusive when the same broken
