@@ -331,8 +331,12 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	if qName == "" {
 		return nil
 	}
+	qtype := dns.RRToType(msg.Question[0])
+	qtypeName := dns.TypeToString[qtype]
+	if qtypeName == "" {
+		qtypeName = fmt.Sprintf("TYPE%d", qtype)
+	}
 	if pluginsState.returnCode == PluginsReturnCodeServFail && plugin.proxy != nil {
-		qtype := dns.RRToType(msg.Question[0])
 		if returnCode, serverName, recovered := retryDNSSECUpstreamSERVFAIL(
 			msg,
 			qName,
@@ -369,7 +373,6 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		result, why = plugin.judge(msg, qName)
 	}
 	if plugin.proxy != nil && !configuredInsecure && retryableDNSSECFailure(result, why) {
-		qtype := dns.RRToType(msg.Question[0])
 		excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
 		if pluginsState.serverName != "" && pluginsState.serverName != "-" {
 			excludedServerNames[pluginsState.serverName] = struct{}{}
@@ -408,10 +411,10 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// arrive. An unsigned zone is a fact about the zone and stays quiet;
 		// this is a fault on this side and would otherwise be invisible, since
 		// both reach the client the same way.
-		dlog.Debugf("DNSSEC could not check [%s]: %v", qName, why)
+		dlog.Debugf("DNSSEC could not check [%s/%s]: %v", qName, qtypeName, why)
 	default:
 		dnssecVerdicts.insecure.Add(1)
-		dlog.Debugf("DNSSEC did not vouch for [%s]: %v", qName, why)
+		dlog.Debugf("DNSSEC did not vouch for [%s/%s]: %v", qName, qtypeName, why)
 	}
 
 	if !plugin.mustReject(result, clientCheckingDisabled(pluginsState)) {
@@ -421,12 +424,12 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// the upstream response as RFC 4035 section 5.5 requires.
 		msg.AuthenticatedData = result == dnssec.Secure
 		if plugin.mode == ValidationLog && (result == dnssec.Bogus || result == dnssec.Indeterminate) {
-			dlog.Warnf("DNSSEC would return SERVFAIL for [%s]: %v", qName, why)
+			dlog.Warnf("DNSSEC would return SERVFAIL for [%s/%s]: %v", qName, qtypeName, why)
 		}
 		return nil
 	}
 
-	dlog.Warnf("DNSSEC returned SERVFAIL for [%s]: %v", qName, why)
+	dlog.Warnf("DNSSEC returned SERVFAIL for [%s/%s]: %v", qName, qtypeName, why)
 	edeCode := dnssecFailureEDE(result, why)
 	failure := DNSSECFailureResponseFromMessage(pluginsState.questionMsg, edeCode)
 	restoreDNSSECClientBits(pluginsState, failure)
