@@ -1,6 +1,7 @@
 package dnssec
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -45,6 +46,29 @@ type Fetcher interface {
 	// delegation: most names are not zone cuts at all, and the denial is what
 	// tells the two apart.
 	DS(zone string) (dss []*dns.DS, sigs []*dns.RRSIG, denial Denial, err error)
+}
+
+// endpointExcludingFetcher is implemented by the production caching fetcher.
+// The basic Fetcher interface stays small for deterministic hierarchy tests,
+// while a pool-aware implementation can retain resolver provenance across a
+// response that arrived successfully but failed later cryptographic checks.
+type endpointExcludingFetcher interface {
+	DNSKEYExcluding(zone string, excluded map[string]struct{}) (keys []*dns.DNSKEY, sigs []*dns.RRSIG, err error)
+	DSExcluding(zone string, excluded map[string]struct{}) (dss []*dns.DS, sigs []*dns.RRSIG, denial Denial, err error)
+}
+
+func fetchDNSKEY(f Fetcher, zone string, excluded map[string]struct{}) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	if pool, ok := f.(endpointExcludingFetcher); ok {
+		return pool.DNSKEYExcluding(zone, excluded)
+	}
+	return f.DNSKEY(zone)
+}
+
+func fetchDS(f Fetcher, zone string, excluded map[string]struct{}) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if pool, ok := f.(endpointExcludingFetcher); ok {
+		return pool.DSExcluding(zone, excluded)
+	}
+	return f.DS(zone)
 }
 
 // ChainResult is what walking the chain established about a zone.
@@ -115,6 +139,7 @@ func BuildChain(f Fetcher, zone string, anchors []*dns.DS, now time.Time) ChainR
 	current := ChainResult{Status: Secure, Keys: keys, Zone: "."}
 nextChild:
 	for _, child := range zones[1:] {
+		excludedServerNames := map[string]struct{}{}
 		// A response with no DS needs authenticated evidence to distinguish an
 		// ordinary name from an unsigned delegation. Different recursive
 		// upstreams can return incomplete negative responses, so an answer that
@@ -122,8 +147,14 @@ nextChild:
 		// This never turns an unproven response into a trusted one: all attempts
 		// must still pass the RFC 4035/RFC 5155 predicates below.
 		for attempt := 0; attempt < chainFetchAttempts; attempt++ {
-			dss, _, denial, err, invalid := verifiedDelegationSigners(f, child, current, now)
+			dss, _, denial, err, invalid := verifiedDelegationSignersExcluding(f, child, current, now, excludedServerNames)
 			if err != nil {
+				if errors.Is(err, ErrUnsupportedSignatureAlgorithm) {
+					return ChainResult{
+						Status: Insecure, Zone: current.Zone,
+						Why: fmt.Errorf("delegation signer for %s uses an unsupported signing algorithm: %w", child, err),
+					}
+				}
 				if invalid {
 					return ChainResult{
 						Status: Bogus, Zone: current.Zone,
@@ -170,11 +201,17 @@ nextChild:
 			// A delegation that genuinely exists and is genuinely unsigned is
 			// the other meaning, and the parent says which by whether it proves
 			// an NS at that name.
+			noDS := denial.NoDSStatus(child)
+			notADelegation := denial.NotADelegationStatus(child)
 			switch {
-			case denial.ProvesNoDS(child):
+			case noDS != Indeterminate:
 				current.Status = Insecure
 				current.Keys = nil
-				current.Why = fmt.Errorf("%s is delegated without a signer", child)
+				if noDS == Insecure {
+					current.Why = fmt.Errorf("%s delegation proof is insecure", child)
+				} else {
+					current.Why = fmt.Errorf("%s is delegated without a signer", child)
+				}
 				return current
 			case denial.Empty():
 				// Nothing was offered to tell the two apart. Descending on the
@@ -184,7 +221,7 @@ nextChild:
 				// completed, and RFC 4035 sections 3.1.3 and 5.4 require a signed
 				// NSEC/NSEC3 proof in a negative answer from this authenticated
 				// parent. Retry below before calling the incomplete response Bogus.
-			case denial.ProvesNotADelegation(child):
+			case notADelegation == Secure:
 				// This label is not a delegation point. It does not say the
 				// same about a deeper label: DNSSEC's DS state belongs to the
 				// exact parent-side zone cut (RFC 4035 section 5.2). Continue
@@ -192,6 +229,15 @@ nextChild:
 				// textual path cannot be delegated. Reverse DNS commonly has
 				// precisely that shape.
 				continue nextChild
+			case notADelegation == Insecure:
+				// The response structurally proves this is not a zone cut, but
+				// only through a signing algorithm disabled by local policy
+				// (RFC 9905 section 2). Do not continue a Secure chain through
+				// evidence the operator explicitly treats as Insecure.
+				current.Status = Insecure
+				current.Keys = nil
+				current.Why = fmt.Errorf("non-delegation proof for %s uses an unsupported signing algorithm", child)
+				return current
 			default:
 				// The parent offered something, but nothing that settles which
 				// of the two this is. Carrying on would hand its keys to what
@@ -236,8 +282,9 @@ nextChild:
 func verifiedRootKeys(f Fetcher, anchors []*dns.DS, now time.Time) ([]*dns.DNSKEY, ChainResult) {
 	var lastResult Result
 	var lastErr error
+	excludedServerNames := map[string]struct{}{}
 	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
-		keys, sigs, err := f.DNSKEY(".")
+		keys, sigs, err := fetchDNSKEY(f, ".", excludedServerNames)
 		if err != nil {
 			return nil, ChainResult{Status: Indeterminate, Zone: ".", Why: fmt.Errorf("fetch root keys: %w", err)}
 		}
@@ -265,8 +312,9 @@ func verifiedRootKeys(f Fetcher, anchors []*dns.DS, now time.Time) ([]*dns.DNSKE
 func verifiedChildKeys(f Fetcher, child string, dss []*dns.DS, now time.Time) ([]*dns.DNSKEY, Result, error) {
 	var lastResult Result
 	var lastErr error
+	excludedServerNames := map[string]struct{}{}
 	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
-		keys, sigs, err := f.DNSKEY(child)
+		keys, sigs, err := fetchDNSKEY(f, child, excludedServerNames)
 		if err != nil {
 			return nil, Indeterminate, fmt.Errorf("fetch keys for %s: %w", child, err)
 		}
@@ -292,9 +340,13 @@ func verifiedChildKeys(f Fetcher, child string, dss []*dns.DS, now time.Time) ([
 // blindly; after the bounded attempts an invalid signed delegation remains
 // Bogus, as RFC 4035 requires.
 func verifiedDelegationSigners(f Fetcher, child string, parent ChainResult, now time.Time) ([]*dns.DS, []*dns.RRSIG, Denial, error, bool) {
+	return verifiedDelegationSignersExcluding(f, child, parent, now, map[string]struct{}{})
+}
+
+func verifiedDelegationSignersExcluding(f Fetcher, child string, parent ChainResult, now time.Time, excludedServerNames map[string]struct{}) ([]*dns.DS, []*dns.RRSIG, Denial, error, bool) {
 	var lastErr error
 	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
-		dss, sigs, denial, err := f.DS(child)
+		dss, sigs, denial, err := fetchDS(f, child, excludedServerNames)
 		if err != nil {
 			return nil, nil, Denial{}, err, false
 		}
@@ -306,9 +358,16 @@ func verifiedDelegationSigners(f Fetcher, child string, parent ChainResult, now 
 		for _, ds := range dss {
 			dsSet = append(dsSet, ds)
 		}
-		if res, err := VerifyRRSet(dsSet, signaturesFromZone(sigs, parent.Zone), parent.Keys, now); res == Secure {
+		res, err := VerifyRRSet(dsSet, signaturesFromZone(sigs, parent.Zone), parent.Keys, now)
+		switch res {
+		case Secure:
 			return dss, sigs, denial, nil, false
-		} else {
+		case Insecure:
+			// RFC 9905 section 2 makes a DS RRset signed only with a
+			// corresponding policy-disabled algorithm Insecure, not Bogus.
+			// A different upstream cannot change the zone's signing policy.
+			return nil, nil, denial, err, false
+		default:
 			lastErr = err
 		}
 

@@ -44,11 +44,20 @@ func (plugin *dnssecFailureTestPlugin) Eval(state *PluginsState, _ *dns.Msg) err
 }
 
 func newValidatorTestZone(t *testing.T, name string) *validatorTestZone {
+	return newValidatorTestZoneWithAlgorithm(t, name, dns.ECDSAP256SHA256)
+}
+
+func newValidatorTestZoneWithAlgorithm(t *testing.T, name string, algorithm uint8) *validatorTestZone {
 	t.Helper()
-	key := dns.NewDNSKEY(name, dns.ECDSAP256SHA256)
+	key := dns.NewDNSKEY(name, algorithm)
+	key.Hdr.TTL = 300
 	key.Flags = dns.FlagZONE
 	key.Protocol = 3
-	priv, err := key.Generate(256)
+	bits := 256
+	if algorithm == dns.RSASHA1 || algorithm == dns.RSASHA1NSEC3SHA1 {
+		bits = 1024
+	}
+	priv, err := key.Generate(bits)
 	if err != nil {
 		t.Fatalf("generate DNSKEY for %s: %v", name, err)
 	}
@@ -57,6 +66,79 @@ func newValidatorTestZone(t *testing.T, name string) *validatorTestZone {
 		t.Fatalf("generated DNSKEY for %s is not a signer", name)
 	}
 	return &validatorTestZone{t: t, name: name, key: key, priv: signer}
+}
+
+// The top-level answer validator must preserve the RFC 9905 policy result from
+// the RRset verifier. Converting it to Bogus would make enforce mode refuse a
+// response that the RFC requires the operator to treat as Insecure.
+func TestValidatorTreatsDeprecatedRSASHA1AnswerAsInsecure(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	accepted := newValidatorTestZone(t, "example.")
+	deprecated := newValidatorTestZoneWithAlgorithm(t, "example.", dns.RSASHA1)
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	ds := accepted.key.ToDS(dns.SHA256)
+	dsSig := root.sign([]dns.RR{ds}, now)
+	zoneKeys := []dns.RR{accepted.key, deprecated.key}
+	zoneKeySig := accepted.sign(zoneKeys, now)
+	gap := &dns.NSEC{
+		Hdr:  dns.Header{Name: "a.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "z.example.", TypeBitMap: []uint16{dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	gapSig := accepted.sign([]dns.RR{gap}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{ds, dsSig}, nil), nil
+		case qtype == dns.TypeDNSKEY && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, append(zoneKeys, zoneKeySig), nil), nil
+		case qtype == dns.TypeDS && qname == "www.example.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{gap, gapSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{
+		fetcher: fetcher,
+		anchors: []*dns.DS{root.key.ToDS(dns.SHA256)},
+	}
+	record := &dns.A{
+		Hdr: dns.Header{Name: "www.example.", Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	sig := deprecated.sign([]dns.RR{record}, now)
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{record, sig}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: record.Header().Name, Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, record.Header().Name)
+	if result != dnssec.Insecure || !errors.Is(why, dnssec.ErrUnsupportedSignatureAlgorithm) {
+		t.Fatalf("judge() = %v (%v), want Insecure/unsupported algorithm", result, why)
+	}
+}
+
+func TestValidatorTreatsDeprecatedRSASHA1DenialAsInsecure(t *testing.T) {
+	now := time.Now()
+	accepted := newValidatorTestZone(t, "example.")
+	deprecated := newValidatorTestZoneWithAlgorithm(t, "example.", dns.RSASHA1)
+	rr := &dns.NSEC{
+		Hdr:  dns.Header{Name: "www.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{NextDomain: "x.example.", TypeBitMap: []uint16{dns.TypeNSEC, dns.TypeRRSIG}},
+	}
+	sig := deprecated.sign([]dns.RR{rr}, now)
+	msg := testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{rr, sig})
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: rr.Header().Name, Class: dns.ClassINET}}}
+	plugin := &PluginDNSSECValidate{}
+	chain := dnssec.ChainResult{
+		Status: dnssec.Secure,
+		Zone:   "example.",
+		Keys:   []*dns.DNSKEY{accepted.key, deprecated.key},
+	}
+
+	result, why := plugin.judgeNegativeWithChain(msg, rr.Header().Name, chain, now)
+	if result != dnssec.Insecure || why == nil || !strings.Contains(why.Error(), "unsupported signing algorithm") {
+		t.Fatalf("negative answer = %v (%v), want Insecure/unsupported algorithm", result, why)
+	}
 }
 
 func (z *validatorTestZone) sign(rrset []dns.RR, now time.Time) *dns.RRSIG {
@@ -648,6 +730,43 @@ func TestConfiguredInsecureZoneClearsUpstreamADAndRecordsVerdict(t *testing.T) {
 	}
 }
 
+// Trust anchors are scoped by owner and class. This validator is configured
+// with the IN root anchor, so applying its IN chain walk to a CHAOS answer can
+// only manufacture a false DNSSEC failure (and an internal retry would even
+// ask an IN question in place of the client's CHAOS question). Treat classes
+// outside the configured validation scope as local-policy insecure: return the
+// data without AD and do not reject it in enforce mode.
+func TestNonINClassIsOutsideValidationScope(t *testing.T) {
+	plugin := &PluginDNSSECValidate{mode: ValidationEnforce}
+	msg := dns.NewMsg("version.bind.", dns.TypeTXT)
+	msg.Question[0].Header().Class = dns.ClassCHAOS
+	msg.AuthenticatedData = true
+	msg.Answer = []dns.RR{&dns.TXT{
+		Hdr: dns.Header{Name: "version.bind.", Class: dns.ClassCHAOS, TTL: 0},
+		TXT: rdata.TXT{Txt: []string{"test"}},
+	}}
+	state := PluginsState{
+		qName:       "version.bind",
+		returnCode:  PluginsReturnCodePass,
+		sessionData: map[string]any{},
+		questionMsg: dns.NewMsg("version.bind.", dns.TypeTXT),
+	}
+	state.questionMsg.Question[0].Header().Class = dns.ClassCHAOS
+
+	if err := plugin.Eval(&state, msg); err != nil {
+		t.Fatalf("Eval() = %v", err)
+	}
+	if msg.AuthenticatedData {
+		t.Fatal("non-IN answer retained an upstream AD assertion")
+	}
+	if got := state.sessionData[dnssecVerdictKey]; got != "insecure" {
+		t.Fatalf("verdict = %v, want insecure", got)
+	}
+	if state.action == PluginsActionReject || state.returnCode == PluginsReturnCodeServFail {
+		t.Fatal("non-IN answer was rejected in enforce mode")
+	}
+}
+
 // RFC 4035 section 5.3.1 requires the signer name to identify the zone that
 // contains the RRset. A cryptographically genuine parent signature below a
 // delegated child is therefore not an authentication of the child's record.
@@ -696,6 +815,76 @@ func TestValidatorRejectsAParentSignatureBelowADelegation(t *testing.T) {
 	result, _ := plugin.judge(msg, "www.example.")
 	if result != dnssec.Bogus {
 		t.Fatalf("judge() = %v, want bogus for the parent-zone signature", result)
+	}
+}
+
+// RFC 4035 sections 3.2.3 and 5.5 require AD to cover the answer to the
+// question, not merely some authentic RRset that happens to be in the Answer
+// section. A recursive upstream (or an attacker replaying its signed data)
+// must not be able to replace the requested RRset and its denial proof with an
+// unrelated, validly signed RRset and still receive a Secure verdict.
+func TestValidatorRejectsSignedButUnrelatedPositiveAnswer(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	notADelegation := &dns.NSEC{
+		Hdr: dns.Header{Name: "unrelated.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{
+			NextDomain: "z.",
+			TypeBitMap: []uint16{dns.TypeA, dns.TypeNSEC, dns.TypeRRSIG},
+		},
+	}
+	notADelegationSig := root.sign([]dns.RR{notADelegation}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "unrelated.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{notADelegation, notADelegationSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	unrelated := &dns.A{
+		Hdr: dns.Header{Name: "unrelated.", Class: dns.ClassINET, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{unrelated, root.sign([]dns.RR{unrelated}, now)}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: ".", Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, ".")
+	if result != dnssec.Bogus {
+		t.Fatalf("signed unrelated answer = %v (%v), want bogus", result, why)
+	}
+	if why == nil || !strings.Contains(why.Error(), "proved nothing") {
+		t.Fatalf("signed unrelated answer reason = %v, want missing-denial diagnosis", why)
+	}
+}
+
+// RFC 4035 sections 4.5 and 5.3.1 bind validation and caching to QCLASS as
+// well as QNAME/QTYPE. Even a cryptographically valid CH RRset at the requested
+// owner does not answer an IN question and cannot receive AD for it.
+func TestValidatorRejectsSignedAnswerFromAnotherClass(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		if qname == "." && qtype == dns.TypeDNSKEY {
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+	wrongClass := &dns.A{
+		Hdr: dns.Header{Name: ".", Class: dns.ClassCHAOS, TTL: 300},
+		A:   rdata.A{Addr: netip.MustParseAddr("192.0.2.1")},
+	}
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{wrongClass, root.sign([]dns.RR{wrongClass}, now)}, nil)
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: ".", Class: dns.ClassINET}}}
+
+	result, why := plugin.judge(msg, ".")
+	if result != dnssec.Bogus {
+		t.Fatalf("other-class answer = %v (%v), want bogus", result, why)
 	}
 }
 
@@ -950,6 +1139,63 @@ func TestValidatorAcceptsOnlyCNAMEsSynthesizedByASecureDNAME(t *testing.T) {
 				t.Fatalf("judge() = %v, want %v", result, tc.want)
 			}
 		})
+	}
+}
+
+// RFC 4592 section 4.4 and RFC 6672 sections 3.3 and 8 warn that a DNAME
+// synthesized from a wildcard is non-deterministic: different caches can
+// derive different rewrite rules, and the generated CNAME has no signature
+// of its own. Match Unbound's conservative validator policy and refuse such a
+// DNAME when it is being used for redirection (a literal QTYPE=DNAME lookup is
+// still an exact request for the DNAME data itself).
+func TestValidatorRejectsWildcardSynthesizedDNAMEForRedirection(t *testing.T) {
+	now := time.Now()
+	root := newValidatorTestZone(t, ".")
+	zone := newValidatorTestZone(t, "example.")
+	rootKeySig := root.sign([]dns.RR{root.key}, now)
+	zoneDS := zone.key.ToDS(dns.SHA256)
+	zoneDSSig := root.sign([]dns.RR{zoneDS}, now)
+	zoneKeySig := zone.sign([]dns.RR{zone.key}, now)
+	gap := &dns.NSEC{
+		Hdr: dns.Header{Name: "a.example.", Class: dns.ClassINET, TTL: 300},
+		NSEC: rdata.NSEC{
+			NextDomain: "z.example.",
+			TypeBitMap: []uint16{dns.TypeNSEC, dns.TypeRRSIG},
+		},
+	}
+	gapSig := zone.sign([]dns.RR{gap}, now)
+	fetcher := dnssec.NewCachingFetcher(func(qname string, qtype uint16) (*dns.Msg, error) {
+		switch {
+		case qtype == dns.TypeDNSKEY && qname == ".":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{root.key, rootKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zoneDS, zoneDSSig}, nil), nil
+		case qtype == dns.TypeDNSKEY && qname == "example.":
+			return testDNSMessage(dns.RcodeSuccess, []dns.RR{zone.key, zoneKeySig}, nil), nil
+		case qtype == dns.TypeDS && qname == "x.example.":
+			return testDNSMessage(dns.RcodeSuccess, nil, []dns.RR{gap, gapSig}), nil
+		}
+		return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+	})
+	plugin := &PluginDNSSECValidate{fetcher: fetcher, anchors: []*dns.DS{root.key.ToDS(dns.SHA256)}}
+
+	wildcard := &dns.DNAME{
+		Hdr:   dns.Header{Name: "*.example.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: "target."},
+	}
+	sig := zone.sign([]dns.RR{wildcard}, now)
+	expanded := &dns.DNAME{
+		Hdr:   dns.Header{Name: "x.example.", Class: dns.ClassINET, TTL: 300},
+		DNAME: rdata.DNAME{Target: "target."},
+	}
+	sig.Hdr.Name = expanded.Header().Name
+	msg := testDNSMessage(dns.RcodeSuccess, []dns.RR{expanded, sig}, []dns.RR{gap, gapSig})
+	msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "www.x.example.", Class: dns.ClassINET}}}
+	set := dnssec.GroupRRSets(msg.Answer)[0]
+
+	result, why := plugin.judgeSet(set, dnssec.ChainResult{}, msg, now)
+	if result != dnssec.Bogus {
+		t.Fatalf("wildcard-synthesized DNAME = %v (%v), want bogus", result, why)
 	}
 }
 

@@ -53,6 +53,98 @@ func TestFetcherReturnsKeysAndCachesThem(t *testing.T) {
 	}
 }
 
+// DNSKEY and DS are tied to the exact owner and class that was queried. An
+// authenticated record for a sibling is not chain material for this name,
+// even if a recursive upstream places it in the Answer section.
+func TestFetcherKeepsOnlyExactINChainRecords(t *testing.T) {
+	for _, qtype := range []uint16{dns.TypeDNSKEY, dns.TypeDS} {
+		t.Run(dns.TypeToString[qtype], func(t *testing.T) {
+			z := newZone(t, "example.test.")
+			other := newZone(t, "other.test.")
+			keyWrongClass := *z.key
+			keyWrongClass.Hdr.Class = dns.ClassCHAOS
+			var wanted, wrongOwner, wrongClass dns.RR = z.key, other.key, &keyWrongClass
+			if qtype == dns.TypeDS {
+				wantedDS := z.key.ToDS(dns.SHA256)
+				wrongClassDS := *wantedDS
+				wrongClassDS.Hdr.Class = dns.ClassCHAOS
+				wanted, wrongOwner, wrongClass = wantedDS, other.key.ToDS(dns.SHA256), &wrongClassDS
+			}
+			rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+				return msgWith(dns.RcodeSuccess, []dns.RR{wrongOwner, wrongClass, wanted}, nil), nil
+			}}
+			f := NewCachingFetcher(rec.fn)
+
+			if qtype == dns.TypeDNSKEY {
+				keys, _, err := f.DNSKEY("example.test.")
+				if err != nil {
+					t.Fatalf("DNSKEY(): %v", err)
+				}
+				if len(keys) != 1 || !dns.EqualName(keys[0].Header().Name, "example.test.") || keys[0].Header().Class != dns.ClassINET {
+					t.Fatalf("filtered DNSKEYs = %v, want only exact IN owner", keys)
+				}
+			} else {
+				dss, _, _, err := f.DS("example.test.")
+				if err != nil {
+					t.Fatalf("DS(): %v", err)
+				}
+				if len(dss) != 1 || !dns.EqualName(dss[0].Header().Name, "example.test.") || dss[0].Header().Class != dns.ClassINET {
+					t.Fatalf("filtered DS records = %v, want only exact IN owner", dss)
+				}
+			}
+		})
+	}
+}
+
+// A syntactically delivered response can still be unusable chain evidence.
+// Keep the endpoint exclusion set across those failures just as for a dropped
+// packet, so one empty/truncated resolver cannot cause an unchecked verdict
+// while another configured resolver has the complete RRset.
+func TestFetcherRetriesUnusableDeliveredResponsesAcrossDistinctEndpoints(t *testing.T) {
+	for _, qtype := range []uint16{dns.TypeDNSKEY, dns.TypeDS} {
+		t.Run(dns.TypeToString[qtype], func(t *testing.T) {
+			z := newZone(t, "example.test.")
+			z.key.Hdr.TTL = 300
+			calls := 0
+			servers := []string{"resolver-a", "resolver-b"}
+			f := NewCachingFetcherExcluding(func(_ string, gotType uint16, excluded map[string]struct{}) (*dns.Msg, error) {
+				if gotType != qtype {
+					t.Fatalf("query type = %d, want %d", gotType, qtype)
+				}
+				if len(excluded) != calls {
+					t.Fatalf("attempt %d exclusions = %v", calls+1, excluded)
+				}
+				server := servers[calls]
+				excluded[server] = struct{}{}
+				calls++
+				if calls == 1 {
+					if qtype == dns.TypeDNSKEY {
+						return msgWith(dns.RcodeSuccess, nil, nil), nil
+					}
+					m := msgWith(dns.RcodeSuccess, nil, nil)
+					m.Truncated = true
+					return m, nil
+				}
+				if qtype == dns.TypeDNSKEY {
+					return msgWith(dns.RcodeSuccess, []dns.RR{z.key}, nil), nil
+				}
+				return msgWith(dns.RcodeSuccess, nil, nil), nil
+			})
+
+			if qtype == dns.TypeDNSKEY {
+				if _, _, err := f.DNSKEY("example.test."); err != nil {
+					t.Fatalf("DNSKEY() after alternate endpoint = %v", err)
+				}
+			} else if _, _, _, err := f.DS("example.test."); err != nil {
+				t.Fatalf("DS() after alternate endpoint = %v", err)
+			}
+			if calls != 2 {
+				t.Fatalf("queries = %d, want 2 distinct endpoints", calls)
+			}
+		})
+	}
+}
+
 // The zone's own TTL decides how long its keys are held, so a rollover is
 // picked up when the zone said it would be.
 func TestFetcherHonoursTheTTL(t *testing.T) {
@@ -83,6 +175,91 @@ func TestFetcherHonoursTheTTL(t *testing.T) {
 	}
 	if got := rec.calls["example.test./48"]; got != 2 {
 		t.Errorf("asked %d times after expiry, want 2", got)
+	}
+}
+
+// RFC 8767 section 4 keeps the ordinary TTL as the point at which the source
+// must be consulted again; stale use is permitted only after that refresh
+// attempt fails. In particular, a zero-TTL RR is transaction-only and MUST
+// NOT be cached. The validator may cap long cache lifetimes, but it must not
+// stretch a publisher's short or zero lifetime to its old 60-second floor.
+func TestFetcherDoesNotExtendShortOrZeroTTLs(t *testing.T) {
+	z := newZone(t, "example.test.")
+	sig := z.sign([]dns.RR{z.key}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+
+	for _, tc := range []struct {
+		name string
+		ttl  uint32
+		want time.Duration
+	}{
+		{name: "zero", ttl: 0, want: 0},
+		{name: "short", ttl: 5, want: 5 * time.Second},
+		{name: "long capped", ttl: 7200, want: maxCacheTTL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyCopy := *z.key
+			sigCopy := *sig
+			keyCopy.Hdr.TTL = tc.ttl
+			sigCopy.Hdr.TTL = tc.ttl
+			if got := ttlOf([]dns.RR{&keyCopy, &sigCopy}); got != tc.want {
+				t.Fatalf("ttlOf(%d) = %v, want %v", tc.ttl, got, tc.want)
+			}
+		})
+	}
+
+	// A zero in any member makes the atomic entry transaction-only; do not
+	// lose it merely because a later member has a nonzero TTL.
+	keyCopy := *z.key
+	sigCopy := *sig
+	keyCopy.Hdr.TTL = 0
+	sigCopy.Hdr.TTL = 300
+	if got := ttlOf([]dns.RR{&keyCopy, &sigCopy}); got != 0 {
+		t.Fatalf("ttlOf(mixed zero/nonzero) = %v, want 0", got)
+	}
+}
+
+// RFC 8767 section 7 explicitly excludes zero-TTL data from stale fallback.
+// It can be used for the transaction that fetched it, but after that a failed
+// refresh must be reported rather than resurrecting the transaction-only key
+// or delegation signer from the validator's private cache.
+func TestFetcherNeverUsesZeroTTLChainMaterialAsStale(t *testing.T) {
+	for _, qtype := range []uint16{dns.TypeDNSKEY, dns.TypeDS} {
+		t.Run(dns.TypeToString[qtype], func(t *testing.T) {
+			z := newZone(t, "example.test.")
+			z.key.Hdr.TTL = 0
+			var rr dns.RR = z.key
+			if qtype == dns.TypeDS {
+				rr = z.key.ToDS(dns.SHA256)
+				rr.Header().TTL = 0
+			}
+			sig := z.sign([]dns.RR{rr}, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+			sig.Hdr.TTL = 0
+			calls := 0
+			rec := &recordingQuery{respond: func(string, uint16) (*dns.Msg, error) {
+				calls++
+				if calls == 1 {
+					return msgWith(dns.RcodeSuccess, []dns.RR{rr, sig}, nil), nil
+				}
+				return nil, fmt.Errorf("upstream unreachable")
+			}}
+			f := NewCachingFetcher(rec.fn)
+
+			if qtype == dns.TypeDNSKEY {
+				if _, _, err := f.DNSKEY("example.test."); err != nil {
+					t.Fatalf("first DNSKEY fetch: %v", err)
+				}
+				if _, _, err := f.DNSKEY("example.test."); err == nil {
+					t.Fatal("zero-TTL DNSKEY was reused after refresh failure")
+				}
+			} else {
+				if _, _, _, err := f.DS("example.test."); err != nil {
+					t.Fatalf("first DS fetch: %v", err)
+				}
+				if _, _, _, err := f.DS("example.test."); err == nil {
+					t.Fatal("zero-TTL DS was reused after refresh failure")
+				}
+			}
+		})
 	}
 }
 
@@ -329,6 +506,28 @@ func TestFetcherCarriesEndpointExclusionsAcrossRetries(t *testing.T) {
 	}
 	if calls != chainFetchAttempts {
 		t.Fatalf("upstream asked %d time(s), want %d distinct attempts", calls, chainFetchAttempts)
+	}
+}
+
+func TestFetcherCountsPreviouslyExcludedEndpointsAgainstRetryBudget(t *testing.T) {
+	calls := 0
+	excluded := map[string]struct{}{"resolver-a": {}}
+	remaining := []string{"resolver-b", "resolver-c"}
+	f := NewCachingFetcherExcluding(func(_ string, _ uint16, got map[string]struct{}) (*dns.Msg, error) {
+		if got == nil || len(got) != calls+1 {
+			t.Fatalf("attempt %d exclusions = %v, want %d entries", calls+1, got, calls+1)
+		}
+		server := remaining[calls]
+		got[server] = struct{}{}
+		calls++
+		return nil, fmt.Errorf("%s timed out", server)
+	})
+
+	if _, _, _, err := f.DSExcluding("example.test.", excluded); err == nil {
+		t.Fatal("DSExcluding() should report exhaustion")
+	}
+	if calls != chainFetchAttempts-1 {
+		t.Fatalf("additional attempts = %d, want %d", calls, chainFetchAttempts-1)
 	}
 }
 

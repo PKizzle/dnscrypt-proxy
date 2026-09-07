@@ -196,15 +196,23 @@ func coversType(bitmap []uint16, rrtype uint16) bool {
 type Denial struct {
 	NSEC  []*dns.NSEC
 	NSEC3 []*dns.NSEC3
-	sigs  []*dns.RRSIG
+	// policyNSEC and policyNSEC3 contain structurally usable records whose
+	// corresponding authenticated DNSKEY exists, but whose only covering
+	// RRSIG uses an algorithm disabled by resolver policy. They are never
+	// combined into a Secure proof. Status methods try the ordinary records
+	// first, then may use the combined set only to return Insecure.
+	policyNSEC  []*dns.NSEC
+	policyNSEC3 []*dns.NSEC3
+	sigs        []*dns.RRSIG
 	// cnames is positive evidence collected only from a DS lookup. A signed,
 	// exact CNAME at the queried name proves that the current zone owns that
 	// name, and therefore that it is not a delegation point. Keeping it with
 	// the DS-absence evidence lets the chain distinguish that ordinary case
 	// from a response whose absence of DS data was merely unexplained.
-	cnames    []*dns.CNAME
-	cnameSigs []*dns.RRSIG
-	zone      string
+	cnames       []*dns.CNAME
+	cnameSigs    []*dns.RRSIG
+	policyCNAMEs []*dns.CNAME
+	zone         string
 }
 
 // CollectDenial picks the denial records out of an authority section.
@@ -287,21 +295,36 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 			// check and follows the owner construction in RFC 5155 section 3.
 			continue
 		}
-		if res, err := VerifyRRSet(set.Records, set.Sigs, keys, now); res != Secure || err != nil {
+		res, _ := VerifyRRSet(set.Records, set.Sigs, keys, now)
+		if res != Secure && res != Insecure {
 			continue
 		}
-		if set.Type == dns.TypeNSEC && !hasExactNSECSignature(set, keys, now) {
+		if set.Type == dns.TypeNSEC {
 			// RFC 4035 section 5.4: a matching NSEC establishes that wildcard
 			// expansion was not used only when the signer recorded the same
 			// label count as the NSEC owner. A valid wildcard-expanded NSEC is
 			// not a statement about an exact existing owner, so it must not be
 			// used as any kind of denial proof.
-			continue
+			res = exactNSECSignatureStatus(set, keys, now)
+			if res != Secure && res != Insecure {
+				continue
+			}
 		}
 		for _, rr := range set.Records {
 			switch rr := rr.(type) {
 			case *dns.NSEC:
-				verified.NSEC = append(verified.NSEC, rr)
+				// RFC 4034 section 4.1.1: Next Domain Name is another
+				// authoritative owner in this same zone (or the zone apex when
+				// the interval wraps).  A signer cannot use its final interval to
+				// deny names beyond the namespace its key authenticates.
+				if !WithinZone(rr.NextDomain, zone) {
+					continue
+				}
+				if res == Secure {
+					verified.NSEC = append(verified.NSEC, rr)
+				} else {
+					verified.policyNSEC = append(verified.policyNSEC, rr)
+				}
 			case *dns.NSEC3:
 				// RFC 5155 section 8.2: only flag values 0 and 1 are valid
 				// NSEC3 denial proofs. Unknown flag bits must not be used to
@@ -309,7 +332,11 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 				if rr.Flags != 0 && rr.Flags != 1 {
 					continue
 				}
-				verified.NSEC3 = append(verified.NSEC3, rr)
+				if res == Secure {
+					verified.NSEC3 = append(verified.NSEC3, rr)
+				} else {
+					verified.policyNSEC3 = append(verified.policyNSEC3, rr)
+				}
 			}
 		}
 	}
@@ -319,6 +346,7 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 			continue
 		}
 		rrset := []dns.RR{cname}
+		exactSigs := make([]*dns.RRSIG, 0, len(d.cnameSigs))
 		for _, sig := range signaturesFromZone(d.cnameSigs, zone) {
 			// A wildcard-expanded CNAME alone is not enough: without the
 			// accompanying denial proof, it does not establish that this exact
@@ -327,10 +355,14 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 			if int(sig.Labels) != CountLabels(owner) {
 				continue
 			}
-			if res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, keys, now); res == Secure && err == nil {
-				verified.cnames = append(verified.cnames, cname)
-				break
-			}
+			exactSigs = append(exactSigs, sig)
+		}
+		res, _ := VerifyRRSet(rrset, exactSigs, keys, now)
+		switch res {
+		case Secure:
+			verified.cnames = append(verified.cnames, cname)
+		case Insecure:
+			verified.policyCNAMEs = append(verified.policyCNAMEs, cname)
 		}
 	}
 	return verified
@@ -343,7 +375,8 @@ func (d Denial) Verified(keys []*dns.DNSKEY, zone string, now time.Time) Denial 
 // label count without the wildcard label, and RFC 4035 appendix B.7 uses that
 // record to prove wildcard NODATA. Inspect every usable signature rather than
 // relying on whichever valid one VerifyRRSet finds first.
-func hasExactNSECSignature(set RRSet, keys []*dns.DNSKEY, now time.Time) bool {
+func exactNSECSignatureStatus(set RRSet, keys []*dns.DNSKEY, now time.Time) Result {
+	policyInsecure := false
 	for _, sig := range set.Sigs {
 		labels := CountLabels(set.Name)
 		exactWildcardOwner := strings.HasPrefix(canonicalName(set.Name), "*.") && int(sig.Labels) == labels-1
@@ -351,15 +384,40 @@ func hasExactNSECSignature(set RRSet, keys []*dns.DNSKEY, now time.Time) bool {
 			continue
 		}
 		if res, _ := VerifyRRSet(set.Records, []*dns.RRSIG{sig}, keys, now); res == Secure {
-			return true
+			return Secure
+		} else if res == Insecure {
+			policyInsecure = true
 		}
 	}
-	return false
+	if policyInsecure {
+		return Insecure
+	}
+	return Indeterminate
 }
 
 // Empty reports whether nothing was offered.
 func (d Denial) Empty() bool {
-	return len(d.NSEC) == 0 && len(d.NSEC3) == 0 && len(d.cnames) == 0
+	return len(d.NSEC) == 0 && len(d.NSEC3) == 0 && len(d.cnames) == 0 &&
+		len(d.policyNSEC) == 0 && len(d.policyNSEC3) == 0 && len(d.policyCNAMEs) == 0
+}
+
+// withPolicyRecords returns a copy containing both fully verified records and
+// records whose only usable signature has an authenticated but policy-disabled
+// algorithm. Callers must use that copy only to decide Insecure, never Secure.
+// Trying the original Denial first ensures an unrelated deprecated signature
+// cannot downgrade a complete proof made with an accepted algorithm.
+func (d Denial) withPolicyRecords() (Denial, bool) {
+	if len(d.policyNSEC) == 0 && len(d.policyNSEC3) == 0 && len(d.policyCNAMEs) == 0 {
+		return d, false
+	}
+	combined := d
+	combined.NSEC = append(append([]*dns.NSEC(nil), d.NSEC...), d.policyNSEC...)
+	combined.NSEC3 = append(append([]*dns.NSEC3(nil), d.NSEC3...), d.policyNSEC3...)
+	combined.cnames = append(append([]*dns.CNAME(nil), d.cnames...), d.policyCNAMEs...)
+	combined.policyNSEC = nil
+	combined.policyNSEC3 = nil
+	combined.policyCNAMEs = nil
+	return combined, true
 }
 
 // HasOnlyUnsupportedNSEC3Iterations reports whether every authenticated
@@ -415,8 +473,8 @@ func (d Denial) HasMixedNSEC3Parameters() bool {
 	return false
 }
 
-// ProvesNoData reports whether the zone proved that name exists but holds no
-// record of rrtype.
+// ProvesNoData reports whether the zone securely proved that name exists but
+// holds no record of rrtype.
 //
 // The proof is a record matching the name whose bitmap omits the type. The
 // bitmap is what carries the meaning, so a CNAME entry has to be refused as
@@ -425,9 +483,44 @@ func (d Denial) HasMixedNSEC3Parameters() bool {
 // hold other RR types, so an exact-owner proof may legitimately omit rrtype.
 // DNAME remains disallowed when an NSEC/NSEC3 is used to deny a descendant.
 func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
+	return d.NoDataStatus(name, rrtype) == Secure
+}
+
+// NoDataStatus preserves an RFC 9905 policy downgrade: records signed only by
+// a corresponding but disabled algorithm may establish an Insecure answer,
+// but can never contribute to a Secure proof.
+func (d Denial) NoDataStatus(name string, rrtype uint16) Result {
+	if d.provesNoData(name, rrtype) {
+		return Secure
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.provesNoData(name, rrtype) {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) provesNoData(name string, rrtype uint16) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
+			// RFC 4035 section 5.4 also permits an NSEC interval to prove
+			// that no RRsets exist at an empty non-terminal.  In canonical
+			// order the owner precedes QNAME, QNAME is covered, and the next
+			// owner is a strict descendant of QNAME.  That descendant is why
+			// the otherwise empty name exists.
+			if canonicalCompare(rr.Header().Name, name) < 0 &&
+				d.nsecMayProveAbsence(rr, name) &&
+				canonicalCompare(rr.NextDomain, name) != 0 &&
+				WithinZone(rr.NextDomain, name) {
+				return true
+			}
 			continue
+		}
+		// RFC 6840 section 4.2: when an ANY response contains no answer
+		// RRsets, validation must establish that no RRsets exist at QNAME.
+		// An exact NSEC owner establishes the opposite even though the ANY
+		// meta-type is (correctly) absent from its bitmap.
+		if rrtype == dns.TypeANY {
+			return false
 		}
 		if coversType(rr.TypeBitMap, rrtype) ||
 			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
@@ -440,6 +533,14 @@ func (d Denial) ProvesNoData(name string, rrtype uint16) bool {
 		hashed := NSEC3Hash(name, rr.Hash, rr.Iterations, rr.Salt)
 		if hashed == "" || hashed != strings.ToUpper(firstLabel(rr.Header().Name)) {
 			continue
+		}
+		if rrtype == dns.TypeANY {
+			// RFC 5155 section 8.5: unlike NSEC, NSEC3 may include an
+			// exact hash with an empty type bitmap specifically to represent
+			// an empty non-terminal. That is the one exact-owner proof which
+			// establishes that an empty ANY answer contains every RRset at
+			// QNAME (namely none), as RFC 6840 section 4.2 requires.
+			return len(rr.TypeBitMap) == 0
 		}
 		if coversType(rr.TypeBitMap, rrtype) ||
 			coversType(rr.TypeBitMap, dns.TypeCNAME) ||
@@ -473,13 +574,24 @@ func (d Denial) ProvesWildcardNoData(name, zone string, rrtype uint16) bool {
 // it into either Secure or "no proof" lets callers serve the valid response
 // without authenticating what the Opt-Out span deliberately did not prove.
 func (d Denial) WildcardNoDataStatus(name, zone string, rrtype uint16) Result {
+	status := d.wildcardNoDataStatus(name, zone, rrtype)
+	if status != Indeterminate {
+		return status
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.wildcardNoDataStatus(name, zone, rrtype) != Indeterminate {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) wildcardNoDataStatus(name, zone string, rrtype uint16) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
 				continue
 			}
-			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
-			if closest != "" && d.ProvesNoData(wildcardName(closest), rrtype) {
+			closest := nsecClosestEncloser(name, rr, zone)
+			if closest != "" && d.provesNoData(wildcardName(closest), rrtype) {
 				return Secure
 			}
 		}
@@ -491,7 +603,7 @@ func (d Denial) WildcardNoDataStatus(name, zone string, rrtype uint16) Result {
 		return Indeterminate
 	}
 	nextCloser := nextCloserName(name, closest)
-	if nextCloser == "" || !d.ProvesNoData(wildcardName(closest), rrtype) {
+	if nextCloser == "" || !d.provesNoData(wildcardName(closest), rrtype) {
 		return Indeterminate
 	}
 	return d.nsec3CoverageStatus(nextCloser)
@@ -515,6 +627,17 @@ func (d Denial) ProvesNoDS(name string) bool {
 // the child is insecure and RFC 5155 section 9.2 forbids authenticating the
 // response as a whole.
 func (d Denial) NoDSStatus(name string) Result {
+	status := d.noDSStatus(name)
+	if status != Indeterminate {
+		return status
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.noDSStatus(name) != Indeterminate {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) noDSStatus(name string) Result {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			continue
@@ -577,6 +700,17 @@ func (d Denial) ProvesNameError(name, zone string) bool {
 // the next-closer span may hide an unsigned delegation, so RFC 5155 section
 // 9.2 explicitly says the response MUST NOT carry AD.
 func (d Denial) NameErrorStatus(name, zone string) Result {
+	status := d.nameErrorStatus(name, zone)
+	if status != Indeterminate {
+		return status
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.nameErrorStatus(name, zone) != Indeterminate {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) nameErrorStatus(name, zone string) Result {
 	if len(d.NSEC) > 0 {
 		for _, rr := range d.NSEC {
 			if !d.nsecMayProveAbsence(rr, name) {
@@ -588,7 +722,7 @@ func (d Denial) NameErrorStatus(name, zone string) Result {
 			// owner and QNAME share the closest encloser. Checking only
 			// "*.zone" would accept a replayed NXDOMAIN for x.b.zone when
 			// "*.b.zone" actually exists.
-			closest := nsecClosestEncloser(name, rr.Header().Name, zone)
+			closest := nsecClosestEncloser(name, rr, zone)
 			if closest != "" && d.nsecCovers(wildcardName(closest)) {
 				return Secure
 			}
@@ -615,35 +749,40 @@ func (d Denial) NameErrorStatus(name, zone string) Result {
 }
 
 // nsecClosestEncloser derives the closest enclosing name retained by an NSEC
-// proof. Unlike NSEC3, canonical NSEC ordering includes the hierarchy: the
-// immediate predecessor that covers QNAME must lie at or below the same
-// closest encloser. RFC 7129 section 5.5 describes this as NSEC implicitly
-// containing the closest-encloser information.
-func nsecClosestEncloser(name, owner, zone string) string {
-	nameLabels := canonicalLabels(name)
-	ownerLabels := canonicalLabels(owner)
+// proof. Both endpoints are existing names. RFC 4592 section 3.3.1 defines the
+// closest encloser as the deepest existing ancestor of QNAME, so it is the
+// longer shared suffix with either the owner or Next Domain Name. Looking only
+// at the owner misses empty non-terminals implied by the next name and checks a
+// higher wildcard than the one the authoritative lookup would actually use.
+func nsecClosestEncloser(name string, rr *dns.NSEC, zone string) string {
+	ownerClosest := sharedTopDomain(name, rr.Header().Name)
+	nextClosest := sharedTopDomain(name, rr.NextDomain)
+	closest := ownerClosest
+	if CountLabels(nextClosest) > CountLabels(ownerClosest) {
+		closest = nextClosest
+	}
+	if !WithinZone(closest, zone) {
+		return ""
+	}
+	return closest
+}
+
+func sharedTopDomain(a, b string) string {
+	nameLabels := canonicalLabels(a)
+	otherLabels := canonicalLabels(b)
 	common := 0
-	for i, j := len(nameLabels)-1, len(ownerLabels)-1; i >= 0 && j >= 0; i, j = i-1, j-1 {
-		if nameLabels[i] != ownerLabels[j] {
+	for i, j := len(nameLabels)-1, len(otherLabels)-1; i >= 0 && j >= 0; i, j = i-1, j-1 {
+		if nameLabels[i] != otherLabels[j] {
 			break
 		}
 		common++
 	}
 	if common == 0 {
-		// The DNS root is an implicit common suffix. canonicalLabels omits its
-		// empty label, so a root-zone NSEC predecessor and a one-label QNAME
-		// otherwise look unrelated. RFC 4035 section 5.4 still requires the
-		// wildcard proof at that closest encloser: "*." rather than "*..".
-		if canonicalName(zone) == "." {
-			return "."
-		}
-		return ""
+		// canonicalLabels omits the root's empty label, which every pair of
+		// absolute DNS names shares.
+		return "."
 	}
-	closest := strings.Join(nameLabels[len(nameLabels)-common:], ".") + "."
-	if !WithinZone(closest, zone) {
-		return ""
-	}
-	return closest
+	return strings.Join(nameLabels[len(nameLabels)-common:], ".") + "."
 }
 
 // wildcardName returns the wildcard at closest. The root's wildcard is "*.",
@@ -809,6 +948,17 @@ func (d Denial) ProvesNoCloserMatch(nextCloser string) bool {
 // NameErrorStatus. A signed wildcard RRset plus an Opt-Out span still cannot
 // authenticate that no unsigned delegation exists closer to QNAME.
 func (d Denial) NoCloserMatchStatus(nextCloser string) Result {
+	status := d.noCloserMatchStatus(nextCloser)
+	if status != Indeterminate {
+		return status
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.noCloserMatchStatus(nextCloser) != Indeterminate {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) noCloserMatchStatus(nextCloser string) Result {
 	for _, rr := range d.NSEC {
 		if d.nsecMayProveAbsence(rr, nextCloser) {
 			return Secure
@@ -835,6 +985,22 @@ func (d Denial) NoCloserMatchStatus(nextCloser string) Result {
 // and treating that as "not a delegation" would hand the parent's keys to a
 // child zone and refuse its unsigned answers as forged.
 func (d Denial) ProvesNotADelegation(name string) bool {
+	return d.NotADelegationStatus(name) == Secure
+}
+
+// NotADelegationStatus distinguishes a fully authenticated proof from one
+// whose necessary RRsets use only a policy-disabled signing algorithm.
+func (d Denial) NotADelegationStatus(name string) Result {
+	if d.provesNotADelegation(name) {
+		return Secure
+	}
+	if combined, ok := d.withPolicyRecords(); ok && combined.provesNotADelegation(name) {
+		return Insecure
+	}
+	return Indeterminate
+}
+
+func (d Denial) provesNotADelegation(name string) bool {
 	for _, rr := range d.NSEC {
 		if canonicalCompare(rr.Header().Name, name) != 0 {
 			if d.nsecMayProveAbsence(rr, name) {
@@ -878,7 +1044,7 @@ func (d Denial) ProvesNotADelegation(name string) bool {
 	// that name would have stopped wildcard synthesis, so this is positive
 	// evidence that the name is not a zone cut. RFC 5155 section 8.7 requires
 	// the closest-encloser and wildcard proofs used here.
-	return d.zone != "" && d.ProvesWildcardNoData(name, d.zone, dns.TypeDS)
+	return d.zone != "" && d.wildcardNoDataStatus(name, d.zone, dns.TypeDS) == Secure
 }
 
 // nsec3MayProveAbsence is the NSEC3 form of the RFC 6840 section 4.1 guard.

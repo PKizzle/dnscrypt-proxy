@@ -100,11 +100,28 @@ const chainFetchAttempts = 3
 // whether it came from the network or from here.
 const maxStale = 24 * time.Hour
 
-// ask sends a query, retrying a failure or an empty reply.
-func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
+// ask sends a query, retrying transport failures and delivered messages that
+// cannot be complete evidence for this chain RRset. check deliberately covers
+// only response-envelope requirements; cryptographic validation happens after
+// parsing with the authenticated parent keys.
+func (f *CachingFetcher) ask(zone string, qtype uint16, excluded map[string]struct{}, check func(*dns.Msg) error) (*dns.Msg, error) {
 	var lastErr error
-	excluded := map[string]struct{}{}
-	for attempt := 0; attempt < chainFetchAttempts; attempt++ {
+	if excluded == nil {
+		excluded = map[string]struct{}{}
+	}
+	attemptLimit := chainFetchAttempts
+	if f.QueryExcluding != nil {
+		// A pool-aware chain walk keeps this set across a response that was
+		// delivered but failed later cryptographic validation. Those endpoints
+		// already consumed part of the same logical RRset budget; without this
+		// subtraction one bad response followed by transport failures could
+		// exceed chainFetchAttempts despite using the shared exclusion map.
+		attemptLimit -= len(excluded)
+		if attemptLimit <= 0 {
+			return nil, fmt.Errorf("all %d upstream attempts exhausted for %s/%d", chainFetchAttempts, zone, qtype)
+		}
+	}
+	for attempt := 0; attempt < attemptLimit; attempt++ {
 		var msg *dns.Msg
 		var err error
 		if f.QueryExcluding != nil {
@@ -113,7 +130,15 @@ func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
 			msg, err = f.Query(zone, qtype)
 		}
 		if err == nil && msg != nil {
-			return msg, nil
+			if check == nil {
+				return msg, nil
+			}
+			if checkErr := check(msg); checkErr == nil {
+				return msg, nil
+			} else {
+				lastErr = checkErr
+				continue
+			}
 		}
 		if err != nil {
 			lastErr = err
@@ -122,6 +147,37 @@ func (f *CachingFetcher) ask(zone string, qtype uint16) (*dns.Msg, error) {
 		}
 	}
 	return nil, lastErr
+}
+
+func usableDNSKEYResponse(zone string) func(*dns.Msg) error {
+	return func(msg *dns.Msg) error {
+		if msg.Rcode != dns.RcodeSuccess {
+			return fmt.Errorf("DNSKEY %s: rcode %d", zone, msg.Rcode)
+		}
+		if msg.Truncated {
+			return fmt.Errorf("DNSKEY %s: truncated", zone)
+		}
+		for _, rr := range msg.Answer {
+			if _, ok := rr.(*dns.DNSKEY); ok && dns.EqualName(rr.Header().Name, zone) && rr.Header().Class == dns.ClassINET {
+				return nil
+			}
+		}
+		return fmt.Errorf("no keys in the answer for %s", zone)
+	}
+}
+
+func usableDSResponse(zone string) func(*dns.Msg) error {
+	return func(msg *dns.Msg) error {
+		switch msg.Rcode {
+		case dns.RcodeSuccess, dns.RcodeNameError:
+		default:
+			return fmt.Errorf("DS %s: rcode %d", zone, msg.Rcode)
+		}
+		if msg.Truncated {
+			return fmt.Errorf("DS %s: truncated", zone)
+		}
+		return nil
+	}
 }
 
 func (f *CachingFetcher) now() time.Time {
@@ -133,6 +189,18 @@ func (f *CachingFetcher) now() time.Time {
 
 // DNSKEY returns the key set of zone.
 func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	return f.dnskey(zone, nil)
+}
+
+// DNSKEYExcluding is the chain-walk form of DNSKEY. The caller owns excluded
+// for one logical RRset validation attempt and keeps it across
+// verify/evict/re-fetch cycles, so a cryptographically stale endpoint cannot
+// be selected again on the nominal retry.
+func (f *CachingFetcher) DNSKEYExcluding(zone string, excluded map[string]struct{}) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	return f.dnskey(zone, excluded)
+}
+
+func (f *CachingFetcher) dnskey(zone string, excluded map[string]struct{}) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
 	zone = canonicalName(zone)
 
 	f.mu.Lock()
@@ -158,7 +226,7 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 		return nil, nil, err
 	}
 
-	msg, err := f.ask(zone, dns.TypeDNSKEY)
+	msg, err := f.ask(zone, dns.TypeDNSKEY, excluded, usableDNSKEYResponse(zone))
 	if err != nil {
 		return fall(err)
 	}
@@ -179,17 +247,30 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 	for _, rr := range msg.Answer {
 		switch v := rr.(type) {
 		case *dns.DNSKEY:
-			keys = append(keys, v)
+			if dns.EqualName(v.Header().Name, zone) && v.Header().Class == dns.ClassINET {
+				keys = append(keys, v)
+			}
 		case *dns.RRSIG:
-			sigs = append(sigs, v)
+			if v.TypeCovered == dns.TypeDNSKEY && dns.EqualName(v.Header().Name, zone) && v.Header().Class == dns.ClassINET {
+				sigs = append(sigs, v)
+			}
 		}
 	}
 	if len(keys) == 0 {
 		return fall(fmt.Errorf("no keys in the answer for %s", zone))
 	}
 
+	ttl := ttlOf(msg.Answer)
 	f.mu.Lock()
-	f.keys[zone] = &keyEntry{keys: keys, sigs: sigs, expires: f.now().Add(ttlOf(msg.Answer))}
+	if ttl == 0 {
+		// RFC 8767 sections 4 and 7: zero-TTL data is usable only for
+		// this transaction. Remove an older held value as well, because a
+		// successful transaction-only refresh supersedes it and must never
+		// become a later serve-stale fallback.
+		delete(f.keys, zone)
+	} else {
+		f.keys[zone] = &keyEntry{keys: keys, sigs: sigs, expires: f.now().Add(ttl)}
+	}
 	f.mu.Unlock()
 	return keys, sigs, nil
 }
@@ -201,6 +282,16 @@ func (f *CachingFetcher) DNSKEY(zone string) ([]*dns.DNSKEY, []*dns.RRSIG, error
 // one that it is an unsigned delegation; it must never infer the latter just
 // because a DS lookup returned NXDOMAIN.
 func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	return f.ds(zone, nil)
+}
+
+// DSExcluding is DS with the per-RRset endpoint exclusion context retained by
+// the chain verifier across signed-but-invalid and inconclusive responses.
+func (f *CachingFetcher) DSExcluding(zone string, excluded map[string]struct{}) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	return f.ds(zone, excluded)
+}
+
+func (f *CachingFetcher) ds(zone string, excluded map[string]struct{}) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
 	zone = canonicalName(zone)
 
 	f.mu.Lock()
@@ -221,7 +312,7 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 		return nil, nil, Denial{}, err
 	}
 
-	msg, err := f.ask(zone, dns.TypeDS)
+	msg, err := f.ask(zone, dns.TypeDS, excluded, usableDSResponse(zone))
 	if err != nil {
 		return fall(err)
 	}
@@ -251,9 +342,13 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 	for _, rr := range msg.Answer {
 		switch v := rr.(type) {
 		case *dns.DS:
-			dss = append(dss, v)
+			if dns.EqualName(v.Header().Name, zone) && v.Header().Class == dns.ClassINET {
+				dss = append(dss, v)
+			}
 		case *dns.RRSIG:
-			sigs = append(sigs, v)
+			if v.TypeCovered == dns.TypeDS && dns.EqualName(v.Header().Name, zone) && v.Header().Class == dns.ClassINET {
+				sigs = append(sigs, v)
+			}
 		}
 	}
 
@@ -281,8 +376,13 @@ func (f *CachingFetcher) DS(zone string) ([]*dns.DS, []*dns.RRSIG, Denial, error
 			return dss, sigs, denial, nil
 		}
 	}
+	ttl := ttlOf(records)
 	f.mu.Lock()
-	f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, denial: denial, expires: f.now().Add(ttlOf(records))}
+	if ttl == 0 {
+		delete(f.dss, zone)
+	} else {
+		f.dss[zone] = &dsEntry{dss: dss, sigs: sigs, denial: denial, expires: f.now().Add(ttl)}
+	}
 	f.mu.Unlock()
 	return dss, sigs, denial, nil
 }
@@ -309,26 +409,27 @@ func (f *CachingFetcher) Forget() {
 	f.mu.Unlock()
 }
 
-const (
-	minCacheTTL = 60 * time.Second
-	maxCacheTTL = time.Hour
-)
+const maxCacheTTL = time.Hour
 
 // ttlOf returns how long a set may be held: the smallest TTL in it, bounded so
-// that a zone publishing seconds cannot turn every lookup into a fetch, and one
-// publishing weeks cannot pin a superseded key past a rollover.
+// that a zone publishing weeks cannot pin a superseded key past a rollover.
+// Short lifetimes are not raised: RFC 8767 section 4 requires a refresh attempt
+// at expiry, and a zero-TTL record is transaction-only and cannot be cached or
+// used as stale data at all.
 func ttlOf(rrs []dns.RR) time.Duration {
-	smallest := uint32(0)
+	var smallest uint32
+	found := false
 	for _, rr := range rrs {
 		ttl := rr.Header().TTL
-		if smallest == 0 || ttl < smallest {
+		if !found || ttl < smallest {
 			smallest = ttl
+			found = true
 		}
 	}
-	d := time.Duration(smallest) * time.Second
-	if d < minCacheTTL {
-		return minCacheTTL
+	if !found {
+		return 0
 	}
+	d := time.Duration(smallest) * time.Second
 	if d > maxCacheTTL {
 		return maxCacheTTL
 	}

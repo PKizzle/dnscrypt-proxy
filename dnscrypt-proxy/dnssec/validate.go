@@ -60,6 +60,12 @@ var ErrNoSignature = fmt.Errorf("rrset carries no signature")
 // not evidence that the zone itself published bad data.
 var ErrSignatureOutsideValidity = errors.New("signature is outside its validity")
 
+// ErrUnsupportedSignatureAlgorithm reports that every otherwise relevant
+// signature used an algorithm disabled by resolver policy. RFC 9905 section 2
+// requires operators to treat RSASHA1 and RSASHA1-NSEC3-SHA1 this way even
+// though implementations must retain the code needed to verify them.
+var ErrUnsupportedSignatureAlgorithm = errors.New("unsupported DNSSEC signing algorithm")
+
 // VerifyRRSet reports whether rrset is covered by a signature that verifies
 // against one of keys and is valid at now.
 //
@@ -139,7 +145,7 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 	// whole function exists for.
 	checkable := false
 	for _, ds := range dss {
-		if supportedDNSKEYAlgorithm(ds.Algorithm) && supportedDSDigest(ds.DigestType) {
+		if acceptedDNSKEYAlgorithm(ds.Algorithm) && supportedDSDigest(ds.DigestType) {
 			checkable = true
 			break
 		}
@@ -148,7 +154,7 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 	anchored := make([]*dns.DNSKEY, 0, len(keys))
 	for _, key := range keys {
 		for _, ds := range dss {
-			if !supportedDNSKEYAlgorithm(ds.Algorithm) || !supportedDSDigest(ds.DigestType) {
+			if !acceptedDNSKEYAlgorithm(ds.Algorithm) || !supportedDSDigest(ds.DigestType) {
 				continue
 			}
 			if key.KeyTag() != ds.KeyTag || key.Algorithm != ds.Algorithm {
@@ -204,17 +210,16 @@ func VerifyDNSKEYs(keys []*dns.DNSKEY, sigs []*dns.RRSIG, dss []*dns.DS, now tim
 	return Secure, nil
 }
 
-// supportedDNSKEYAlgorithm mirrors the algorithms implemented by the pinned
-// dns.RRSIG.Verify method. Merely being assigned an IANA number, or appearing
-// in dns.AlgorithmToString, does not mean this build can verify it (that table
-// also contains DSA, GOST and Ed448). RFC 4035 section 5.2 makes this an input
-// to delegation security, so guessing support here can turn an unsupported
-// zone into a false Bogus result.
-func supportedDNSKEYAlgorithm(algorithm uint8) bool {
+// acceptedDNSKEYAlgorithm is the resolver operator's validation policy, not
+// merely a list of code paths implemented by dns.RRSIG.Verify. RFC 9905
+// section 2 requires implementations to retain RSASHA1 verification support,
+// but requires operators to treat algorithms 5 and 7 as unsupported for both
+// DS records and DNSSEC signatures; they are therefore deliberately absent
+// here. Merely appearing in the DNS library's name table does not establish
+// support either (that table also contains DSA, GOST, and Ed448).
+func acceptedDNSKEYAlgorithm(algorithm uint8) bool {
 	switch algorithm {
-	case dns.RSASHA1,
-		dns.RSASHA1NSEC3SHA1,
-		dns.RSASHA256,
+	case dns.RSASHA256,
 		dns.RSASHA512,
 		dns.ECDSAP256SHA256,
 		dns.ECDSAP384SHA384,
@@ -376,6 +381,19 @@ func WildcardNextCloser(sig *dns.RRSIG, owner string) (string, bool) {
 	}
 	name := strings.ToLower(strings.TrimSuffix(owner, "."))
 	labels := strings.Split(name, ".")
+	// RFC 4034 section 3.1.3 also encodes the leading wildcard label by
+	// decrementing Labels when the RRset owner itself is "*.zone". Rebuild
+	// the owner that was signed before deciding this was synthesis. If it is
+	// identical to the returned owner, the client queried the wildcard name
+	// literally and there is no missing closer name to prove.
+	wildcardLabels := []string{"*"}
+	if sig.Labels > 0 {
+		wildcardLabels = append(wildcardLabels, labels[len(labels)-int(sig.Labels):]...)
+	}
+	signedOwner := strings.Join(wildcardLabels, ".") + "."
+	if canonicalName(owner) == signedOwner {
+		return "", false
+	}
 	// One label more than the closest encloser the signature vouches for.
 	keep := int(sig.Labels) + 1
 	if keep > len(labels) {
@@ -399,8 +417,20 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 	}
 
 	var lastErr error
+	unsupportedOnly := false
 	for _, sig := range sigs {
 		if !covers(sig, rrset) {
+			continue
+		}
+		if !acceptedDNSKEYAlgorithm(sig.Algorithm) {
+			// RFC 6840 section 5.12 requires extra signatures whose
+			// algorithm/key does not exist in the authenticated DNSKEY RRset
+			// to be disregarded. Only a signature with a corresponding usable
+			// zone key can establish that this RRset relies on an algorithm the
+			// operator has deliberately classified as unsupported.
+			if hasCorrespondingDNSKEY(sig, keys, rrset) {
+				unsupportedOnly = true
+			}
 			continue
 		}
 		if !ValidAt(sig, now) {
@@ -412,6 +442,16 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 				continue
 			}
 			if key.Flags&dns.FlagZONE == 0 {
+				continue
+			}
+			// RFC 5011 section 2.1: a revoked key is permanently invalid
+			// except for authenticating the RRSIG it made over its own DNSKEY
+			// RRset so that the revocation can be established.  In particular,
+			// retaining the key in an authenticated DNSKEY set does not let it
+			// continue signing ordinary zone data.
+			if key.Flags&dns.FlagREVOKE != 0 &&
+				(dns.RRToType(rrset[0]) != dns.TypeDNSKEY ||
+					!dns.EqualName(rrset[0].Header().Name, key.Header().Name)) {
 				continue
 			}
 			// RFC 4034 section 2.1.2: any other value means the key is not
@@ -429,15 +469,39 @@ func VerifyRRSetDetail(rrset []dns.RR, sigs []*dns.RRSIG, keys []*dns.DNSKEY, no
 			lastErr = fmt.Errorf("no key matches signature by key %d", sig.KeyTag)
 		}
 	}
+	if unsupportedOnly {
+		// RFC 9905 section 2 explicitly renders the RRset Insecure when no
+		// other supported signing algorithm validates it. That result takes
+		// precedence over failures from alternative signatures, while a valid
+		// accepted signature returned Secure above (RFC 6840 section 5.4).
+		return Insecure, nil, ErrUnsupportedSignatureAlgorithm
+	}
 	if lastErr == nil {
 		return Indeterminate, nil, ErrNoSignature
 	}
-	// Algorithm support is decided from the authenticated DS before this point.
-	// ErrKey here therefore means that matching material for an algorithm this
-	// build supports was malformed or unusable. RFC 4035 sections 4.3 and 5.5
-	// require that failed authentication to remain Bogus; treating it as
-	// Insecure would be a downgrade around the chain of trust.
+	// Unsupported algorithms were skipped above. ErrKey here therefore means
+	// that matching material for an accepted algorithm was malformed or
+	// unusable. RFC 4035 sections 4.3 and 5.5 require that failed authentication
+	// to remain Bogus; treating it as Insecure would be a downgrade around the
+	// chain of trust.
 	return Bogus, nil, lastErr
+}
+
+func hasCorrespondingDNSKEY(sig *dns.RRSIG, keys []*dns.DNSKEY, rrset []dns.RR) bool {
+	for _, key := range keys {
+		if key.Algorithm != sig.Algorithm || key.KeyTag() != sig.KeyTag ||
+			key.Flags&dns.FlagZONE == 0 || key.Protocol != 3 ||
+			!dns.EqualName(key.Header().Name, sig.SignerName) {
+			continue
+		}
+		if key.Flags&dns.FlagREVOKE != 0 &&
+			(dns.RRToType(rrset[0]) != dns.TypeDNSKEY ||
+				!dns.EqualName(rrset[0].Header().Name, key.Header().Name)) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // SignatureExpiry returns the moment a signature stops being valid.

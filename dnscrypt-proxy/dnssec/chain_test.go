@@ -92,6 +92,36 @@ type failingDSHierarchy struct {
 	zone string
 }
 
+// deprecatedDelegationSignatureHierarchy authenticates an RSASHA1 key as part
+// of the parent's DNSKEY RRset, then uses only that key to sign a child DS
+// RRset. RFC 9905 requires the resulting delegation response to be Insecure,
+// even though the parent itself also has an accepted authentication path.
+type deprecatedDelegationSignatureHierarchy struct {
+	*hierarchy
+	deprecated *zone
+}
+
+func (h *deprecatedDelegationSignatureHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
+	if canonicalName(zoneName) != "." {
+		return h.hierarchy.DNSKEY(zoneName)
+	}
+	root := h.zones["."]
+	keys := []*dns.DNSKEY{root.key, h.deprecated.key}
+	rrset := []dns.RR{root.key, h.deprecated.key}
+	return keys, []*dns.RRSIG{root.sign(rrset, h.now.Add(-time.Hour), h.now.Add(time.Hour))}, nil
+}
+
+func (h *deprecatedDelegationSignatureHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if canonicalName(zoneName) != "test." {
+		return h.hierarchy.DS(zoneName)
+	}
+	child := h.zones["test."]
+	ds := child.key.ToDS(dns.SHA256)
+	return []*dns.DS{ds}, []*dns.RRSIG{
+		h.deprecated.sign([]dns.RR{ds}, h.now.Add(-time.Hour), h.now.Add(time.Hour)),
+	}, Denial{}, nil
+}
+
 func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
 	if canonicalName(zoneName) != "." {
 		return h.hierarchy.DNSKEY(zoneName)
@@ -352,6 +382,19 @@ func TestBuildChainReachesASignedZone(t *testing.T) {
 	}
 }
 
+func TestBuildChainPreservesInsecureForDeprecatedDelegationSignature(t *testing.T) {
+	h := newHierarchy(t, ".", "test.")
+	f := &deprecatedDelegationSignatureHierarchy{
+		hierarchy:  h,
+		deprecated: newZoneWithAlgorithm(t, ".", dns.RSASHA1),
+	}
+
+	res := BuildChain(f, "test.", h.anchors(), h.now)
+	if res.Status != Insecure {
+		t.Fatalf("BuildChain() = %v (%v), want Insecure", res.Status, res.Why)
+	}
+}
+
 // A zone whose parent publishes no DS is unsigned, which is ordinary and not a
 // failure -- but the walk must stop there rather than pretend to have keys.
 func TestBuildChainStopsAtAnUnsignedDelegation(t *testing.T) {
@@ -458,6 +501,77 @@ func TestBuildChainRefetchesAnInvalidRootKeySet(t *testing.T) {
 	}
 	if f.calls != 2 {
 		t.Fatalf("root DNSKEY calls = %d, want 2 (invalid response then refetch)", f.calls)
+	}
+}
+
+// A response that arrived but failed cryptographic validation can be stale at
+// one recursive endpoint while another endpoint already has the rollover.
+// Preserve the endpoint exclusion set across the verify/evict/re-fetch loop;
+// otherwise every nominal retry may select the same bad resolver again.
+func TestChainRetriesInvalidRootKeysAcrossDistinctEndpoints(t *testing.T) {
+	now := time.Now()
+	root := newZone(t, ".")
+	validSig := root.sign([]dns.RR{root.key}, now.Add(-time.Hour), now.Add(time.Hour))
+	badSig := *validSig
+	badSig.Signature = "AAAA"
+	calls := 0
+	servers := []string{"resolver-a", "resolver-b"}
+	fetcher := NewCachingFetcherExcluding(func(qname string, qtype uint16, excluded map[string]struct{}) (*dns.Msg, error) {
+		if qname != "." || qtype != dns.TypeDNSKEY {
+			return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+		}
+		if len(excluded) != calls {
+			t.Fatalf("attempt %d exclusions = %v, want %d prior endpoint(s)", calls+1, excluded, calls)
+		}
+		excluded[servers[calls]] = struct{}{}
+		calls++
+		if calls == 1 {
+			return msgWith(dns.RcodeSuccess, []dns.RR{root.key, &badSig}, nil), nil
+		}
+		return msgWith(dns.RcodeSuccess, []dns.RR{root.key, validSig}, nil), nil
+	})
+
+	result := BuildChain(fetcher, ".", []*dns.DS{root.key.ToDS(dns.SHA256)}, now)
+	if result.Status != Secure {
+		t.Fatalf("BuildChain() = %v (%v), want secure from second endpoint", result.Status, result.Why)
+	}
+	if calls != 2 {
+		t.Fatalf("queries = %d, want 2 distinct endpoints", calls)
+	}
+}
+
+func TestChainRetriesInvalidDelegationSignerAcrossDistinctEndpoints(t *testing.T) {
+	now := time.Now()
+	root := newZone(t, ".")
+	child := newZone(t, "child.")
+	ds := child.key.ToDS(dns.SHA256)
+	validSig := root.sign([]dns.RR{ds}, now.Add(-time.Hour), now.Add(time.Hour))
+	badSig := *validSig
+	badSig.Signature = "AAAA"
+	calls := 0
+	servers := []string{"resolver-a", "resolver-b"}
+	fetcher := NewCachingFetcherExcluding(func(qname string, qtype uint16, excluded map[string]struct{}) (*dns.Msg, error) {
+		if qname != "child." || qtype != dns.TypeDS {
+			return nil, fmt.Errorf("unexpected DNSSEC fetch %s/%d", qname, qtype)
+		}
+		if len(excluded) != calls {
+			t.Fatalf("attempt %d exclusions = %v, want %d prior endpoint(s)", calls+1, excluded, calls)
+		}
+		excluded[servers[calls]] = struct{}{}
+		calls++
+		if calls == 1 {
+			return msgWith(dns.RcodeSuccess, []dns.RR{ds, &badSig}, nil), nil
+		}
+		return msgWith(dns.RcodeSuccess, []dns.RR{ds, validSig}, nil), nil
+	})
+	parent := ChainResult{Status: Secure, Keys: []*dns.DNSKEY{root.key}, Zone: "."}
+
+	dss, _, _, err, invalid := verifiedDelegationSigners(fetcher, "child.", parent, now)
+	if err != nil || invalid || len(dss) != 1 {
+		t.Fatalf("verifiedDelegationSigners() = %d DS, invalid=%v, err=%v", len(dss), invalid, err)
+	}
+	if calls != 2 {
+		t.Fatalf("queries = %d, want 2 distinct endpoints", calls)
 	}
 }
 

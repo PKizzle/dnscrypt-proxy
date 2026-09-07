@@ -331,12 +331,13 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	if qName == "" {
 		return nil
 	}
+	qclass := msg.Question[0].Header().Class
 	qtype := dns.RRToType(msg.Question[0])
 	qtypeName := dns.TypeToString[qtype]
 	if qtypeName == "" {
 		qtypeName = fmt.Sprintf("TYPE%d", qtype)
 	}
-	if pluginsState.returnCode == PluginsReturnCodeServFail && plugin.proxy != nil {
+	if qclass == dns.ClassINET && pluginsState.returnCode == PluginsReturnCodeServFail && plugin.proxy != nil {
 		if returnCode, serverName, recovered := retryDNSSECUpstreamSERVFAIL(
 			msg,
 			qName,
@@ -359,9 +360,20 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	}
 
 	configuredInsecure := plugin.isInsecureZone(qName)
+	outsideValidationScope := qclass != dns.ClassINET
 	var result dnssec.Result
 	var why error
-	if configuredInsecure {
+	if outsideValidationScope {
+		// The configured root trust anchor is an IN DS and every auxiliary
+		// DNSKEY/DS lookup is consequently IN. RFC 4035 section 5.3.1 makes
+		// class part of RRset/signature identity; applying that chain to CH,
+		// HS, or another class would manufacture a false validation result.
+		// Treat unsupported classes as an explicit local insecure policy under
+		// RFC 4033 section 5, return no AD assertion, and never substitute an
+		// internally retried IN answer for the client's non-IN question.
+		result = dnssec.Insecure
+		why = fmt.Errorf("DNS class %d is outside the IN validation scope", qclass)
+	} else if configuredInsecure {
 		// A local policy exception says only that this validator deliberately
 		// did not authenticate the name. It does not authorize an upstream's
 		// AD assertion. Run it through the normal Insecure result path so AD is
@@ -372,7 +384,7 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 	} else {
 		result, why = plugin.judge(msg, qName)
 	}
-	if plugin.proxy != nil && !configuredInsecure && retryableDNSSECFailure(result, why) {
+	if plugin.proxy != nil && !configuredInsecure && !outsideValidationScope && retryableDNSSECFailure(result, why) {
 		excludedServerNames := make(map[string]struct{}, dnssecResponseAttempts)
 		if pluginsState.serverName != "" && pluginsState.serverName != "-" {
 			excludedServerNames[pluginsState.serverName] = struct{}{}
@@ -482,7 +494,7 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 	now := time.Now()
 	records, signatures := dnssec.SplitSignatures(msg.Answer)
 	qtype := dns.RRToType(msg.Question[0])
-	positiveRRSIGQuery := qtype == dns.TypeRRSIG && len(signatures) > 0
+	positiveRRSIGQuery := qtype == dns.TypeRRSIG && hasRRSIGAtName(signatures, qName)
 
 	if len(records) == 0 {
 		if positiveRRSIGQuery {
@@ -571,6 +583,26 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		}
 	}
 
+	// Authentication of the bytes in the Answer section is necessary but not
+	// sufficient: the section must also begin an answer to this question. A
+	// valid signature over unrelated data is replayable and says nothing about
+	// whether QNAME/QTYPE exists. RFC 4035 sections 3.2.3 and 5.5 require the
+	// denial path in that case, just as if the Answer section had been empty.
+	if !answerStartsAtQuestion(msg, qName, qtype, sets, signatures) {
+		res, err := plugin.judgeNegative(msg, qName, now)
+		switch res {
+		case dnssec.Bogus:
+			return res, err
+		case dnssec.Indeterminate:
+			worst, worstErr = res, err
+		case dnssec.Insecure:
+			if worst != dnssec.Indeterminate {
+				worst, worstErr = res, err
+			}
+		}
+		return worst, worstErr
+	}
+
 	// A CNAME is not the requested data (except for QTYPE=CNAME itself). If
 	// its target answered negatively, the authority proof is part of the
 	// response that AD would vouch for and has to be checked too. Without this,
@@ -590,6 +622,46 @@ func (plugin *PluginDNSSECValidate) judge(msg *dns.Msg, qName string) (dnssec.Re
 		}
 	}
 	return worst, worstErr
+}
+
+// answerStartsAtQuestion reports whether the Answer section contains either
+// the requested RRset at QNAME or the CNAME that begins an alias path there.
+// Wildcard expansion has the expanded QNAME as its owner, and DNAME synthesis
+// includes a CNAME at QNAME, so both legitimate cases satisfy the same rule.
+//
+// RRSIG is special: RRSIG records are signatures rather than an RRset that can
+// itself be authenticated, but an explicit RRSIG query is still positive only
+// when at least one returned signature is owned by QNAME.
+func answerStartsAtQuestion(msg *dns.Msg, qName string, qtype uint16, sets []dnssec.RRSet, signatures []*dns.RRSIG) bool {
+	if qtype == dns.TypeRRSIG {
+		return hasRRSIGAtName(signatures, qName)
+	}
+	for _, set := range sets {
+		if !sameDNSName(set.Name, qName) {
+			continue
+		}
+		// A CNAME can precede a positive terminal answer or an authenticated
+		// negative answer, including when the response RCODE is NXDOMAIN.
+		if set.Type == dns.TypeCNAME {
+			return true
+		}
+		if msg.Rcode != dns.RcodeSuccess {
+			continue
+		}
+		if qtype == dns.TypeANY || set.Type == qtype {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRRSIGAtName(signatures []*dns.RRSIG, name string) bool {
+	for _, sig := range signatures {
+		if sameDNSName(sig.Header().Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // judgeNegativeAuthority authenticates the non-denial Authority RRsets that
@@ -741,8 +813,9 @@ func (plugin *PluginDNSSECValidate) judgeNegativeWithChain(msg *dns.Msg, qName s
 				fmt.Errorf("%s DS denial uses NSEC3 Opt-Out", qName))
 		}
 	}
-	if denial.ProvesNoData(qName, qtype) {
-		return plugin.judgeNegativeAuthority(msg, chain, now)
+	if proof := denial.NoDataStatus(qName, qtype); proof != dnssec.Indeterminate {
+		return plugin.finishDenial(msg, chain, now, proof,
+			fmt.Errorf("%s NODATA proof uses an unsupported signing algorithm", qName))
 	}
 	if proof := denial.WildcardNoDataStatus(qName, chain.Zone, qtype); proof != dnssec.Indeterminate {
 		return plugin.finishDenial(msg, chain, now, proof,
@@ -994,6 +1067,7 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 	}
 
 	var lastErr error
+	var policyInsecureErr error
 	for _, sig := range set.Sigs {
 		if !dns.EqualName(owner.Zone, sig.SignerName) {
 			lastErr = fmt.Errorf("%s belongs to %s, not %s", set.Name, owner.Zone, sig.SignerName)
@@ -1006,6 +1080,15 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 			// exists rather than that it was the right answer here. The zone
 			// has to have shown that nothing closer to the name does exist.
 			if nextCloser, expanded := dnssec.WildcardNextCloser(verified, set.Name); expanded {
+				if set.Type == dns.TypeDNAME && dns.RRToType(msg.Question[0]) != dns.TypeDNAME {
+					// RFC 4592 section 4.4 and RFC 6672 sections 3.3 and 8:
+					// wildcard-synthesized DNAME rewrite rules are
+					// non-deterministic across caches, while their generated CNAME
+					// has no signature of its own. Unbound rejects the same shape.
+					// A literal QTYPE=DNAME query remains allowed because it asks
+					// for the authenticated DNAME RRset rather than following it.
+					return dnssec.Bogus, fmt.Errorf("wildcard-synthesized DNAME %s cannot be used for redirection", set.Name)
+				}
 				denial := dnssec.CollectDenial(msg.Ns).Verified(owner.Keys, owner.Zone, now)
 				if denial.HasMixedNSEC3Parameters() {
 					return dnssec.Bogus, fmt.Errorf(
@@ -1028,7 +1111,19 @@ func (plugin *PluginDNSSECValidate) judgeSet(set dnssec.RRSet, chain dnssec.Chai
 			}
 			return dnssec.Secure, nil
 		}
+		if res == dnssec.Insecure {
+			// RFC 9905 section 2: a corresponding DNSKEY exists, but this
+			// RRset relies only on a signing algorithm disabled by operator
+			// policy. Preserve Insecure so enforce mode does not turn an
+			// explicit algorithm-policy downgrade into SERVFAIL. A later valid
+			// accepted signature can still return Secure above.
+			policyInsecureErr = err
+			continue
+		}
 		lastErr = err
+	}
+	if policyInsecureErr != nil {
+		return dnssec.Insecure, policyInsecureErr
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no signature over %s could be checked", set.Name)

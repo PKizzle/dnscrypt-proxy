@@ -119,7 +119,7 @@ func TestProvesRootNameErrorForNonHostnameLabel(t *testing.T) {
 		nsec(".", "aaa.", dns.TypeNS, dns.TypeSOA, dns.TypeRRSIG, dns.TypeNSEC, dns.TypeDNSKEY),
 	}}
 	const name = "fdb3:e6dc:eb35::ffff:0:1"
-	if closest := nsecClosestEncloser(name, "fast.", "."); closest != "." {
+	if closest := nsecClosestEncloser(name, nsec("fast.", "fedex."), "."); closest != "." {
 		t.Fatalf("closest encloser = %q, want root", closest)
 	}
 	if got := wildcardName("."); got != "*." {
@@ -140,6 +140,52 @@ func TestProvesNoData(t *testing.T) {
 	}
 	if d.ProvesNoData("other.example.", dns.TypeAAAA) {
 		t.Error("a record for another name proves nothing about this one")
+	}
+}
+
+// An empty non-terminal exists because it has a descendant, but owns no
+// RRsets itself.  RFC 4035 section 3.1.3 includes this case in authenticated
+// denial, and the NSEC whose interval covers the name proves it when its next
+// owner is a strict descendant of that name.
+func TestProvesNoDataAtAnEmptyNonTerminal(t *testing.T) {
+	d := Denial{NSEC: []*dns.NSEC{
+		nsec("a.example.", "child.ent.example.", dns.TypeNSEC, dns.TypeRRSIG),
+	}}
+	if !d.ProvesNoData("ent.example.", dns.TypeA) {
+		t.Fatal("an NSEC interval ending below an empty non-terminal did not prove NODATA")
+	}
+	if !d.ProvesNoData("ent.example.", dns.TypeANY) {
+		t.Fatal("an empty non-terminal should prove that no RRset exists for an empty ANY answer")
+	}
+}
+
+// RFC 6840 section 4.2: an empty ANY response must prove that no RRsets exist
+// at QNAME. A matching NSEC or a nonempty matching NSEC3 proves the opposite --
+// the owner has data -- regardless of whether meta-type ANY appears in its
+// bitmap. RFC 5155 section 8.5 defines the one NSEC3 exception: an exact hash
+// with an empty bitmap proves an empty non-terminal and therefore no RRsets.
+func TestMatchingDenialCannotProveAnEmptyANYAnswer(t *testing.T) {
+	const name = "www.example.test."
+	exactNSEC := Denial{NSEC: []*dns.NSEC{
+		nsec(name, "x.example.test.", dns.TypeA, dns.TypeNSEC, dns.TypeRRSIG),
+	}}
+	if exactNSEC.ProvesNoData(name, dns.TypeANY) {
+		t.Fatal("a matching NSEC with existing RRsets proved an empty ANY answer")
+	}
+
+	hash := NSEC3Hash(name, 1, 0, "-")
+	exactNSEC3 := Denial{NSEC3: []*dns.NSEC3{
+		nsec3(hash, adjacentNSEC3Hash(t, hash, 1), 0, dns.TypeA, dns.TypeNSEC3, dns.TypeRRSIG),
+	}}
+	if exactNSEC3.ProvesNoData(name, dns.TypeANY) {
+		t.Fatal("a matching NSEC3 with existing RRsets proved an empty ANY answer")
+	}
+
+	emptyNonTerminal := Denial{NSEC3: []*dns.NSEC3{
+		nsec3(hash, adjacentNSEC3Hash(t, hash, 1), 0),
+	}}
+	if !emptyNonTerminal.ProvesNoData(name, dns.TypeANY) {
+		t.Fatal("an exact NSEC3 with an empty bitmap did not prove an empty non-terminal ANY answer")
 	}
 }
 
@@ -329,6 +375,30 @@ func TestProvesNameErrorUsesTheClosestNSECEncloser(t *testing.T) {
 	valid := Denial{NSEC: []*dns.NSEC{nameCover, closestWildcardCover}}
 	if !valid.ProvesNameError("x.b.example.", "example.") {
 		t.Fatal("a proof for the closest-encloser wildcard should validate the name error")
+	}
+}
+
+// RFC 4592 section 3.3.1 defines the closest encloser as the deepest existing
+// ancestor of QNAME.  An NSEC interval proves existence at both endpoints, so
+// the deeper common ancestor can come from its Next Domain Name rather than
+// its owner.  Ignoring that endpoint checks the wrong wildcard and can turn a
+// real *.b.example. answer into an authenticated NXDOMAIN.
+func TestProvesNameErrorUsesTheDeeperEncloserFromNSECNextName(t *testing.T) {
+	// Canonical DNS labels are arbitrary octets. "!" sorts before "*", while
+	// "(" also sorts before "*" but after "!".  Thus this interval covers the
+	// QNAME and proves b.example. exists as an empty non-terminal, but does not
+	// itself cover the applicable *.b.example. wildcard.
+	nameCover := nsec("z.a.example.", "(.b.example.", dns.TypeNSEC, dns.TypeRRSIG)
+	apexWildcardCover := nsec("example.", "a.example.", dns.TypeSOA, dns.TypeNSEC, dns.TypeRRSIG)
+	wrong := Denial{NSEC: []*dns.NSEC{nameCover, apexWildcardCover}}
+	if wrong.ProvesNameError("!.b.example.", "example.") {
+		t.Fatal("a proof for *.example. must not deny the relevant *.b.example. wildcard")
+	}
+
+	closestWildcardCover := nsec("(.b.example.", "a.b.example.", dns.TypeNSEC, dns.TypeRRSIG)
+	valid := Denial{NSEC: []*dns.NSEC{nameCover, closestWildcardCover}}
+	if !valid.ProvesNameError("!.b.example.", "example.") {
+		t.Fatal("the NSEC next name's empty non-terminal did not select the closest wildcard")
 	}
 }
 
@@ -558,6 +628,24 @@ func TestOnlyASignedDenialCanProveAbsence(t *testing.T) {
 	}
 }
 
+func TestDeprecatedRSASHA1DenialIsInsecureOnlyWhenItProvesTheAnswer(t *testing.T) {
+	z := newZoneWithAlgorithm(t, "example.test.", dns.RSASHA1)
+	now := time.Now()
+	rr := nsec("www.example.test.", "x.example.test.", dns.TypeRRSIG, dns.TypeNSEC)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+
+	if got := verified.NoDataStatus("www.example.test.", dns.TypeA); got != Insecure {
+		t.Fatalf("deprecated-algorithm NODATA = %v, want Insecure", got)
+	}
+	if verified.ProvesNoData("www.example.test.", dns.TypeA) {
+		t.Fatal("a deprecated-algorithm denial must never be a Secure proof")
+	}
+	if got := verified.NoDataStatus("other.example.test.", dns.TypeA); got != Indeterminate {
+		t.Fatalf("unrelated deprecated-algorithm NSEC = %v, want Indeterminate", got)
+	}
+}
+
 // RFC 4035 section 5.4 permits a matching NSEC to establish that wildcard
 // expansion was not used only when the signature's label count matches the
 // NSEC owner. A wildcard-expanded NSEC is cryptographically valid but does
@@ -585,6 +673,21 @@ func TestVerifiedDenialRejectsARecordOutsideTheSignerZone(t *testing.T) {
 	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
 	if !verified.Empty() {
 		t.Error("a signer must not establish denial for data outside its zone")
+	}
+}
+
+// RFC 4034 section 4.1.1 keeps both ends of an NSEC interval in the zone.
+// A signed next name that overreaches the signer can otherwise claim absence
+// in namespace the signer does not control.
+func TestVerifiedDenialRejectsNSECNextNameOutsideTheSignerZone(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	rr := nsec("a.example.test.", "z.invalid.", dns.TypeNSEC, dns.TypeRRSIG)
+	sig := z.sign([]dns.RR{rr}, now.Add(-time.Hour), now.Add(time.Hour))
+
+	verified := CollectDenial([]dns.RR{rr, sig}).Verified([]*dns.DNSKEY{z.key}, z.name, now)
+	if !verified.Empty() {
+		t.Fatal("an NSEC next name outside its signer zone was accepted")
 	}
 }
 

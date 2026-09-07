@@ -21,11 +21,20 @@ type zone struct {
 }
 
 func newZone(t *testing.T, name string) *zone {
+	return newZoneWithAlgorithm(t, name, dns.ECDSAP256SHA256)
+}
+
+func newZoneWithAlgorithm(t *testing.T, name string, algorithm uint8) *zone {
 	t.Helper()
-	key := dns.NewDNSKEY(name, dns.ECDSAP256SHA256)
+	key := dns.NewDNSKEY(name, algorithm)
+	key.Hdr.TTL = 300
 	key.Flags = dns.FlagZONE
 	key.Protocol = 3
-	priv, err := key.Generate(256)
+	bits := 256
+	if algorithm == dns.RSASHA1 || algorithm == dns.RSASHA1NSEC3SHA1 {
+		bits = 1024
+	}
+	priv, err := key.Generate(bits)
 	if err != nil {
 		t.Fatalf("generate key for %s: %v", name, err)
 	}
@@ -69,6 +78,78 @@ func TestVerifyRRSetAcceptsAGenuineSignature(t *testing.T) {
 	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
 	if res != Secure {
 		t.Fatalf("VerifyRRSet() = %v (%v), want secure", res, err)
+	}
+}
+
+// RFC 9905 section 2 requires an operator's validating resolver to treat
+// RSASHA1 and RSASHA1-NSEC3-SHA1 signing algorithms as unsupported even while
+// the implementation retains the ability to verify them. A cryptographically
+// genuine signature made only with either deprecated algorithm therefore
+// renders the RRset Insecure, never Secure.
+func TestDeprecatedRSASHA1SignaturesAreInsecure(t *testing.T) {
+	for _, algorithm := range []uint8{dns.RSASHA1, dns.RSASHA1NSEC3SHA1} {
+		t.Run(dns.AlgorithmToString[algorithm], func(t *testing.T) {
+			z := newZoneWithAlgorithm(t, "example.test.", algorithm)
+			rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+			now := time.Now()
+			sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+			res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+			if res != Insecure {
+				t.Fatalf("VerifyRRSet() = %v (%v), want Insecure", res, err)
+			}
+		})
+	}
+}
+
+func TestDeprecatedSignaturePolicyStillAcceptsAnotherValidAlgorithm(t *testing.T) {
+	deprecated := newZoneWithAlgorithm(t, "example.test.", dns.RSASHA1)
+	accepted := newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{
+		deprecated.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour)),
+		accepted.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour)),
+	}, []*dns.DNSKEY{deprecated.key, accepted.key}, now)
+	if res != Secure {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Secure from the accepted algorithm", res, err)
+	}
+}
+
+// RFC 6840 section 5.12: an extra RRSIG whose algorithm/key does not exist in
+// the authenticated DNSKEY RRset is ignored. It must not let an attacker turn
+// a missing accepted signature into an Insecure policy result.
+func TestUnknownExtraSignatureDoesNotDowngradeAnRRSet(t *testing.T) {
+	z := newZone(t, "example.test.")
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	sig := &dns.RRSIG{
+		Hdr: dns.Header{Name: "www.example.test.", Class: dns.ClassINET, TTL: 300},
+		RRSIG: rdata.RRSIG{
+			TypeCovered: dns.TypeA,
+			Algorithm:   99,
+			Labels:      3,
+			KeyTag:      12345,
+			SignerName:  "example.test.",
+		},
+	}
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, time.Now())
+	if res != Indeterminate || !errors.Is(err, ErrNoSignature) {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Indeterminate/ErrNoSignature", res, err)
+	}
+}
+
+func TestDeprecatedRevokedKeyCannotDowngradeOrdinaryRRSet(t *testing.T) {
+	z := newZoneWithAlgorithm(t, "example.test.", dns.RSASHA1)
+	z.key.Flags |= dns.FlagREVOKE
+	rrset := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	now := time.Now()
+	sig := z.sign(rrset, now.Add(-time.Hour), now.Add(time.Hour))
+
+	res, err := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+	if res != Indeterminate || !errors.Is(err, ErrNoSignature) {
+		t.Fatalf("VerifyRRSet() = %v (%v), want Indeterminate/ErrNoSignature", res, err)
 	}
 }
 
@@ -322,6 +403,31 @@ func TestDelegationWithUnsupportedKeyAlgorithmIsInsecureNotBogus(t *testing.T) {
 	}
 }
 
+// RFC 9905 section 2 requires resolver operators to treat algorithm 5
+// (RSASHA1) and algorithm 7 (RSASHA1-NSEC3-SHA1) DS records as unsupported.
+// The implementation still retains verification support for interoperability;
+// this is the delegation policy that prevents those algorithms establishing a
+// secure chain on their own.
+func TestDeprecatedRSASHA1DelegationsAreInsecure(t *testing.T) {
+	for _, algorithm := range []uint8{dns.RSASHA1, dns.RSASHA1NSEC3SHA1} {
+		t.Run(dns.AlgorithmToString[algorithm], func(t *testing.T) {
+			z := newZone(t, "example.test.")
+			key := *z.key
+			key.Algorithm = algorithm
+			key.Tag = 0
+			ds := key.ToDS(dns.SHA256)
+			if ds == nil {
+				t.Fatal("construct deprecated-algorithm DS fixture")
+			}
+
+			res, err := VerifyDNSKEYs([]*dns.DNSKEY{&key}, nil, []*dns.DS{ds}, time.Now())
+			if res != Insecure {
+				t.Fatalf("result = %v (%v), want Insecure", res, err)
+			}
+		})
+	}
+}
+
 // RFC 9904 makes the IANA registry canonical. Digest value 5 is GOST
 // R 34.11-2012 there; this pinned DNS library still calls the same numeric
 // value experimental SHA-512 and can compute the wrong digest for it. It is
@@ -499,6 +605,40 @@ func TestWildcardExpansionIsReportedWithTheNameToDisprove(t *testing.T) {
 	}
 }
 
+// A literal query for an existing wildcard owner is an exact-owner answer,
+// not wildcard synthesis. Its RRSIG Labels field still omits the leading "*"
+// (RFC 4034 section 3.1.3), so label count alone cannot distinguish the two.
+// Requiring denial for the exact owner would demand proof that an owner whose
+// signed data we just authenticated does not exist.
+func TestLiteralWildcardOwnerIsNotReportedAsExpansion(t *testing.T) {
+	z := newZone(t, "example.test.")
+	now := time.Now()
+	wildcard := []dns.RR{aRecord("*.example.test.", "192.0.2.1")}
+	sig := z.sign(wildcard, now.Add(-time.Hour), now.Add(time.Hour))
+
+	res, verified, err := VerifyRRSetDetail(wildcard, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+	if res != Secure {
+		t.Fatalf("literal wildcard owner did not verify: %v (%v)", res, err)
+	}
+	if nextCloser, expanded := WildcardNextCloser(verified, "*.example.test."); expanded {
+		t.Fatalf("literal wildcard owner was reported as expansion needing denial of %s", nextCloser)
+	}
+
+	// A query name may itself start with a literal star and still have been
+	// synthesized by a higher wildcard; compare reconstructed owners instead
+	// of treating every leading star as exact.
+	expandedName := "*.child.example.test."
+	expanded := []dns.RR{aRecord(expandedName, "192.0.2.1")}
+	sig.Hdr.Name = expandedName
+	res, verified, err = VerifyRRSetDetail(expanded, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now)
+	if res != Secure {
+		t.Fatalf("star-prefixed wildcard expansion did not verify: %v (%v)", res, err)
+	}
+	if nextCloser, wasExpanded := WildcardNextCloser(verified, expandedName); !wasExpanded || nextCloser != "child.example.test." {
+		t.Fatalf("star-prefixed expansion = (%q, %v), want (child.example.test., true)", nextCloser, wasExpanded)
+	}
+}
+
 // The ordinary case must not be dragged into the wildcard path: a signature
 // made over the name itself demands no extra proof.
 func TestAnOrdinarySignatureIsNotTreatedAsAWildcard(t *testing.T) {
@@ -523,6 +663,27 @@ func TestKeyWithAWrongProtocolIsNotUsed(t *testing.T) {
 	z.key.Protocol = 2
 	if res, _ := VerifyRRSet(rrset, []*dns.RRSIG{sig}, []*dns.DNSKEY{z.key}, now); res == Secure {
 		t.Error("a key with a non-DNSSEC protocol value was used to verify")
+	}
+}
+
+// RFC 5011 section 2.1: once a DNSKEY carries REVOKE, it is unusable for
+// ordinary data.  Its sole exception is authenticating its self-signature on
+// the DNSKEY RRset so that the revocation can itself be validated.
+func TestRevokedKeyIsUsedOnlyForItsDNSKEYSelfSignature(t *testing.T) {
+	z := newZone(t, "example.test.")
+	z.key.Flags |= dns.FlagREVOKE
+	now := time.Now()
+
+	ordinary := []dns.RR{aRecord("www.example.test.", "192.0.2.1")}
+	ordinarySig := z.sign(ordinary, now.Add(-time.Hour), now.Add(time.Hour))
+	if res, _ := VerifyRRSet(ordinary, []*dns.RRSIG{ordinarySig}, []*dns.DNSKEY{z.key}, now); res == Secure {
+		t.Fatal("a revoked DNSKEY authenticated ordinary zone data")
+	}
+
+	keySet := []dns.RR{z.key}
+	selfSig := z.sign(keySet, now.Add(-time.Hour), now.Add(time.Hour))
+	if res, err := VerifyRRSet(keySet, []*dns.RRSIG{selfSig}, []*dns.DNSKEY{z.key}, now); res != Secure {
+		t.Fatalf("revocation self-signature result = %v (%v), want Secure", res, err)
 	}
 }
 
