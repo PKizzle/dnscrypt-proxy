@@ -83,6 +83,15 @@ type flakyNoDSProofHierarchy struct {
 	alwaysUnproven bool
 }
 
+// failingDSHierarchy models the other RFC 4035 section 4.3 outcome: no DNS
+// response was obtained, so the validator genuinely cannot determine whether
+// a signature is expected. That remains Indeterminate rather than being
+// confused with a completed but cryptographically incomplete response.
+type failingDSHierarchy struct {
+	*hierarchy
+	zone string
+}
+
 func (h *flakyRootHierarchy) DNSKEY(zoneName string) ([]*dns.DNSKEY, []*dns.RRSIG, error) {
 	if canonicalName(zoneName) != "." {
 		return h.hierarchy.DNSKEY(zoneName)
@@ -115,6 +124,13 @@ func (h *flakyNoDSProofHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, 
 	h.calls++
 	if h.alwaysUnproven || h.calls == 1 {
 		return nil, nil, h.nsecProving("other."+canonicalName(zoneName), dns.TypeA), nil
+	}
+	return h.hierarchy.DS(zoneName)
+}
+
+func (h *failingDSHierarchy) DS(zoneName string) ([]*dns.DS, []*dns.RRSIG, Denial, error) {
+	if canonicalName(zoneName) == canonicalName(h.zone) {
+		return nil, nil, Denial{}, fmt.Errorf("upstream unreachable")
 	}
 	return h.hierarchy.DS(zoneName)
 }
@@ -495,17 +511,28 @@ func TestBuildChainRefetchesAnInconclusiveNoDSResponse(t *testing.T) {
 	}
 }
 
-func TestBuildChainRejectsNoDSResponsesThatNeverSettleTheZoneCut(t *testing.T) {
+func TestBuildChainMarksCompletedNoDSResponsesWithoutProofBogus(t *testing.T) {
 	h := newHierarchy(t, ".", "test.", "example.test.")
 	const ordinaryName = "www.example.test."
 	f := &flakyNoDSProofHierarchy{hierarchy: h, zone: ordinaryName, alwaysUnproven: true}
 
 	res := BuildChain(f, ordinaryName, h.anchors(), h.now)
-	if res.Status != Indeterminate {
-		t.Fatalf("BuildChain() = %v (%v), want indeterminate", res.Status, res.Why)
+	if res.Status != Bogus {
+		t.Fatalf("BuildChain() = %v (%v), want bogus", res.Status, res.Why)
 	}
 	if f.calls != chainFetchAttempts {
 		t.Fatalf("DS calls = %d, want %d", f.calls, chainFetchAttempts)
+	}
+}
+
+func TestBuildChainKeepsAFailedDSFetchIndeterminate(t *testing.T) {
+	h := newHierarchy(t, ".", "test.", "example.test.")
+	const ordinaryName = "www.example.test."
+	f := &failingDSHierarchy{hierarchy: h, zone: ordinaryName}
+
+	res := BuildChain(f, ordinaryName, h.anchors(), h.now)
+	if res.Status != Indeterminate {
+		t.Fatalf("BuildChain() = %v (%v), want indeterminate", res.Status, res.Why)
 	}
 }
 
@@ -522,8 +549,8 @@ func TestBuildChainDoesNotTrustAnUnsignedCNAMEForDS(t *testing.T) {
 	h := newHierarchy(t, ".", "test.", "example.test.")
 	const alias = "alias.example.test."
 	res := BuildChain(&cnameDelegationHierarchy{hierarchy: h, name: alias}, alias, h.anchors(), h.now)
-	if res.Status != Indeterminate {
-		t.Fatalf("BuildChain() = %v (%v), want indeterminate for unsigned CNAME evidence", res.Status, res.Why)
+	if res.Status != Bogus {
+		t.Fatalf("BuildChain() = %v (%v), want bogus for an unsigned CNAME from a secure parent", res.Status, res.Why)
 	}
 }
 
@@ -623,8 +650,8 @@ func TestBuildChainDoesNotTrustAnUnsignedNoDSProof(t *testing.T) {
 	h.unsigned["example.test."] = true
 
 	res := BuildChain(tamperedHierarchy{hierarchy: h, unsignedProof: "example.test."}, "example.test.", h.anchors(), h.now)
-	if res.Status != Indeterminate {
-		t.Fatalf("BuildChain() = %v (%v), want indeterminate", res.Status, res.Why)
+	if res.Status != Bogus {
+		t.Fatalf("BuildChain() = %v (%v), want bogus", res.Status, res.Why)
 	}
 	if len(res.Keys) != 0 {
 		t.Error("keys were kept after an unverifiable delegation proof")
@@ -672,8 +699,8 @@ func TestBuildChainWillNotGuessWhenTheParentSettlesNothing(t *testing.T) {
 	if res.Status == Secure {
 		t.Fatal("the walk carried on into a name nothing was shown about")
 	}
-	if res.Status != Indeterminate {
-		t.Errorf("status = %v, want indeterminate", res.Status)
+	if res.Status != Bogus {
+		t.Errorf("status = %v, want bogus", res.Status)
 	}
 	if len(res.Keys) != 0 {
 		t.Error("keys were handed to a name that may belong to another zone")

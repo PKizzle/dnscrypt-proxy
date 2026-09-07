@@ -50,13 +50,14 @@ type Fetcher interface {
 // ChainResult is what walking the chain established about a zone.
 type ChainResult struct {
 	// Status is Secure when keys were reached, Insecure when a delegation
-	// proved unsigned, Bogus when something along the way did not hold up.
+	// proved unsigned, Bogus when something along the way did not hold up,
+	// and Indeterminate when the records needed to decide could not be fetched.
 	Status Result
 	// Keys may sign records in Zone. Empty unless Status is Secure.
 	Keys []*dns.DNSKEY
 	// Zone is the deepest zone the walk established keys for.
 	Zone string
-	// Why explains an Insecure or Bogus outcome.
+	// Why explains an Insecure, Bogus, or Indeterminate outcome.
 	Why error
 }
 
@@ -178,10 +179,11 @@ nextChild:
 			case denial.Empty():
 				// Nothing was offered to tell the two apart. Descending on the
 				// parent's keys would refuse a genuinely unsigned zone for
-				// carrying no signature, so this stays where it was and says that
-				// nothing could be concluded. It is not an unsigned delegation:
-				// no signed proof established one.
-				// Retry below after evicting this incomplete response.
+				// carrying no signature, so this must not continue the walk. It is
+				// also not an indeterminate transport failure: the DS query
+				// completed, and RFC 4035 sections 3.1.3 and 5.4 require a signed
+				// NSEC/NSEC3 proof in a negative answer from this authenticated
+				// parent. Retry below before calling the incomplete response Bogus.
 			case denial.ProvesNotADelegation(child):
 				// This label is not a delegation point. It does not say the
 				// same about a deeper label: DNSSEC's DS state belongs to the
@@ -203,12 +205,18 @@ nextChild:
 				forget(f, child)
 				continue
 			}
-			current.Status = Indeterminate
+			// At least one DNS response arrived on every attempt. RFC 4035
+			// section 4.3 classifies missing data that the authenticated DNSSEC
+			// chain says must be present as Bogus. Indeterminate is reserved for
+			// the error path above, where the required records could not be
+			// obtained at all. This is also Unbound's ds_response_to_ke rule:
+			// NODATA without signed NSEC/NSEC3 is bogus, never an insecure cut.
+			current.Status = Bogus
 			current.Keys = nil
 			if denial.Empty() {
-				current.Why = fmt.Errorf("%s: no proof of what is or is not delegated there", child)
+				current.Why = fmt.Errorf("%s: DS response omitted the signed NSEC/NSEC3 proof required by its secure parent", child)
 			} else {
-				current.Why = fmt.Errorf("%s: nothing shown either way about a delegation there", child)
+				current.Why = fmt.Errorf("%s: authenticated denial proves neither an unsigned delegation nor that the name remains in its secure parent", child)
 			}
 			return current
 		}

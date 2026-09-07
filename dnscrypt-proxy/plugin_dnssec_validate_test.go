@@ -745,7 +745,7 @@ func TestValidatorClassifiesProvablyBadSignatureWhenOwnerWalkIsIncomplete(t *tes
 		sig  *dns.RRSIG
 		want dnssec.Result
 	}{
-		{name: "valid remains indeterminate", sig: validSig, want: dnssec.Indeterminate},
+		{name: "valid signature cannot repair missing delegation proof", sig: validSig, want: dnssec.Bogus},
 		{name: "bad cryptographic signature", sig: func() *dns.RRSIG {
 			bad := *validSig
 			bad.Signature = "AAAA"
