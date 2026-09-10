@@ -493,12 +493,12 @@ func (plugin *PluginDNSSECValidate) Eval(pluginsState *PluginsState, msg *dns.Ms
 		// the upstream response as RFC 4035 section 5.5 requires.
 		msg.AuthenticatedData = result == dnssec.Secure
 		if plugin.mode == ValidationLog && (result == dnssec.Bogus || result == dnssec.Indeterminate) {
-			dlog.Warnf("DNSSEC would return SERVFAIL for [%s/%s]: %v", qName, qtypeName, why)
+			dlog.Warnf("DNSSEC %s would return SERVFAIL for [%s/%s]: %v", verdictName(result), qName, qtypeName, why)
 		}
 		return nil
 	}
 
-	dlog.Warnf("DNSSEC returned SERVFAIL for [%s/%s]: %v", qName, qtypeName, why)
+	dlog.Warnf("DNSSEC %s returned SERVFAIL for [%s/%s]: %v", verdictName(result), qName, qtypeName, why)
 	edeCode := dnssecFailureEDE(result, why)
 	failure := DNSSECFailureResponseFromMessage(pluginsState.questionMsg, edeCode)
 	restoreDNSSECClientBits(pluginsState, failure)

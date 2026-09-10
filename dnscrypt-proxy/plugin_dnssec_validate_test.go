@@ -2105,6 +2105,22 @@ func TestBogusVerdictsReachTheExportedCounter(t *testing.T) {
 	}
 }
 
+func TestDNSSECModeReachesTheExportedGauge(t *testing.T) {
+	before := dnssecMode.Load()
+	dnssecMode.Store("log")
+	defer dnssecMode.Store(before)
+
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+
+	ui.metricsCollector.prometheusEnabled = true
+	exported := ui.metricsCollector.generatePrometheusMetrics()
+	want := `dnscrypt_proxy_dnssec_validation_mode{mode="log"} 1`
+	if !strings.Contains(exported, want) {
+		t.Errorf("the DNSSEC validation mode is not exported as %q", want)
+	}
+}
+
 func answerWithSignature(t *testing.T) *dns.Msg {
 	t.Helper()
 	msg := dns.NewMsg("www.example.test.", dns.TypeA)

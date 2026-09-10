@@ -769,9 +769,19 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# TYPE dnscrypt_proxy_aes_hardware_support gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_aes_hardware_support %d\n", aesHW))
 
-	// Split by verdict rather than counted as one, because the three mean
-	// different things: bogus is the one that would be refused if validation
-	// were enforcing, and it is the only one worth alerting on.
+	// Export the active policy separately from the outcomes. A quiet counter
+	// stream cannot tell an operator whether validation was logging, enforcing,
+	// or disabled, and the pre-enforcement gate must be able to prove that every
+	// replica was actually observing traffic in the intended mode.
+	mode := dnssecMode.Load().(string)
+	result.WriteString("# HELP dnscrypt_proxy_dnssec_validation_mode Active DNSSEC validation policy (exactly one labelled series is 1)\n")
+	result.WriteString("# TYPE dnscrypt_proxy_dnssec_validation_mode gauge\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_validation_mode{mode=\"%s\"} 1\n", mode))
+
+	// Split by verdict rather than counted as one, because the four outcomes
+	// mean different things. Both Bogus and Indeterminate are refused while
+	// enforcing; the latter is kept separate because it is a local inability to
+	// decide rather than evidence that the zone's data failed authentication.
 	result.WriteString("# HELP dnscrypt_proxy_dnssec_verdicts_total DNSSEC validation results by verdict\n")
 	result.WriteString("# TYPE dnscrypt_proxy_dnssec_verdicts_total counter\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"secure\"} %d\n", dnssecVerdicts.secure.Load()))
