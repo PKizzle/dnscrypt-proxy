@@ -256,9 +256,9 @@ func acceptedDNSKEYAlgorithm(algorithm uint8) bool {
 // supportedDSDigest lists the IANA-assigned digest algorithms that this build
 // implements correctly. Keeping this independent of the offered DNSKEY
 // material is important: a malformed key under a supported DS is a validation
-// failure, not evidence that the DS algorithm was unsupported. Do not include
-// dns.SHA512 here: the pinned library uses that name for numeric value 5, which
-// IANA now assigns to GOST R 34.11-2012, not SHA-512.
+// failure, not evidence that the DS algorithm was unsupported. GOST 2012 and
+// SM3 are optional under RFC 9558/RFC 9563 and the IANA registry; leave them
+// out until both their DNSKEY algorithms and DS digests can be checked.
 func supportedDSDigest(digest uint8) bool {
 	switch digest {
 	case dns.SHA1, dns.SHA256, dns.SHA384:

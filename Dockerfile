@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 
 WORKDIR /src
 
@@ -26,7 +26,7 @@ RUN cp -a /src/dnscrypt-proxy/example-* ./
 COPY dnscrypt-proxy.toml ./
 
 # ----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26 AS probe
+FROM --platform=$BUILDPLATFORM golang:1.27 AS probe
 
 WORKDIR /src/dnsprobe
 

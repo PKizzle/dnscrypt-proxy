@@ -679,16 +679,15 @@ func TestDeprecatedRSASHA1DelegationsAreInsecure(t *testing.T) {
 	}
 }
 
-// RFC 9904 makes the IANA registry canonical. Digest value 5 is GOST
-// R 34.11-2012 there; this pinned DNS library still calls the same numeric
-// value experimental SHA-512 and can compute the wrong digest for it. It is
-// therefore unsupported until the library implements the registered meaning.
-func TestRegisteredDigestFiveIsNotMistakenForLibrarySHA512(t *testing.T) {
+// RFC 9558 assigns digest value 5 to optional GOST R 34.11-2012. The DNS
+// library now names it correctly and deliberately cannot compute it; construct
+// the wire-level DS directly to prove it remains an unsupported delegation,
+// rather than accidentally accepting it as some other digest.
+func TestRegisteredDigestFiveIsUnsupported(t *testing.T) {
 	z := newZone(t, "example.test.")
-	ds := z.key.ToDS(5)
-	if ds == nil {
-		t.Fatal("construct dependency's legacy digest-5 DS fixture")
-	}
+	ds := z.key.ToDS(dns.SHA256)
+	ds.DigestType = dns.GOST2012
+	ds.Digest = strings.Repeat("00", 32)
 
 	res, err := VerifyDNSKEYs([]*dns.DNSKEY{z.key}, nil, []*dns.DS{ds}, time.Now())
 	if res != Insecure {
