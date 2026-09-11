@@ -1,3 +1,13 @@
+# Unreleased
+  - The monitoring query history now uses a fixed-size ring whose struct and
+string storage are both included in the configured memory budget. Eviction is
+constant-time and clears references to removed entries.
+  - Dashboard snapshots are no longer built or fleet-aggregated for every DNS
+query when no WebSocket client is connected, and live broadcasts are limited
+to one every five seconds.
+  - Prometheus metrics now expose the Go heap, runtime-reserved memory and
+goroutine count alongside the retained query-log estimate.
+
 # Version 2.1.18
   - Forwarding rules now support the `$PROXY:` prefix to send selected plain
 DNS upstreams over DNS-over-TCP through the proxy configured by the main

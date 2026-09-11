@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"codeberg.org/miekg/dns"
 	"github.com/gorilla/websocket"
@@ -51,7 +52,10 @@ type MonitoringUIConfig struct {
 	PeerToken string `toml:"peer_token"`
 }
 
-const maxTopDomains = 1000
+const (
+	maxTopDomains               = 1000
+	monitoringBroadcastMinDelay = 5 * time.Second
+)
 
 // MetricsCollector - Collects and stores metrics for the monitoring UI
 type MetricsCollector struct {
@@ -77,6 +81,8 @@ type MetricsCollector struct {
 	serverQueryCount   map[string]uint64
 	topDomains         map[string]uint64
 	recentQueries      []QueryLogEntry
+	recentQueriesHead  int
+	recentQueriesCount int
 	maxRecentQueries   int
 	maxMemoryBytes     int64
 	currentMemoryBytes int64
@@ -125,13 +131,73 @@ type QueryLogEntry struct {
 
 // EstimateMemoryUsage estimates the memory usage of a QueryLogEntry in bytes
 func (q *QueryLogEntry) EstimateMemoryUsage() int64 {
-	// Base struct size + string content lengths
-	return int64(88 + // approximate struct overhead
+	// The slice owns the struct and keeps every string backing array reachable.
+	// Keep this accounting in sync automatically when fields are added.
+	return int64(unsafe.Sizeof(*q)) + q.estimateStringMemoryUsage()
+}
+
+func (q *QueryLogEntry) estimateStringMemoryUsage() int64 {
+	return int64(
 		len(q.ClientIP) +
-		len(q.Domain) +
-		len(q.Type) +
-		len(q.ResponseCode) +
-		len(q.Server))
+			len(q.Domain) +
+			len(q.Type) +
+			len(q.ResponseCode) +
+			len(q.Server) +
+			len(q.DNSSECVerdict) +
+			len(q.DNSSECReason))
+}
+
+func (mc *MetricsCollector) recentQueryCountLocked() int {
+	return mc.recentQueriesCount
+}
+
+func (mc *MetricsCollector) evictOldestRecentQueryLocked() {
+	if mc.recentQueryCountLocked() == 0 {
+		return
+	}
+	oldest := &mc.recentQueries[mc.recentQueriesHead]
+	mc.currentMemoryBytes -= oldest.estimateStringMemoryUsage()
+	*oldest = QueryLogEntry{}
+	mc.recentQueriesHead = (mc.recentQueriesHead + 1) % len(mc.recentQueries)
+	mc.recentQueriesCount--
+}
+
+func (mc *MetricsCollector) appendRecentQueryLocked(entry QueryLogEntry) {
+	if len(mc.recentQueries) == 0 || mc.maxRecentQueries <= 0 {
+		return
+	}
+	entryStringsSize := entry.estimateStringMemoryUsage()
+	ringMemoryBytes := int64(len(mc.recentQueries)) * int64(unsafe.Sizeof(QueryLogEntry{}))
+	if ringMemoryBytes+entryStringsSize > mc.maxMemoryBytes {
+		return
+	}
+	for mc.recentQueryCountLocked() > 0 &&
+		(mc.currentMemoryBytes+entryStringsSize > mc.maxMemoryBytes ||
+			mc.recentQueryCountLocked() >= mc.maxRecentQueries) {
+		mc.evictOldestRecentQueryLocked()
+	}
+	if mc.currentMemoryBytes+entryStringsSize > mc.maxMemoryBytes {
+		return
+	}
+	index := (mc.recentQueriesHead + mc.recentQueriesCount) % len(mc.recentQueries)
+	mc.recentQueries[index] = entry
+	mc.recentQueriesCount++
+	mc.currentMemoryBytes += entryStringsSize
+}
+
+func (mc *MetricsCollector) snapshotRecentQueries(limit int) []QueryLogEntry {
+	mc.queryLogMutex.RLock()
+	defer mc.queryLogMutex.RUnlock()
+	count := mc.recentQueryCountLocked()
+	if limit <= 0 || limit > count {
+		limit = count
+	}
+	recent := make([]QueryLogEntry, limit)
+	for i := range recent {
+		index := (mc.recentQueriesHead + count - limit + i) % len(mc.recentQueries)
+		recent[i] = mc.recentQueries[index]
+	}
+	return recent
 }
 
 type resolverSnapshot struct {
@@ -194,6 +260,15 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 	if maxMemoryMB <= 0 {
 		maxMemoryMB = 1
 	}
+	maxMemoryBytes := int64(maxMemoryMB) * 1024 * 1024
+	// Do not reserve a backing array whose structs alone exceed the configured
+	// query-log budget. String contents are accounted as entries are appended.
+	if memoryEntries := int(maxMemoryBytes / int64(unsafe.Sizeof(QueryLogEntry{}))); maxEntries > memoryEntries {
+		maxEntries = memoryEntries
+	}
+	if maxEntries < 1 {
+		maxEntries = 1
+	}
 
 	// Initialize metrics collector
 	metricsCollector := &MetricsCollector{
@@ -204,10 +279,11 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 		serverResponseTime: make(map[string]uint64),
 		serverQueryCount:   make(map[string]uint64),
 		topDomains:         make(map[string]uint64),
-		recentQueries:      make([]QueryLogEntry, 0, maxEntries),
+		recentQueries:      make([]QueryLogEntry, maxEntries),
 		maxRecentQueries:   maxEntries,
-		maxMemoryBytes:     int64(maxMemoryMB * 1024 * 1024),
-		currentMemoryBytes: 0,
+		maxMemoryBytes:     maxMemoryBytes,
+		// The fixed ring's struct storage is resident even while it is empty.
+		currentMemoryBytes: int64(maxEntries) * int64(unsafe.Sizeof(QueryLogEntry{})),
 		privacyLevel:       proxy.monitoringUI.PrivacyLevel,
 		// Initialize caching with 1 second TTL
 		cacheTTL:      time.Second,
@@ -241,8 +317,9 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 		},
 		clients: make(map[*websocket.Conn]bool),
 		proxy:   proxy,
-		// Initialize broadcast rate limiting with 100ms minimum delay
-		broadcastMinDelay: 100 * time.Millisecond,
+		// A dashboard is operational telemetry, not part of the DNS hot path.
+		// Full fleet snapshots can contain thousands of retained queries.
+		broadcastMinDelay: monitoringBroadcastMinDelay,
 		// Initialize Prometheus path
 		prometheusPath: func() string {
 			if proxy.monitoringUI.PrometheusPath != "" {
@@ -587,28 +664,7 @@ func (ui *MonitoringUI) applyMetrics(ev metricEvent) {
 		}
 
 		mc.queryLogMutex.Lock()
-		entrySize := entry.EstimateMemoryUsage()
-
-		// Check if adding this entry would exceed memory limit
-		if mc.currentMemoryBytes+entrySize > mc.maxMemoryBytes {
-			// Remove oldest entries until we have enough space
-			for len(mc.recentQueries) > 0 && mc.currentMemoryBytes+entrySize > mc.maxMemoryBytes {
-				oldEntry := mc.recentQueries[0]
-				mc.recentQueries = mc.recentQueries[1:]
-				mc.currentMemoryBytes -= oldEntry.EstimateMemoryUsage()
-			}
-		}
-
-		mc.recentQueries = append(mc.recentQueries, entry)
-		mc.currentMemoryBytes += entrySize
-
-		// Also enforce the max entries limit
-		if len(mc.recentQueries) > mc.maxRecentQueries {
-			oldEntry := mc.recentQueries[0]
-			mc.recentQueries = mc.recentQueries[1:]
-			mc.currentMemoryBytes -= oldEntry.EstimateMemoryUsage()
-		}
-
+		mc.appendRecentQueryLocked(entry)
 		mc.queryLogMutex.Unlock()
 	}
 
@@ -740,7 +796,7 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 
 	// Add memory usage metrics if available
 	mc.queryLogMutex.RLock()
-	queryLogEntries := len(mc.recentQueries)
+	queryLogEntries := mc.recentQueryCountLocked()
 	memoryUsage := mc.currentMemoryBytes
 	mc.queryLogMutex.RUnlock()
 
@@ -748,9 +804,21 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# TYPE dnscrypt_proxy_query_log_entries gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_query_log_entries %d\n", queryLogEntries))
 
-	result.WriteString("# HELP dnscrypt_proxy_memory_usage_bytes Current memory usage in bytes for query logs\n")
+	result.WriteString("# HELP dnscrypt_proxy_memory_usage_bytes Estimated retained memory in bytes for query logs\n")
 	result.WriteString("# TYPE dnscrypt_proxy_memory_usage_bytes gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_memory_usage_bytes %d\n", memoryUsage))
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	result.WriteString("# HELP dnscrypt_proxy_go_heap_alloc_bytes Bytes of live Go heap allocations\n")
+	result.WriteString("# TYPE dnscrypt_proxy_go_heap_alloc_bytes gauge\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_go_heap_alloc_bytes %d\n", memStats.Alloc))
+	result.WriteString("# HELP dnscrypt_proxy_go_memory_sys_bytes Bytes of memory obtained from the operating system by the Go runtime\n")
+	result.WriteString("# TYPE dnscrypt_proxy_go_memory_sys_bytes gauge\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_go_memory_sys_bytes %d\n", memStats.Sys))
+	result.WriteString("# HELP dnscrypt_proxy_go_goroutines Current number of Go goroutines\n")
+	result.WriteString("# TYPE dnscrypt_proxy_go_goroutines gauge\n")
+	result.WriteString(fmt.Sprintf("dnscrypt_proxy_go_goroutines %d\n", runtime.NumGoroutine()))
 
 	// Events discarded because the collector was behind. Non-zero means the
 	// numbers above undercount, which is worth knowing before trusting them.
@@ -1161,11 +1229,8 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		}
 	}
 
-	// Read recent queries with its own lock
-	mc.queryLogMutex.RLock()
-	recentQueries := make([]QueryLogEntry, len(mc.recentQueries))
-	copy(recentQueries, mc.recentQueries)
-	mc.queryLogMutex.RUnlock()
+	// Read recent queries with its own lock.
+	recentQueries := mc.snapshotRecentQueries(0)
 
 	resolverHealth := make([]map[string]any, 0, len(resolverSnapshots))
 	for _, snapshot := range resolverSnapshots {
@@ -1613,6 +1678,9 @@ func (ui *MonitoringUI) basicAuthMiddleware(next http.Handler) http.Handler {
 
 // scheduleBroadcast - Rate-limited scheduling of WebSocket broadcasts
 func (ui *MonitoringUI) scheduleBroadcast() {
+	if !ui.hasClients() {
+		return
+	}
 	ui.broadcastMutex.Lock()
 	defer ui.broadcastMutex.Unlock()
 
@@ -1647,6 +1715,12 @@ func (ui *MonitoringUI) scheduleBroadcast() {
 
 // broadcastMetrics - Broadcasts metrics to all connected WebSocket clients
 func (ui *MonitoringUI) broadcastMetrics() {
+	// Avoid building, copying and fleet-aggregating the full query history when
+	// nobody can receive it. Recheck here because the last client may disconnect
+	// after a delayed broadcast was scheduled.
+	if !ui.hasClients() {
+		return
+	}
 	metrics := ui.browserMetrics()
 
 	ui.writesMutex.Lock()
@@ -1664,4 +1738,10 @@ func (ui *MonitoringUI) broadcastMetrics() {
 			delete(ui.clients, client)
 		}
 	}
+}
+
+func (ui *MonitoringUI) hasClients() bool {
+	ui.clientsMutex.Lock()
+	defer ui.clientsMutex.Unlock()
+	return len(ui.clients) > 0
 }

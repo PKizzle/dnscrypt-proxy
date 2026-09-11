@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,14 +10,120 @@ import (
 	"codeberg.org/miekg/dns"
 )
 
+func TestQueryLogMemoryIncludesDNSSECDetails(t *testing.T) {
+	entry := QueryLogEntry{
+		ClientIP:      "anonymized",
+		Domain:        "example.com",
+		Type:          "HTTPS",
+		ResponseCode:  "PASS",
+		Server:        "resolver",
+		DNSSECVerdict: "indeterminate",
+		DNSSECReason:  strings.Repeat("x", 1024),
+	}
+	withoutDetails := entry
+	withoutDetails.DNSSECVerdict = ""
+	withoutDetails.DNSSECReason = ""
+	if got, want := entry.EstimateMemoryUsage()-withoutDetails.EstimateMemoryUsage(), int64(len(entry.DNSSECVerdict)+len(entry.DNSSECReason)); got != want {
+		t.Fatalf("DNSSEC detail memory = %d, want %d", got, want)
+	}
+}
+
+func TestQueryLogEvictionHonorsMemoryAndEntryLimits(t *testing.T) {
+	ui := newTestMonitoringUIWithLimits(t, 2, 1)
+	mc := ui.metricsCollector
+	mc.maxMemoryBytes = 1024
+
+	for _, domain := range []string{"one.example", "two.example", "three.example"} {
+		ui.applyMetrics(metricEvent{
+			at:           time.Now(),
+			qName:        domain,
+			qType:        "A",
+			serverName:   "resolver",
+			returnCode:   "PASS",
+			dnssecReason: strings.Repeat("r", 256),
+			logQuery:     true,
+		})
+	}
+
+	if got := mc.recentQueryCountLocked(); got != 2 {
+		t.Fatalf("retained query count = %d, want 2", got)
+	}
+	if mc.currentMemoryBytes > mc.maxMemoryBytes {
+		t.Fatalf("retained query memory = %d, limit %d", mc.currentMemoryBytes, mc.maxMemoryBytes)
+	}
+	recent := mc.snapshotRecentQueries(0)
+	if recent[0].Domain != "two.example" || recent[1].Domain != "three.example" {
+		t.Fatalf("retained queries = %#v, want the two newest", recent)
+	}
+
+	// An individual entry larger than the budget is dropped instead of making
+	// the configured bound advisory.
+	ui.applyMetrics(metricEvent{
+		at:           time.Now(),
+		qName:        "oversized.example",
+		qType:        "A",
+		serverName:   "resolver",
+		returnCode:   "PASS",
+		dnssecReason: strings.Repeat("r", int(mc.maxMemoryBytes)),
+		logQuery:     true,
+	})
+	if got := mc.recentQueryCountLocked(); got != 2 {
+		t.Fatalf("oversized entry changed retained count to %d", got)
+	}
+}
+
+func TestLargeQueryHistoryStaysWithinConfiguredBounds(t *testing.T) {
+	ui := newTestMonitoringUIWithLimits(t, 10_000, 8)
+	mc := ui.metricsCollector
+	reason := strings.Repeat("validated DNSSEC chain; ", 24)
+
+	for i := 0; i < 50_000; i++ {
+		ui.applyMetrics(metricEvent{
+			at:            time.Now(),
+			qName:         "retention-test.example",
+			qType:         "HTTPS",
+			serverName:    "resolver",
+			returnCode:    "PASS",
+			dnssecVerdict: "secure",
+			dnssecReason:  reason,
+			logQuery:      true,
+		})
+	}
+
+	if got := mc.recentQueryCountLocked(); got > mc.maxRecentQueries {
+		t.Fatalf("retained query count = %d, limit %d", got, mc.maxRecentQueries)
+	}
+	if mc.currentMemoryBytes > mc.maxMemoryBytes {
+		t.Fatalf("retained query memory = %d, limit %d", mc.currentMemoryBytes, mc.maxMemoryBytes)
+	}
+	if len(mc.snapshotRecentQueries(0)) != mc.recentQueryCountLocked() {
+		t.Fatal("query snapshot includes stale evicted entries")
+	}
+	if !ui.lastBroadcast.IsZero() {
+		t.Fatal("query load scheduled dashboard work without a connected client")
+	}
+}
+
+func TestBroadcastDoesNoWorkWithoutClients(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	ui.scheduleBroadcast()
+	if !ui.lastBroadcast.IsZero() {
+		t.Fatal("a query scheduled dashboard work without a connected client")
+	}
+}
+
 // newTestMonitoringUI builds a monitoring UI with its collector running.
 func newTestMonitoringUI(t *testing.T) *MonitoringUI {
+	return newTestMonitoringUIWithLimits(t, 100, 1)
+}
+
+func newTestMonitoringUIWithLimits(t *testing.T, maxEntries, maxMemoryMB int) *MonitoringUI {
 	t.Helper()
 	ui := NewMonitoringUI(&Proxy{
 		monitoringUI: MonitoringUIConfig{
 			Enabled:            true,
-			MaxQueryLogEntries: 100,
-			MaxMemoryMB:        1,
+			MaxQueryLogEntries: maxEntries,
+			MaxMemoryMB:        maxMemoryMB,
 		},
 	})
 	if ui == nil {
