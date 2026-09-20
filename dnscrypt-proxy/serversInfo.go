@@ -1360,6 +1360,13 @@ func fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, is
 func (serverInfo *ServerInfo) noticeFailure(proxy *Proxy) {
 	proxy.serversInfo.Lock()
 	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
+	// The first strategy normally keeps using index zero. Move a failed
+	// preferred resolver behind a healthier alternative immediately so that
+	// disabling the background estimator provides sticky selection without
+	// also disabling failover.
+	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
+		proxy.serversInfo.sortByRtt()
+	}
 	proxy.serversInfo.Unlock()
 }
 

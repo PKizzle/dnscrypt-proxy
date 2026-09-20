@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/VividCortex/ewma"
 )
@@ -43,6 +44,30 @@ func TestGetOneKeepsConfiguredSelectorForOrdinaryQueries(t *testing.T) {
 	}
 	if server.Name != "first" {
 		t.Fatalf("getOne() = %q, want configured first candidate", server.Name)
+	}
+}
+
+func TestFirstStrategyPromotesAlternativeAfterFailure(t *testing.T) {
+	proxy := NewProxy()
+	proxy.timeout = time.Second
+	proxy.serversInfo.lbStrategy = LBStrategyFirst{}
+	proxy.serversInfo.lbEstimator = false
+	proxy.serversInfo.inner = []*ServerInfo{
+		retryTestServer("first"),
+		retryTestServer("second"),
+	}
+	proxy.serversInfo.inner[0].rtt.Set(10)
+	proxy.serversInfo.inner[1].rtt.Set(20)
+
+	failed := proxy.serversInfo.getOne()
+	if failed == nil || failed.Name != "first" {
+		t.Fatalf("initial getOne() = %v, want first", failed)
+	}
+	failed.noticeFailure(proxy)
+
+	next := proxy.serversInfo.getOne()
+	if next == nil || next.Name != "second" {
+		t.Fatalf("getOne() after failure = %v, want second", next)
 	}
 }
 
