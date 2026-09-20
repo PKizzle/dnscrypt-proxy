@@ -7,13 +7,13 @@ import (
 	"sync"
 
 	"codeberg.org/miekg/dns"
-	iradix "github.com/hashicorp/go-immutable-radix"
+	iradix "github.com/hashicorp/go-immutable-radix/v2"
 	"github.com/jedisct1/dlog"
 	"github.com/k-sone/critbitgo"
 )
 
 type PluginAllowedIP struct {
-	allowedPrefixes *iradix.Tree
+	allowedPrefixes *iradix.Tree[struct{}]
 	allowedIPs      map[string]any
 	allowedNetworks *critbitgo.Net
 	logger          io.Writer
@@ -24,7 +24,7 @@ type PluginAllowedIP struct {
 	rwLock          sync.RWMutex
 	configFile      string
 	configWatcher   *ConfigWatcher
-	stagingPrefixes *iradix.Tree
+	stagingPrefixes *iradix.Tree[struct{}]
 	stagingIPs      map[string]any
 	stagingNetworks *critbitgo.Net
 }
@@ -46,7 +46,7 @@ func (plugin *PluginAllowedIP) Init(proxy *Proxy) error {
 		return err
 	}
 
-	plugin.allowedPrefixes = iradix.New()
+	plugin.allowedPrefixes = iradix.New[struct{}]()
 	plugin.allowedIPs = make(map[string]any)
 	plugin.allowedNetworks = critbitgo.NewNet()
 
@@ -72,7 +72,7 @@ func (plugin *PluginAllowedIP) Drop() error {
 func (plugin *PluginAllowedIP) PrepareReload() error {
 	return StandardPrepareReloadPattern(plugin.Name(), plugin.configFile, func(lines string) error {
 		// Create staging structures
-		plugin.stagingPrefixes = iradix.New()
+		plugin.stagingPrefixes = iradix.New[struct{}]()
 		plugin.stagingIPs = make(map[string]any)
 		plugin.stagingNetworks = critbitgo.NewNet()
 

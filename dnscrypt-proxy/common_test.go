@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	iradix "github.com/hashicorp/go-immutable-radix"
+	iradix "github.com/hashicorp/go-immutable-radix/v2"
 	"github.com/jedisct1/dlog"
 	"github.com/k-sone/critbitgo"
 )
@@ -47,7 +47,7 @@ func TestLoadIPRulesErrorLineNumbers(t *testing.T) {
 				t.Fatal(err)
 			}
 			ips := make(map[string]any)
-			if _, err := LoadIPRules("# Rules\n\n"+tt.rule+"\n192.0.2.1\n", iradix.New(), ips, tt.networks); err != nil {
+			if _, err := LoadIPRules("# Rules\n\n"+tt.rule+"\n192.0.2.1\n", iradix.New[struct{}](), ips, tt.networks); err != nil {
 				t.Fatal(err)
 			}
 			if ips["192.0.2.1"] != true {

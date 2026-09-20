@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode"
 
-	iradix "github.com/hashicorp/go-immutable-radix"
+	iradix "github.com/hashicorp/go-immutable-radix/v2"
 	"github.com/jedisct1/dlog"
 	"github.com/k-sone/critbitgo"
 )
@@ -323,7 +323,7 @@ func ProcessConfigLines(lines string, processor func(line string, lineNo int) er
 //   - ips (map): exact IP addresses
 //   - prefixes (radix tree): wildcard prefix rules (e.g. "192.168.*")
 //   - networks (critbit net): CIDR network masks (e.g. "10.0.0.0/8")
-func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]any, networks *critbitgo.Net) (*iradix.Tree, error) {
+func LoadIPRules(lines string, prefixes *iradix.Tree[struct{}], ips map[string]any, networks *critbitgo.Net) (*iradix.Tree[struct{}], error) {
 	err := ProcessConfigLines(lines, func(line string, lineNo int) error {
 		if strings.Contains(line, "/") {
 			if networks == nil {
@@ -342,7 +342,7 @@ func LoadIPRules(lines string, prefixes *iradix.Tree, ips map[string]any, networ
 		}
 
 		if trailingStar {
-			prefixes, _, _ = prefixes.Insert([]byte(cleanLine), 0)
+			prefixes, _, _ = prefixes.Insert([]byte(cleanLine), struct{}{})
 		} else {
 			ips[cleanLine] = true
 		}
