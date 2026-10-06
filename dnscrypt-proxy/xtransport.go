@@ -52,6 +52,13 @@ const (
 	resolverRetryMaxBackoff     = 1 * time.Second
 
 	DefaultHTTP3NegativeCacheTTL = 30 * time.Minute
+
+	// A QUIC connection whose path died is otherwise kept for quic-go's 30s
+	// idle timeout, and every query sent on it in the meantime waits for the
+	// full request timeout. Keepalives every 2s let a 5s idle timeout close it
+	// quickly without closing healthy connections that are merely quiet.
+	HTTP3MaxIdleTimeout  = 5 * time.Second
+	HTTP3KeepAlivePeriod = 2 * time.Second
 )
 
 type CachedIPItem struct {
@@ -420,10 +427,7 @@ func (xTransport *XTransport) rebuildTransport() {
 		}
 	}
 	transport.TLSClientConfig = &tlsClientConfig
-	if http2Transport, _ := http2.ConfigureTransports(transport); http2Transport != nil {
-		http2Transport.ReadIdleTimeout = timeout
-		http2Transport.AllowHTTP = false
-	}
+	configureHTTP2Transport(transport, timeout)
 	xTransport.transport = transport
 	if xTransport.http3 {
 		dial := func(ctx context.Context, addrStr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
@@ -500,9 +504,32 @@ func (xTransport *XTransport) rebuildTransport() {
 			}
 			return nil, lastErr
 		}
-		h3Transport := &http3.Transport{DisableCompression: true, TLSClientConfig: &tlsClientConfig, Dial: dial}
+		h3Transport := &http3.Transport{
+			DisableCompression: true,
+			TLSClientConfig:    &tlsClientConfig,
+			QUICConfig: &quic.Config{
+				MaxIdleTimeout:  HTTP3MaxIdleTimeout,
+				KeepAlivePeriod: HTTP3KeepAlivePeriod,
+			},
+			Dial: dial,
+		}
 		xTransport.h3Transport = h3Transport
 	}
+}
+
+// configureHTTP2Transport enables HTTP/2 on transport with health checks sized
+// to the request timeout. A connection that has been silent for one timeout is
+// pinged, and closed if the ping is not answered within another. Without the
+// ping timeout, x/net waits 15s, and every query sent on a dead connection in
+// the meantime fails only after its own full timeout.
+func configureHTTP2Transport(transport *http.Transport, timeout time.Duration) *http2.Transport {
+	http2Transport, _ := http2.ConfigureTransports(transport)
+	if http2Transport != nil {
+		http2Transport.ReadIdleTimeout = timeout
+		http2Transport.PingTimeout = timeout
+		http2Transport.AllowHTTP = false
+	}
+	return http2Transport
 }
 
 func (xTransport *XTransport) resolveUsingSystem(host string, returnIPv4, returnIPv6 bool) ([]net.IP, time.Duration, error) {
