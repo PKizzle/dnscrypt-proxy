@@ -265,3 +265,50 @@ func TestFirstStrategyFailbackKeepsBetterReplacement(t *testing.T) {
 		t.Fatalf("head = %q, want the faster replacement kept", got)
 	}
 }
+
+func TestFirstStrategyIgnoresIsolatedServfail(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	for range firstStrategyServfailDemotion - 1 {
+		fast.noticeFailureReason(proxy, failureReasonServfail)
+	}
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("isolated SERVFAILs moved the head to %q", got)
+	}
+	if got := fast.rtt.Value(); got != 14 {
+		t.Fatalf("isolated SERVFAILs changed the RTT estimate to %v", got)
+	}
+}
+
+func TestFirstStrategySuccessResetsServfailRun(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	for range firstStrategyServfailDemotion - 1 {
+		fast.noticeFailureReason(proxy, failureReasonServfail)
+	}
+	fast.noticeBegin(proxy)
+	fast.noticeSuccess(proxy)
+	fast.noticeFailureReason(proxy, failureReasonServfail)
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("SERVFAILs separated by a success moved the head to %q", got)
+	}
+}
+
+func TestFirstStrategyDemotesServerThatOnlyServfails(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	for range firstStrategyServfailDemotion {
+		fast.noticeFailureReason(proxy, failureReasonServfail)
+	}
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("a server answering only SERVFAIL kept the head: %q", got)
+	}
+}
+
+func TestFirstStrategyTimeoutStillFailsOverImmediately(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	proxy.serversInfo.inner[0].noticeFailureReason(proxy, failureReasonTimeout)
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("head after a timeout = %q, want slow", got)
+	}
+}

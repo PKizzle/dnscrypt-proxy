@@ -30,6 +30,12 @@ const (
 	// firstStrategyFailbackDelay is how long a server demoted by a failure
 	// under the `first` strategy waits before it may take the head again.
 	firstStrategyFailbackDelay = 5 * time.Minute
+
+	// firstStrategyServfailDemotion is how many SERVFAILs in a row, with no
+	// successful answer between them, demote a server under the `first`
+	// strategy. A single SERVFAIL is usually a broken domain, which every
+	// upstream answers the same way, and must not move all traffic.
+	firstStrategyServfailDemotion = 3
 )
 
 type RegisteredServer struct {
@@ -83,6 +89,8 @@ type ServerInfo struct {
 	// is the estimate it held before the failure, measured from live traffic.
 	demotedAt     time.Time
 	preFailureRtt float64
+	// consecutiveServfails counts SERVFAILs since the last successful answer.
+	consecutiveServfails int
 }
 
 type LBStrategy interface {
@@ -1500,6 +1508,13 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	}
 	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
+		if reason == failureReasonServfail {
+			serverInfo.consecutiveServfails++
+			if serverInfo.consecutiveServfails < firstStrategyServfailDemotion {
+				proxy.serversInfo.Unlock()
+				return
+			}
+		}
 		// Keep the estimate from before the first failure of a run; a repeated
 		// failure only restarts the failback delay.
 		if serverInfo.demotedAt.IsZero() {
@@ -1532,5 +1547,6 @@ func (serverInfo *ServerInfo) noticeSuccess(proxy *Proxy) {
 	if elapsedMs > 0 && elapsed < proxy.timeout {
 		serverInfo.rtt.Add(float64(elapsedMs))
 	}
+	serverInfo.consecutiveServfails = 0
 	proxy.serversInfo.Unlock()
 }
