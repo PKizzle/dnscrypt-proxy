@@ -173,6 +173,33 @@ type ServersInfo struct {
 	odohRefreshMu       sync.Mutex
 	odohRefreshInFlight map[string]bool
 	odohLastFailureAt   map[string]time.Time
+	// failures counts upstream failures by server name and reason. It lives
+	// here rather than on ServerInfo because a certificate refresh replaces
+	// the ServerInfo, and a counter must not reset with it.
+	failures map[serverFailureKey]uint64
+}
+
+// Reasons an upstream exchange counts as failed.
+const (
+	failureReasonTimeout     = "timeout"
+	failureReasonNetwork     = "network"
+	failureReasonServfail    = "servfail"
+	failureReasonBadResponse = "bad_response"
+	failureReasonOther       = "other"
+)
+
+type serverFailureKey struct {
+	server string
+	reason string
+}
+
+// failureReasonForError classifies a transport error.
+func failureReasonForError(err error) string {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return failureReasonTimeout
+	}
+	return failureReasonNetwork
 }
 
 func NewServersInfo() ServersInfo {
@@ -183,7 +210,31 @@ func NewServersInfo() ServersInfo {
 		registeredRelays:    make([]RegisteredServer, 0),
 		odohRefreshInFlight: make(map[string]bool),
 		odohLastFailureAt:   make(map[string]time.Time),
+		failures:            make(map[serverFailureKey]uint64),
 	}
+}
+
+// failureCounts returns a copy of the failure counters.
+func (serversInfo *ServersInfo) failureCounts() map[serverFailureKey]uint64 {
+	serversInfo.RLock()
+	defer serversInfo.RUnlock()
+	counts := make(map[serverFailureKey]uint64, len(serversInfo.failures))
+	for key, count := range serversInfo.failures {
+		counts[key] = count
+	}
+	return counts
+}
+
+// serverOrder returns the server names in selection order. With the `first`
+// strategy the first name is the server that receives every query.
+func (serversInfo *ServersInfo) serverOrder() []string {
+	serversInfo.RLock()
+	defer serversInfo.RUnlock()
+	names := make([]string, len(serversInfo.inner))
+	for i, server := range serversInfo.inner {
+		names[i] = server.Name
+	}
+	return names
 }
 
 // beginODoHRefresh returns true if the caller should perform an ODoH key
@@ -294,6 +345,13 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	found := false
 	for i, oldServer := range serversInfo.inner {
 		if oldServer.Name == name {
+			if serversInfo.keepsOrderAcrossRefresh() && oldServer.rtt != nil {
+				// A certificate refresh is not new evidence about latency. The
+				// probe RTT is a single sample and would undo a failure demotion.
+				newServer.rtt = oldServer.rtt
+				newServer.lastActionTS = oldServer.lastActionTS
+				newServer.lastDecayTS = oldServer.lastDecayTS
+			}
 			serversInfo.inner[i] = &newServer
 			found = true
 			break
@@ -318,6 +376,10 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	serversCount := len(serversInfo.registeredServers)
 	registeredServers := make([]RegisteredServer, serversCount)
 	copy(registeredServers, serversInfo.registeredServers)
+	previousOrder := make(map[string]int, len(serversInfo.inner))
+	for i, server := range serversInfo.inner {
+		previousOrder[server.Name] = i
+	}
 	serversInfo.RUnlock()
 	rand.Shuffle(len(registeredServers), func(i, j int) {
 		registeredServers[i], registeredServers[j] = registeredServers[j], registeredServers[i]
@@ -347,9 +409,7 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 		err = nil
 	}
 	serversInfo.Lock()
-	sort.SliceStable(serversInfo.inner, func(i, j int) bool {
-		return serversInfo.inner[i].initialRtt < serversInfo.inner[j].initialRtt
-	})
+	orderAfterRefresh(serversInfo.inner, previousOrder, serversInfo.keepsOrderAcrossRefresh())
 	inner := serversInfo.inner
 	innerLen := len(inner)
 	if innerLen > 1 {
@@ -363,6 +423,36 @@ func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
 	}
 	serversInfo.Unlock()
 	return liveServers, err
+}
+
+// keepsOrderAcrossRefresh reports whether the server order is a decision that
+// periodic certificate refreshes must preserve. With the `first` strategy the
+// order is the server choice: index zero receives every query, and it changes
+// only when that server fails. Re-sorting by each refresh's probe RTT would
+// switch upstreams every refresh interval on a single noisy sample.
+func (serversInfo *ServersInfo) keepsOrderAcrossRefresh() bool {
+	_, isFirst := serversInfo.lbStrategy.(LBStrategyFirst)
+	return isFirst
+}
+
+// orderAfterRefresh sorts servers after a refresh. Servers that are new to this
+// refresh are ordered by their initial probe RTT. When keepExisting is set,
+// servers that were already known keep their previous relative order and stay
+// ahead of new ones; otherwise every server is ordered by its probe RTT.
+func orderAfterRefresh(inner []*ServerInfo, previousOrder map[string]int, keepExisting bool) {
+	sort.SliceStable(inner, func(i, j int) bool {
+		if keepExisting {
+			pi, iKnown := previousOrder[inner[i].Name]
+			pj, jKnown := previousOrder[inner[j].Name]
+			if iKnown && jKnown {
+				return pi < pj
+			}
+			if iKnown != jKnown {
+				return iKnown
+			}
+		}
+		return inner[i].initialRtt < inner[j].initialRtt
+	})
 }
 
 func (serversInfo *ServersInfo) estimatorUpdate(currentActive int) {
@@ -1358,7 +1448,15 @@ func fetchODoHTargetInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, is
 }
 
 func (serverInfo *ServerInfo) noticeFailure(proxy *Proxy) {
+	serverInfo.noticeFailureReason(proxy, failureReasonOther)
+}
+
+func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	proxy.serversInfo.Lock()
+	if proxy.serversInfo.failures == nil {
+		proxy.serversInfo.failures = make(map[serverFailureKey]uint64)
+	}
+	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
 	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
 	// The first strategy normally keeps using index zero. Move a failed
 	// preferred resolver behind a healthier alternative immediately so that

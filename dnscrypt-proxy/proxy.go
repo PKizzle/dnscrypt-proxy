@@ -972,7 +972,7 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 		}
 		pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 		if serverInfo != nil {
-			serverInfo.noticeFailure(proxy)
+			serverInfo.noticeFailureReason(proxy, failureReasonBadResponse)
 		}
 		return response
 	}

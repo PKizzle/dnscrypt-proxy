@@ -105,7 +105,7 @@ func processDNSCryptQuery(
 			}
 		}
 		// No stale response available; this is a definitive failure
-		serverInfo.noticeFailure(proxy)
+		serverInfo.noticeFailureReason(proxy, failureReasonForError(err))
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
@@ -151,7 +151,7 @@ func processDoHQuery(
 	}
 
 	// No stale response available; this is a definitive failure
-	serverInfo.noticeFailure(proxy)
+	serverInfo.noticeFailureReason(proxy, failureReasonForError(err))
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	return nil, err
@@ -397,9 +397,9 @@ func processPlugins(
 	// the original server completed its exchange and supplied judgeable data.
 	finalRcode := Rcode(response)
 	if upstreamRcode == dns.RcodeServerFailure {
-		serverInfo.noticeFailure(proxy)
+		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
 	} else if finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec {
-		serverInfo.noticeFailure(proxy)
+		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
 	} else {
 		serverInfo.noticeSuccess(proxy)
 	}

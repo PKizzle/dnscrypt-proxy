@@ -786,6 +786,41 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 
 	// Add query type metrics
 	mc.queryTypesMutex.RLock()
+	// Failed upstream exchanges never reach the per-query metrics above: a
+	// query that gets no answer is not recorded there at all. These counters
+	// are the only place a timeout or a dead connection shows up.
+	if mc.proxy != nil {
+		failures := mc.proxy.serversInfo.failureCounts()
+		keys := make([]serverFailureKey, 0, len(failures))
+		for key := range failures {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].server != keys[j].server {
+				return keys[i].server < keys[j].server
+			}
+			return keys[i].reason < keys[j].reason
+		})
+		result.WriteString("# HELP dnscrypt_proxy_server_failures_total Failed upstream exchanges per server and reason\n")
+		result.WriteString("# TYPE dnscrypt_proxy_server_failures_total counter\n")
+		for _, key := range keys {
+			result.WriteString(fmt.Sprintf("dnscrypt_proxy_server_failures_total{server=\"%s\",reason=\"%s\"} %d\n",
+				prometheusLabelValue(key.server), key.reason, failures[key]))
+		}
+
+		// With the `first` strategy the head of the order receives every
+		// query, so this series is a timeline of which upstream was in use.
+		result.WriteString("# HELP dnscrypt_proxy_preferred_server Whether the server is first in selection order (1) or not (0)\n")
+		result.WriteString("# TYPE dnscrypt_proxy_preferred_server gauge\n")
+		for i, server := range mc.proxy.serversInfo.serverOrder() {
+			preferred := 0
+			if i == 0 {
+				preferred = 1
+			}
+			result.WriteString(fmt.Sprintf("dnscrypt_proxy_preferred_server{server=\"%s\"} %d\n", prometheusLabelValue(server), preferred))
+		}
+	}
+
 	result.WriteString("# HELP dnscrypt_proxy_query_type_total Total queries per DNS record type\n")
 	result.WriteString("# TYPE dnscrypt_proxy_query_type_total counter\n")
 	for qtype, count := range mc.queryTypes {
@@ -858,6 +893,12 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"indeterminate\"} %d\n", dnssecVerdicts.indeterminate.Load()))
 
 	return result.String()
+}
+
+// prometheusLabelValue escapes backslashes and quotes so a label value cannot
+// end the label early.
+func prometheusLabelValue(value string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(value, "\\", "\\\\"), "\"", "\\\"")
 }
 
 func determineResolverStatus(total uint64, successRate float64, lastUpdate, lastAction, now time.Time) string {
