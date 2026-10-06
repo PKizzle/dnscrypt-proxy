@@ -306,19 +306,32 @@ func handleDNSExchange(
 				pluginsState.serverName = res.serverName
 			}
 			pluginsState.returnCode = res.returnCode
-			if res.err != nil {
-				return nil, res.err
-			}
-			response := make([]byte, len(res.response))
-			copy(response, res.response)
-			if len(response) >= 2 && len(query) >= 2 {
-				response[0], response[1] = query[0], query[1]
-			}
-			return response, nil
 		}
-		return res.response, res.err
+		if res.err != nil {
+			return nil, res.err
+		}
+		return inflightResponseForCaller(res.response, query), nil
 	}
 	return exchangeOnce(proxy, serverInfo, pluginsState, query, serverProto)
+}
+
+// inflightResponseForCaller returns a private copy of a collapsed exchange's
+// response, carrying the caller's own transaction ID.
+//
+// Every caller of the exchange reads the shared response, and response
+// processing re-packs the message into the buffer it was given. If any caller,
+// including the one that did the work, kept the shared slice, the others would
+// copy a message rewritten underneath them and fail to parse it.
+func inflightResponseForCaller(shared, query []byte) []byte {
+	if shared == nil {
+		return nil
+	}
+	response := make([]byte, len(shared))
+	copy(response, shared)
+	if len(response) >= 2 && len(query) >= 2 {
+		response[0], response[1] = query[0], query[1]
+	}
+	return response
 }
 
 // exchangeOnce performs the exchange itself, without regard for whether another
