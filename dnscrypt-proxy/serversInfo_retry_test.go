@@ -188,3 +188,80 @@ func TestRefreshResortsByProbeRttForOtherStrategies(t *testing.T) {
 		t.Fatalf("order = %v, want probe-RTT order when not keeping existing", got)
 	}
 }
+
+func firstStrategyFailbackProxy() *Proxy {
+	proxy := NewProxy()
+	proxy.timeout = time.Second
+	proxy.serversInfo.lbStrategy = LBStrategyFirst{}
+	proxy.serversInfo.lbEstimator = false
+	proxy.serversInfo.inner = []*ServerInfo{
+		refreshTestServer("fast", 14),
+		refreshTestServer("slow", 90),
+	}
+	return proxy
+}
+
+func TestFirstStrategyFailsBackAfterDelay(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	fast.noticeFailure(proxy)
+	if got := proxy.serversInfo.getOne().Name; got != "slow" {
+		t.Fatalf("after failure getOne() = %q, want slow", got)
+	}
+
+	proxy.serversInfo.Lock()
+	proxy.serversInfo.failBackFirstStrategy(fast.demotedAt.Add(firstStrategyFailbackDelay - time.Second))
+	proxy.serversInfo.Unlock()
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("failed back before the delay: head = %q", got)
+	}
+
+	proxy.serversInfo.Lock()
+	proxy.serversInfo.failBackFirstStrategy(fast.demotedAt.Add(firstStrategyFailbackDelay))
+	proxy.serversInfo.Unlock()
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("after the delay head = %q, want fast", got)
+	}
+	if !fast.demotedAt.IsZero() {
+		t.Fatal("failback did not clear the demotion")
+	}
+}
+
+func TestFirstStrategyRepeatedFailureKeepsOriginalEstimate(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	fast.noticeFailure(proxy)
+	fast.noticeFailure(proxy)
+	if fast.preFailureRtt != 14 {
+		t.Fatalf("preFailureRtt = %v, want the estimate before the first failure", fast.preFailureRtt)
+	}
+}
+
+func TestFirstStrategyNeverPromotesServerThatDidNotFail(t *testing.T) {
+	// The backup's stale estimate is lower than the head's live one, but it
+	// never failed, so nothing may swap them. Only failures move the head.
+	proxy := firstStrategyFailbackProxy()
+	proxy.serversInfo.inner[0].rtt.Set(120)
+	proxy.serversInfo.Lock()
+	proxy.serversInfo.failBackFirstStrategy(time.Now().Add(time.Hour))
+	proxy.serversInfo.Unlock()
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("head = %q, want fast to stay", got)
+	}
+}
+
+func TestFirstStrategyFailbackKeepsBetterReplacement(t *testing.T) {
+	// If the replacement measures faster than the failed server ever did,
+	// failback restores the old estimate but the replacement keeps the head.
+	proxy := firstStrategyFailbackProxy()
+	proxy.serversInfo.inner[1].rtt.Set(30)
+	proxy.serversInfo.inner[0].rtt.Set(40)
+	fast := proxy.serversInfo.inner[0]
+	fast.noticeFailure(proxy)
+	proxy.serversInfo.Lock()
+	proxy.serversInfo.failBackFirstStrategy(fast.demotedAt.Add(firstStrategyFailbackDelay))
+	proxy.serversInfo.Unlock()
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("head = %q, want the faster replacement kept", got)
+	}
+}

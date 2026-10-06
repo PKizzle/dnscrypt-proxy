@@ -26,6 +26,10 @@ import (
 
 const (
 	RTTEwmaDecay = 10.0
+
+	// firstStrategyFailbackDelay is how long a server demoted by a failure
+	// under the `first` strategy waits before it may take the head again.
+	firstStrategyFailbackDelay = 5 * time.Minute
 )
 
 type RegisteredServer struct {
@@ -73,6 +77,12 @@ type ServerInfo struct {
 	failedQueries  uint64    // Failed queries count
 	lastUpdateTime time.Time // Last time metrics were updated
 	lastDecayTS    time.Time // Last time RTT was decayed for recovery
+
+	// demotedAt and preFailureRtt let a server demoted by a failure under the
+	// `first` strategy return once it has had time to recover. preFailureRtt
+	// is the estimate it held before the failure, measured from live traffic.
+	demotedAt     time.Time
+	preFailureRtt float64
 }
 
 type LBStrategy interface {
@@ -351,6 +361,8 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 				newServer.rtt = oldServer.rtt
 				newServer.lastActionTS = oldServer.lastActionTS
 				newServer.lastDecayTS = oldServer.lastDecayTS
+				newServer.demotedAt = oldServer.demotedAt
+				newServer.preFailureRtt = oldServer.preFailureRtt
 			}
 			serversInfo.inner[i] = &newServer
 			found = true
@@ -489,10 +501,40 @@ func (serversInfo *ServersInfo) sortByRtt() {
 	}
 }
 
+// failBackFirstStrategy restores servers that a failure demoted under the
+// `first` strategy, once firstStrategyFailbackDelay has passed without another
+// failure. Each gets back the RTT estimate it had before the failure, and the
+// order is re-sorted, so the server regains the head only if that estimate
+// still beats the measured estimate of the server that replaced it. A server
+// that never failed is never promoted this way, so the choice stays sticky.
+func (serversInfo *ServersInfo) failBackFirstStrategy(now time.Time) {
+	// serversInfo.RWMutex is assumed to be Locked
+	if _, isFirst := serversInfo.lbStrategy.(LBStrategyFirst); !isFirst {
+		return
+	}
+	restored := false
+	for _, server := range serversInfo.inner {
+		if server.demotedAt.IsZero() || now.Sub(server.demotedAt) < firstStrategyFailbackDelay {
+			continue
+		}
+		server.rtt.Set(server.preFailureRtt)
+		server.demotedAt = time.Time{}
+		restored = true
+		dlog.Debugf("[%s] had no failure for %v; restoring its RTT estimate to %d", server.Name,
+			firstStrategyFailbackDelay, int(server.preFailureRtt))
+	}
+	if restored {
+		sort.SliceStable(serversInfo.inner, func(i, j int) bool {
+			return serversInfo.inner[i].rtt.Value() < serversInfo.inner[j].rtt.Value()
+		})
+	}
+}
+
 func (serversInfo *ServersInfo) recoverDormantServers() {
 	if len(serversInfo.inner) <= 1 {
 		return
 	}
+	serversInfo.failBackFirstStrategy(time.Now())
 	bestRtt := serversInfo.inner[0].rtt.Value()
 	for _, server := range serversInfo.inner {
 		if rtt := server.rtt.Value(); rtt > 0 && rtt < bestRtt {
@@ -1457,6 +1499,14 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 		proxy.serversInfo.failures = make(map[serverFailureKey]uint64)
 	}
 	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
+	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
+		// Keep the estimate from before the first failure of a run; a repeated
+		// failure only restarts the failback delay.
+		if serverInfo.demotedAt.IsZero() {
+			serverInfo.preFailureRtt = serverInfo.rtt.Value()
+		}
+		serverInfo.demotedAt = time.Now()
+	}
 	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
 	// The first strategy normally keeps using index zero. Move a failed
 	// preferred resolver behind a healthier alternative immediately so that
