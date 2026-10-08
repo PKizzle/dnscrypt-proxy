@@ -69,6 +69,7 @@ func processDNSCryptQuery(
 	}
 
 	serverInfo.noticeBegin(proxy)
+	sentAt := time.Now()
 	var response []byte
 
 	if serverProto == "udp" {
@@ -105,7 +106,7 @@ func processDNSCryptQuery(
 			}
 		}
 		// No stale response available; this is a definitive failure
-		serverInfo.noticeFailureReason(proxy, failureReasonForError(err))
+		serverInfo.noticeExchangeError(proxy, err, sentAt)
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
@@ -128,6 +129,7 @@ func processDoHQuery(
 	tid := TransactionID(query)
 	SetTransactionID(query, 0)
 	serverInfo.noticeBegin(proxy)
+	sentAt := time.Now()
 	serverResponse, _, tls, _, err := proxy.xTransport.DoHQuery(serverInfo.useGet, serverInfo.URL, query, proxy.timeout)
 	SetTransactionID(query, tid)
 
@@ -151,7 +153,7 @@ func processDoHQuery(
 	}
 
 	// No stale response available; this is a definitive failure
-	serverInfo.noticeFailureReason(proxy, failureReasonForError(err))
+	serverInfo.noticeExchangeError(proxy, err, sentAt)
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	return nil, err

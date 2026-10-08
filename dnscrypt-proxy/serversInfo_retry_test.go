@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -310,5 +311,66 @@ func TestFirstStrategyTimeoutStillFailsOverImmediately(t *testing.T) {
 	proxy.serversInfo.inner[0].noticeFailureReason(proxy, failureReasonTimeout)
 	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
 		t.Fatalf("head after a timeout = %q, want slow", got)
+	}
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+func TestFirstStrategyKeepsServerThatAnsweredOtherQueries(t *testing.T) {
+	// A slow zone: the query was sent, other queries were answered while it
+	// waited, then it timed out. Another upstream would wait just as long.
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	sentAt := time.Now()
+	fast.noticeBegin(proxy)
+	fast.noticeSuccess(proxy)
+	fast.noticeExchangeError(proxy, timeoutError{}, sentAt.Add(-time.Millisecond))
+
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("an isolated timeout moved the head to %q", got)
+	}
+	counts := proxy.serversInfo.failureCounts()
+	if counts[serverFailureKey{"fast", failureReasonIsolatedTimeout}] != 1 || counts[serverFailureKey{"fast", failureReasonTimeout}] != 0 {
+		t.Fatalf("failure counts = %v, want one isolated timeout", counts)
+	}
+}
+
+func TestFirstStrategyFailsOverWhenNothingWasAnswered(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	fast.noticeBegin(proxy)
+	fast.noticeSuccess(proxy) // answered before the query was sent
+	time.Sleep(2 * time.Millisecond)
+	fast.noticeExchangeError(proxy, timeoutError{}, time.Now())
+
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("head after a timeout on a silent server = %q, want slow", got)
+	}
+}
+
+func TestFirstStrategyCountsServfailAsAnAnswer(t *testing.T) {
+	// A SERVFAIL is still a response: the server is reachable.
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	sentAt := time.Now().Add(-time.Millisecond)
+	fast.noticeFailureReason(proxy, failureReasonServfail)
+	fast.noticeExchangeError(proxy, timeoutError{}, sentAt)
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "fast" {
+		t.Fatalf("head = %q, want fast kept after it answered with SERVFAIL", got)
+	}
+}
+
+func TestFirstStrategyNetworkErrorStillFailsOver(t *testing.T) {
+	proxy := firstStrategyFailbackProxy()
+	fast := proxy.serversInfo.inner[0]
+	fast.noticeBegin(proxy)
+	fast.noticeSuccess(proxy)
+	fast.noticeExchangeError(proxy, errors.New("connection reset"), time.Now().Add(-time.Second))
+	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
+		t.Fatalf("head after a network error = %q, want slow", got)
 	}
 }

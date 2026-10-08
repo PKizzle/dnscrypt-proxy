@@ -91,6 +91,10 @@ type ServerInfo struct {
 	preFailureRtt float64
 	// consecutiveServfails counts SERVFAILs since the last successful answer.
 	consecutiveServfails int
+	// lastResponseTS is when the server last returned any DNS response,
+	// SERVFAIL included. It separates a server that stopped answering from
+	// one that is slow for a particular name.
+	lastResponseTS time.Time
 }
 
 type LBStrategy interface {
@@ -199,11 +203,15 @@ type ServersInfo struct {
 
 // Reasons an upstream exchange counts as failed.
 const (
-	failureReasonTimeout     = "timeout"
-	failureReasonNetwork     = "network"
-	failureReasonServfail    = "servfail"
-	failureReasonBadResponse = "bad_response"
-	failureReasonOther       = "other"
+	failureReasonTimeout = "timeout"
+	// failureReasonIsolatedTimeout is a timeout on a server that answered
+	// other queries after the timed-out one was sent: the name is slow, not
+	// the server, so it is counted but does not move traffic.
+	failureReasonIsolatedTimeout = "isolated_timeout"
+	failureReasonNetwork         = "network"
+	failureReasonServfail        = "servfail"
+	failureReasonBadResponse     = "bad_response"
+	failureReasonOther           = "other"
 )
 
 type serverFailureKey struct {
@@ -371,6 +379,7 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 				newServer.lastDecayTS = oldServer.lastDecayTS
 				newServer.demotedAt = oldServer.demotedAt
 				newServer.preFailureRtt = oldServer.preFailureRtt
+				newServer.lastResponseTS = oldServer.lastResponseTS
 			}
 			serversInfo.inner[i] = &newServer
 			found = true
@@ -1509,6 +1518,7 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
 		if reason == failureReasonServfail {
+			serverInfo.lastResponseTS = time.Now()
 			serverInfo.consecutiveServfails++
 			if serverInfo.consecutiveServfails < firstStrategyServfailDemotion {
 				proxy.serversInfo.Unlock()
@@ -1548,5 +1558,30 @@ func (serverInfo *ServerInfo) noticeSuccess(proxy *Proxy) {
 		serverInfo.rtt.Add(float64(elapsedMs))
 	}
 	serverInfo.consecutiveServfails = 0
+	serverInfo.lastResponseTS = now
 	proxy.serversInfo.Unlock()
+}
+
+// noticeExchangeError records a transport error for a query sent at sentAt.
+//
+// Under the `first` strategy a timeout fails over only when the server has
+// returned nothing since sentAt. A connection that died answers nothing; a
+// zone with slow or refusing nameservers times out while the same server keeps
+// answering everything else, and another upstream would wait just as long.
+func (serverInfo *ServerInfo) noticeExchangeError(proxy *Proxy, err error, sentAt time.Time) {
+	reason := failureReasonForError(err)
+	if reason == failureReasonTimeout {
+		proxy.serversInfo.Lock()
+		_, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst)
+		if isFirst && serverInfo.lastResponseTS.After(sentAt) {
+			if proxy.serversInfo.failures == nil {
+				proxy.serversInfo.failures = make(map[serverFailureKey]uint64)
+			}
+			proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: failureReasonIsolatedTimeout}]++
+			proxy.serversInfo.Unlock()
+			return
+		}
+		proxy.serversInfo.Unlock()
+	}
+	serverInfo.noticeFailureReason(proxy, reason)
 }
