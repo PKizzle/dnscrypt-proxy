@@ -84,9 +84,20 @@ type ServerInfo struct {
 	lastUpdateTime time.Time // Last time metrics were updated
 	lastDecayTS    time.Time // Last time RTT was decayed for recovery
 
-	// demotedAt and preFailureRtt let a server demoted by a failure under the
-	// `first` strategy return once it has had time to recover. preFailureRtt
-	// is the estimate it held before the failure, measured from live traffic.
+	// failover is what the `first` strategy has recorded about the server's
+	// failures and answers. Use failoverLocked to reach it.
+	failover *failoverState
+}
+
+// failoverState is the `first` strategy's record of a server's failures and
+// answers. A certificate refresh replaces a ServerInfo while exchanges started
+// on the old one may still be running, so the replacement shares this record by
+// pointer, as it shares the RTT estimate. An outcome recorded through either
+// ServerInfo is then seen through both. The ServersInfo lock guards it.
+type failoverState struct {
+	// demotedAt and preFailureRtt let a server demoted by a failure return once
+	// it has had time to recover. preFailureRtt is the estimate it held before
+	// the failure, measured from live traffic.
 	demotedAt     time.Time
 	preFailureRtt float64
 	// consecutiveServfails counts SERVFAILs since the last successful answer.
@@ -95,6 +106,15 @@ type ServerInfo struct {
 	// SERVFAIL included. It separates a server that stopped answering from
 	// one that is slow for a particular name.
 	lastResponseTS time.Time
+}
+
+// failoverLocked returns the server's failover record, creating it on first
+// use. The ServersInfo lock must be held.
+func (serverInfo *ServerInfo) failoverLocked() *failoverState {
+	if serverInfo.failover == nil {
+		serverInfo.failover = &failoverState{}
+	}
+	return serverInfo.failover
 }
 
 type LBStrategy interface {
@@ -368,27 +388,7 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	proxy.cryptoKeyMu.RLock()
 	proxy.recomputeServerSharedKeyLocked(&newServer)
 	serversInfo.Lock()
-	found := false
-	for i, oldServer := range serversInfo.inner {
-		if oldServer.Name == name {
-			if serversInfo.keepsOrderAcrossRefresh() && oldServer.rtt != nil {
-				// A certificate refresh is not new evidence about latency. The
-				// probe RTT is a single sample and would undo a failure demotion.
-				newServer.rtt = oldServer.rtt
-				newServer.lastActionTS = oldServer.lastActionTS
-				newServer.lastDecayTS = oldServer.lastDecayTS
-				newServer.demotedAt = oldServer.demotedAt
-				newServer.preFailureRtt = oldServer.preFailureRtt
-				newServer.lastResponseTS = oldServer.lastResponseTS
-			}
-			serversInfo.inner[i] = &newServer
-			found = true
-			break
-		}
-	}
-	if !found {
-		serversInfo.inner = append(serversInfo.inner, &newServer)
-	}
+	found := serversInfo.installRefreshedServerLocked(&newServer)
 	serversInfo.Unlock()
 	proxy.cryptoKeyMu.RUnlock()
 	if !found {
@@ -396,6 +396,29 @@ func (serversInfo *ServersInfo) refreshServer(proxy *Proxy, name string, stamp s
 	}
 
 	return nil
+}
+
+// installRefreshedServerLocked puts a server fetched by a certificate refresh
+// in place of the known server with the same name, or appends it if there is
+// none. It reports whether the server was known. serversInfo must be locked.
+func (serversInfo *ServersInfo) installRefreshedServerLocked(newServer *ServerInfo) bool {
+	for i, oldServer := range serversInfo.inner {
+		if oldServer.Name != newServer.Name {
+			continue
+		}
+		if serversInfo.keepsOrderAcrossRefresh() && oldServer.rtt != nil {
+			// A certificate refresh is not new evidence about latency. The
+			// probe RTT is a single sample and would undo a failure demotion.
+			newServer.rtt = oldServer.rtt
+			newServer.lastActionTS = oldServer.lastActionTS
+			newServer.lastDecayTS = oldServer.lastDecayTS
+			newServer.failover = oldServer.failoverLocked()
+		}
+		serversInfo.inner[i] = newServer
+		return true
+	}
+	serversInfo.inner = append(serversInfo.inner, newServer)
+	return false
 }
 
 func (serversInfo *ServersInfo) refresh(proxy *Proxy) (int, error) {
@@ -520,30 +543,45 @@ func (serversInfo *ServersInfo) sortByRtt() {
 
 // failBackFirstStrategy restores servers that a failure demoted under the
 // `first` strategy, once firstStrategyFailbackDelay has passed without another
-// failure. Each gets back the RTT estimate it had before the failure, and the
-// order is re-sorted, so the server regains the head only if that estimate
-// still beats the measured estimate of the server that replaced it. A server
-// that never failed is never promoted this way, so the choice stays sticky.
+// failure. Each gets back the RTT estimate it had before the failure. The one
+// with the lowest restored estimate regains the head if that estimate beats the
+// measured estimate of the server that replaced it. No other server changes
+// place, so a server that never failed is never promoted and the choice stays
+// sticky.
 func (serversInfo *ServersInfo) failBackFirstStrategy(now time.Time) {
 	// serversInfo.RWMutex is assumed to be Locked
 	if _, isFirst := serversInfo.lbStrategy.(LBStrategyFirst); !isFirst {
 		return
 	}
-	restored := false
+	var best *ServerInfo
 	for _, server := range serversInfo.inner {
-		if server.demotedAt.IsZero() || now.Sub(server.demotedAt) < firstStrategyFailbackDelay {
+		failover := server.failoverLocked()
+		if failover.demotedAt.IsZero() || now.Sub(failover.demotedAt) < firstStrategyFailbackDelay {
 			continue
 		}
-		server.rtt.Set(server.preFailureRtt)
-		server.demotedAt = time.Time{}
-		restored = true
+		server.rtt.Set(failover.preFailureRtt)
+		failover.demotedAt = time.Time{}
 		dlog.Debugf("[%s] had no failure for %v; restoring its RTT estimate to %d", server.Name,
-			firstStrategyFailbackDelay, int(server.preFailureRtt))
+			firstStrategyFailbackDelay, int(failover.preFailureRtt))
+		if best == nil || server.rtt.Value() < best.rtt.Value() {
+			best = server
+		}
 	}
-	if restored {
-		sort.SliceStable(serversInfo.inner, func(i, j int) bool {
-			return serversInfo.inner[i].rtt.Value() < serversInfo.inner[j].rtt.Value()
-		})
+	if best != nil && best.rtt.Value() < serversInfo.inner[0].rtt.Value() {
+		serversInfo.moveToHead(best)
+	}
+}
+
+// moveToHead puts server first. The servers that were ahead of it move back by
+// one place and keep their order.
+func (serversInfo *ServersInfo) moveToHead(server *ServerInfo) {
+	// serversInfo.RWMutex is assumed to be Locked
+	for i, candidate := range serversInfo.inner {
+		if candidate == server {
+			copy(serversInfo.inner[1:i+1], serversInfo.inner[:i])
+			serversInfo.inner[0] = server
+			return
+		}
 	}
 }
 
@@ -1517,20 +1555,21 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	}
 	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
+		failover := serverInfo.failoverLocked()
 		if reason == failureReasonServfail {
-			serverInfo.lastResponseTS = time.Now()
-			serverInfo.consecutiveServfails++
-			if serverInfo.consecutiveServfails < firstStrategyServfailDemotion {
+			failover.lastResponseTS = time.Now()
+			failover.consecutiveServfails++
+			if failover.consecutiveServfails < firstStrategyServfailDemotion {
 				proxy.serversInfo.Unlock()
 				return
 			}
 		}
 		// Keep the estimate from before the first failure of a run; a repeated
 		// failure only restarts the failback delay.
-		if serverInfo.demotedAt.IsZero() {
-			serverInfo.preFailureRtt = serverInfo.rtt.Value()
+		if failover.demotedAt.IsZero() {
+			failover.preFailureRtt = serverInfo.rtt.Value()
 		}
-		serverInfo.demotedAt = time.Now()
+		failover.demotedAt = time.Now()
 	}
 	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
 	// The first strategy normally keeps using index zero. Move a failed
@@ -1557,8 +1596,9 @@ func (serverInfo *ServerInfo) noticeSuccess(proxy *Proxy) {
 	if elapsedMs > 0 && elapsed < proxy.timeout {
 		serverInfo.rtt.Add(float64(elapsedMs))
 	}
-	serverInfo.consecutiveServfails = 0
-	serverInfo.lastResponseTS = now
+	failover := serverInfo.failoverLocked()
+	failover.consecutiveServfails = 0
+	failover.lastResponseTS = now
 	proxy.serversInfo.Unlock()
 }
 
@@ -1573,7 +1613,7 @@ func (serverInfo *ServerInfo) noticeExchangeError(proxy *Proxy, err error, sentA
 	if reason == failureReasonTimeout {
 		proxy.serversInfo.Lock()
 		_, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst)
-		if isFirst && serverInfo.lastResponseTS.After(sentAt) {
+		if isFirst && serverInfo.failoverLocked().lastResponseTS.After(sentAt) {
 			if proxy.serversInfo.failures == nil {
 				proxy.serversInfo.failures = make(map[serverFailureKey]uint64)
 			}
