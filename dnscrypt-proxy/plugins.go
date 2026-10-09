@@ -94,6 +94,10 @@ type PluginsState struct {
 	cacheMinTTL                      uint32
 	cacheHit                         bool
 	dnssec                           bool
+	// servedStale is set when the upstream exchange failed and an expired cache
+	// entry answered instead. The failure counts against the server; the
+	// answer does not count for it.
+	servedStale bool
 }
 
 func (proxy *Proxy) InitPluginsGlobals() error {

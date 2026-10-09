@@ -60,11 +60,11 @@ func TestCollapsedCallersGetIndependentResponses(t *testing.T) {
 	followerQuery := []byte{0x22, 0x22}
 
 	// The caller that did the work processes its answer first, re-packing it.
-	leader := inflightResponseForCaller(shared, leaderQuery)
+	leader := inflightResponseForCaller(shared, leaderQuery, 0x1111)
 	repackWithoutOptions(t, leader)
 
 	// A caller that waited reads the shared answer afterwards.
-	follower := inflightResponseForCaller(shared, followerQuery)
+	follower := inflightResponseForCaller(shared, followerQuery, 0x1111)
 	if !bytes.Equal(shared, original) {
 		t.Fatal("processing one caller's response modified the shared response")
 	}
@@ -78,7 +78,20 @@ func TestCollapsedCallersGetIndependentResponses(t *testing.T) {
 }
 
 func TestCollapsedFailureStaysNil(t *testing.T) {
-	if got := inflightResponseForCaller(nil, []byte{1, 2}); got != nil {
+	if got := inflightResponseForCaller(nil, []byte{1, 2}, 0x0102); got != nil {
 		t.Fatalf("response = %v, want nil so the caller sees no answer", got)
+	}
+}
+
+func TestCollapsedResponseKeepsAnIDThatDoesNotMatchTheExchange(t *testing.T) {
+	// The exchange sent ID 0x1111 but the answer carries 0x9999. Writing a
+	// caller's own ID over it would hide the mismatch from the response
+	// validation that every caller runs, the one that sent the query included.
+	shared := paddedResponse(t, 0x9999, 16)
+	for _, query := range [][]byte{{0x11, 0x11}, {0x22, 0x22}} {
+		response := inflightResponseForCaller(shared, query, 0x1111)
+		if got := TransactionID(response); got != 0x9999 {
+			t.Fatalf("caller %#x got response ID %#x, want the mismatched 0x9999 kept", TransactionID(query), got)
+		}
 	}
 }

@@ -96,17 +96,12 @@ func processDNSCryptQuery(
 		response, err = proxy.exchangeWithTCPServer(serverInfo, sharedKey, encryptedQuery, clientNonce, queryEpoch)
 	}
 
-	// Check for stale response if there was an error
 	if err != nil {
-		if stale, ok := pluginsState.sessionData["stale"]; ok {
-			dlog.Debug("Serving stale response")
-			staleMsg := stale.(*dns.Msg)
-			if packErr := staleMsg.Pack(); packErr == nil {
-				return staleMsg.Data, nil
-			}
-		}
-		// No stale response available; this is a definitive failure
+		// The exchange failed whether or not a stale answer can stand in for it.
 		serverInfo.noticeExchangeError(proxy, err, sentAt)
+		if staleResponse, ok := serveStale(pluginsState); ok {
+			return staleResponse, nil
+		}
 		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
 			pluginsState.returnCode = PluginsReturnCodeServerTimeout
 		} else {
@@ -143,20 +138,32 @@ func processDoHQuery(
 		return response, nil
 	}
 
-	// Attempt to serve a stale response as a fallback.
-	if stale, ok := pluginsState.sessionData["stale"]; ok {
-		dlog.Debug("Serving stale response")
-		staleMsg := stale.(*dns.Msg)
-		if packErr := staleMsg.Pack(); packErr == nil {
-			return staleMsg.Data, nil
-		}
-	}
-
-	// No stale response available; this is a definitive failure
+	// The exchange failed whether or not a stale answer can stand in for it.
 	serverInfo.noticeExchangeError(proxy, err, sentAt)
+	if staleResponse, ok := serveStale(pluginsState); ok {
+		return staleResponse, nil
+	}
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
 	return nil, err
+}
+
+// serveStale returns the expired cache entry that the cache plugin set aside
+// for a query whose upstream exchange failed, and reports whether there was
+// one. It marks the query as answered from the stale cache, so that the answer
+// is not credited to the server that failed to give it.
+func serveStale(pluginsState *PluginsState) ([]byte, bool) {
+	stale, ok := pluginsState.sessionData["stale"]
+	if !ok {
+		return nil, false
+	}
+	staleMsg := stale.(*dns.Msg)
+	if err := staleMsg.Pack(); err != nil {
+		return nil, false
+	}
+	dlog.Debug("Serving stale response")
+	pluginsState.servedStale = true
+	return staleMsg.Data, true
 }
 
 // refreshODoHKey claims the per-server refresh slot, drives the actual
@@ -206,9 +213,13 @@ func processODoHQuery(
 		targetURL = serverInfo.Relay.ODoH.URL
 	}
 
+	sentAt := time.Now()
 	responseBody, responseCode, _, _, err := proxy.xTransport.ObliviousDoHQuery(
 		serverInfo.useGet, targetURL, odohQuery.odohMessage, proxy.timeout,
 	)
+	// A key refresh below may replace err; health is judged by what the
+	// exchange itself returned.
+	exchangeErr := err
 
 	if err == nil && len(responseBody) > 0 && responseCode == 200 {
 		response, err := odohQuery.decryptResponse(responseBody)
@@ -275,7 +286,11 @@ func processODoHQuery(
 
 	pluginsState.returnCode = PluginsReturnCodeNetworkError
 	pluginsState.ApplyLoggingPlugins(&proxy.pluginsGlobals)
-	serverInfo.noticeFailure(proxy)
+	if exchangeErr != nil {
+		serverInfo.noticeExchangeError(proxy, exchangeErr, sentAt)
+	} else {
+		serverInfo.noticeFailure(proxy)
+	}
 
 	return nil, err
 }
@@ -295,10 +310,12 @@ func handleDNSExchange(
 		res, shared := proxy.inflight.Do(key, func() inflightResult {
 			response, err := exchangeOnce(proxy, serverInfo, pluginsState, query, serverProto)
 			return inflightResult{
-				response:   response,
-				err:        err,
-				serverName: pluginsState.serverName,
-				returnCode: pluginsState.returnCode,
+				response:    response,
+				err:         err,
+				serverName:  pluginsState.serverName,
+				returnCode:  pluginsState.returnCode,
+				servedStale: pluginsState.servedStale,
+				queryID:     TransactionID(query),
 			}
 		})
 		if shared {
@@ -308,11 +325,12 @@ func handleDNSExchange(
 				pluginsState.serverName = res.serverName
 			}
 			pluginsState.returnCode = res.returnCode
+			pluginsState.servedStale = res.servedStale
 		}
 		if res.err != nil {
 			return nil, res.err
 		}
-		return inflightResponseForCaller(res.response, query), nil
+		return inflightResponseForCaller(res.response, query, res.queryID), nil
 	}
 	return exchangeOnce(proxy, serverInfo, pluginsState, query, serverProto)
 }
@@ -324,13 +342,17 @@ func handleDNSExchange(
 // processing re-packs the message into the buffer it was given. If any caller,
 // including the one that did the work, kept the shared slice, the others would
 // copy a message rewritten underneath them and fail to parse it.
-func inflightResponseForCaller(shared, query []byte) []byte {
+//
+// The caller's ID replaces only exchangeID, the ID of the query the exchange
+// sent. A response that carries any other ID keeps it, so the response
+// validation each caller runs rejects it.
+func inflightResponseForCaller(shared, query []byte, exchangeID uint16) []byte {
 	if shared == nil {
 		return nil
 	}
 	response := make([]byte, len(shared))
 	copy(response, shared)
-	if len(response) >= 2 && len(query) >= 2 {
+	if len(response) >= 2 && len(query) >= 2 && TransactionID(response) == exchangeID {
 		response[0], response[1] = query[0], query[1]
 	}
 	return response
@@ -411,11 +433,16 @@ func processPlugins(
 	// the client transaction; a locally generated DNSSEC SERVFAIL still means
 	// the original server completed its exchange and supplied judgeable data.
 	finalRcode := Rcode(response)
-	if upstreamRcode == dns.RcodeServerFailure {
+	switch {
+	case pluginsState.servedStale:
+		// The answer came from the stale cache because the exchange failed, and
+		// that failure was recorded when it happened. Crediting the server with
+		// the answer would hide that it stopped answering.
+	case upstreamRcode == dns.RcodeServerFailure:
 		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
-	} else if finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec {
+	case finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec:
 		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
-	} else {
+	default:
 		serverInfo.noticeSuccess(proxy)
 	}
 

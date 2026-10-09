@@ -944,7 +944,7 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 			exchangeResponse, err := handleDNSExchange(proxy, serverInfo, &pluginsState, query, serverProto)
 
 			// Update server statistics for WP2 strategy
-			success := upstreamExchangeSucceeded(exchangeResponse, err)
+			success := upstreamExchangeSucceeded(&pluginsState, exchangeResponse, err)
 			proxy.serversInfo.updateServerStats(serverName, success)
 
 			if err != nil || exchangeResponse == nil {
@@ -992,9 +992,12 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 // upstreamExchangeSucceeded distinguishes receiving a DNS-level failure from
 // successfully obtaining a usable answer. A SERVFAIL is transport-complete,
 // but rewarding that resolver would make WP2 increasingly likely to select the
-// exact server from which DNSSEC recovery had to escape.
-func upstreamExchangeSucceeded(response []byte, err error) bool {
-	return err == nil && len(response) >= MinDNSPacketSize && Rcode(response) != dns.RcodeServerFailure
+// exact server from which DNSSEC recovery had to escape. An answer from the
+// stale cache stands in for an exchange that failed, so it is not a success
+// either.
+func upstreamExchangeSucceeded(pluginsState *PluginsState, response []byte, err error) bool {
+	return err == nil && !pluginsState.servedStale &&
+		len(response) >= MinDNSPacketSize && Rcode(response) != dns.RcodeServerFailure
 }
 
 func NewProxy() *Proxy {

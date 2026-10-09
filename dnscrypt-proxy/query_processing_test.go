@@ -19,22 +19,29 @@ func packedResponseWithRcode(t *testing.T, rcode uint16) []byte {
 }
 
 func TestUpstreamExchangeSucceededRejectsDNSLevelSERVFAIL(t *testing.T) {
-	if upstreamExchangeSucceeded(nil, nil) {
+	if upstreamExchangeSucceeded(&PluginsState{}, nil, nil) {
 		t.Error("a missing response was counted as success")
 	}
-	if upstreamExchangeSucceeded([]byte{}, nil) {
+	if upstreamExchangeSucceeded(&PluginsState{}, []byte{}, nil) {
 		t.Error("an empty response was counted as success")
 	}
-	if upstreamExchangeSucceeded(packedResponseWithRcode(t, dns.RcodeSuccess), errors.New("transport failed")) {
+	if upstreamExchangeSucceeded(&PluginsState{}, packedResponseWithRcode(t, dns.RcodeSuccess), errors.New("transport failed")) {
 		t.Error("a transport error was counted as success")
 	}
-	if upstreamExchangeSucceeded(packedResponseWithRcode(t, dns.RcodeServerFailure), nil) {
+	if upstreamExchangeSucceeded(&PluginsState{}, packedResponseWithRcode(t, dns.RcodeServerFailure), nil) {
 		t.Error("an upstream SERVFAIL was counted as success")
 	}
-	if !upstreamExchangeSucceeded(packedResponseWithRcode(t, dns.RcodeSuccess), nil) {
+	if !upstreamExchangeSucceeded(&PluginsState{}, packedResponseWithRcode(t, dns.RcodeSuccess), nil) {
 		t.Error("an upstream NOERROR response was not counted as success")
 	}
-	if !upstreamExchangeSucceeded(packedResponseWithRcode(t, dns.RcodeNameError), nil) {
+	if !upstreamExchangeSucceeded(&PluginsState{}, packedResponseWithRcode(t, dns.RcodeNameError), nil) {
 		t.Error("an upstream NXDOMAIN response was not counted as success")
+	}
+}
+
+func TestUpstreamExchangeSucceededRejectsAStaleAnswer(t *testing.T) {
+	stale := &PluginsState{servedStale: true}
+	if upstreamExchangeSucceeded(stale, packedResponseWithRcode(t, dns.RcodeSuccess), nil) {
+		t.Error("an answer from the stale cache after a failed exchange was counted as the server's success")
 	}
 }

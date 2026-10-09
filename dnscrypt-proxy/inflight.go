@@ -32,6 +32,11 @@ type inflightResult struct {
 	err        error
 	serverName string
 	returnCode PluginsReturnCode
+	// servedStale reports that the response came from the stale cache because
+	// the exchange failed.
+	servedStale bool
+	// queryID is the transaction ID of the query the exchange sent.
+	queryID uint16
 }
 
 func newInflight() *inflight {
