@@ -56,7 +56,8 @@ const (
 	// A QUIC connection whose path died is otherwise kept for quic-go's 30s
 	// idle timeout, and every query sent on it in the meantime waits for the
 	// full request timeout. Keepalives every 2s let a 5s idle timeout close it
-	// quickly without closing healthy connections that are merely quiet.
+	// quickly without closing healthy connections that are merely quiet;
+	// http3Pool closes those once no request has used them for a while.
 	HTTP3MaxIdleTimeout  = 5 * time.Second
 	HTTP3KeepAlivePeriod = 2 * time.Second
 )
@@ -88,9 +89,10 @@ type AltSupport struct {
 
 type XTransport struct {
 	transport                *http.Transport
-	h3Transport              *http3.Transport
+	http3Pool                *http3Pool
 	keepAlive                time.Duration
 	timeout                  time.Duration
+	idleConnTimeout          time.Duration
 	cachedIPs                CachedIPs
 	altSupport               AltSupport
 	internalResolvers        []string
@@ -119,6 +121,7 @@ func NewXTransport() *XTransport {
 		altSupport:               AltSupport{cache: make(map[string]AltSupportEntry)},
 		keepAlive:                DefaultKeepAlive,
 		timeout:                  DefaultTimeout,
+		idleConnTimeout:          DefaultIdleConnTimeout,
 		bootstrapResolvers:       []string{DefaultBootstrapResolver},
 		mainProto:                "",
 		ignoreSystemDNS:          true,
@@ -291,15 +294,15 @@ func (xTransport *XTransport) rebuildTransport() {
 	if xTransport.transport != nil {
 		xTransport.transport.CloseIdleConnections()
 	}
-	if xTransport.h3Transport != nil {
-		xTransport.h3Transport.CloseIdleConnections()
+	if xTransport.http3Pool != nil {
+		xTransport.http3Pool.closeIdleSince(time.Now())
 	}
 	timeout := xTransport.timeout
 	transport := &http.Transport{
 		DisableKeepAlives:      false,
 		DisableCompression:     true,
 		MaxIdleConns:           DefaultMaxIdleConns,
-		IdleConnTimeout:        DefaultIdleConnTimeout,
+		IdleConnTimeout:        xTransport.idleConnTimeout,
 		ResponseHeaderTimeout:  timeout,
 		ExpectContinueTimeout:  timeout,
 		MaxResponseHeaderBytes: 4096,
@@ -504,16 +507,114 @@ func (xTransport *XTransport) rebuildTransport() {
 			}
 			return nil, lastErr
 		}
-		h3Transport := &http3.Transport{
-			DisableCompression: true,
-			TLSClientConfig:    &tlsClientConfig,
-			QUICConfig: &quic.Config{
-				MaxIdleTimeout:  HTTP3MaxIdleTimeout,
-				KeepAlivePeriod: HTTP3KeepAlivePeriod,
-			},
-			Dial: dial,
+		xTransport.http3Pool = newHTTP3Pool(func() *http3.Transport {
+			return &http3.Transport{
+				DisableCompression: true,
+				TLSClientConfig:    &tlsClientConfig,
+				QUICConfig: &quic.Config{
+					MaxIdleTimeout:  HTTP3MaxIdleTimeout,
+					KeepAlivePeriod: HTTP3KeepAlivePeriod,
+				},
+				Dial: dial,
+			}
+		}, xTransport.idleConnTimeout)
+	}
+}
+
+// http3Pool gives each host its own HTTP/3 transport, and closes the
+// connection to a host once no request has used it for idleTimeout.
+//
+// Keepalives hold a quiet QUIC connection open for as long as the peer
+// acknowledges them, so the QUIC idle timeout closes only connections whose
+// path died. Without this pool, every server ever reached over HTTP/3,
+// including the ones a certificate refresh only probed, would keep a
+// connection for the life of the process. HTTP/2 connections get the same
+// limit from IdleConnTimeout.
+type http3Pool struct {
+	newTransport func() *http3.Transport
+	idleTimeout  time.Duration
+
+	mu       sync.Mutex
+	hosts    map[string]*http3PoolHost
+	sweeping bool
+}
+
+type http3PoolHost struct {
+	transport *http3.Transport
+	inFlight  int
+	lastUsed  time.Time
+}
+
+func newHTTP3Pool(newTransport func() *http3.Transport, idleTimeout time.Duration) *http3Pool {
+	return &http3Pool{
+		newTransport: newTransport,
+		idleTimeout:  idleTimeout,
+		hosts:        make(map[string]*http3PoolHost),
+	}
+}
+
+// acquire returns the transport for host and counts a request on it until the
+// matching release.
+func (pool *http3Pool) acquire(host string) *http3.Transport {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	entry := pool.hosts[host]
+	if entry == nil {
+		entry = &http3PoolHost{transport: pool.newTransport()}
+		pool.hosts[host] = entry
+	}
+	entry.inFlight++
+	if !pool.sweeping {
+		pool.sweeping = true
+		go pool.sweep()
+	}
+	return entry.transport
+}
+
+// release ends a request that acquire counted.
+func (pool *http3Pool) release(host string) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if entry := pool.hosts[host]; entry != nil {
+		entry.inFlight--
+		entry.lastUsed = time.Now()
+	}
+}
+
+// closeIdleSince closes the connections of the hosts that have no request in
+// flight and whose last request ended at or before cutoff.
+func (pool *http3Pool) closeIdleSince(cutoff time.Time) {
+	var idle []*http3.Transport
+	pool.mu.Lock()
+	for host, entry := range pool.hosts {
+		if entry.inFlight == 0 && !entry.lastUsed.After(cutoff) {
+			idle = append(idle, entry.transport)
+			delete(pool.hosts, host)
 		}
-		xTransport.h3Transport = h3Transport
+	}
+	pool.mu.Unlock()
+	for _, transport := range idle {
+		transport.Close()
+	}
+}
+
+// sweep closes idle connections once per idleTimeout, so a connection closes
+// between one and two idle timeouts after its last request. It stops when no
+// host is left and acquire starts it again.
+func (pool *http3Pool) sweep() {
+	ticker := time.NewTicker(pool.idleTimeout)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		pool.closeIdleSince(now.Add(-pool.idleTimeout))
+		pool.mu.Lock()
+		empty := len(pool.hosts) == 0
+		if empty {
+			pool.sweeping = false
+		}
+		pool.mu.Unlock()
+		if empty {
+			return
+		}
 	}
 }
 
@@ -755,13 +856,14 @@ func (xTransport *XTransport) Fetch(
 	host, port := ExtractHostAndPort(url.Host, 443)
 	hasAltSupport := false
 	http3Suppressed := false
+	usingHTTP3 := false
 
-	if xTransport.h3Transport != nil {
+	if xTransport.http3Pool != nil {
 		altPort, found, negative := xTransport.loadAltSupport(url.Host)
 		http3Suppressed = negative
 		if xTransport.http3Probe {
 			if !negative {
-				client.Transport = xTransport.h3Transport
+				usingHTTP3 = true
 				dlog.Debugf("Probing HTTP/3 transport for [%s]", url.Host)
 			} else {
 				dlog.Debugf("Skipping HTTP/3 probe for [%s] - previously failed", url.Host)
@@ -770,10 +872,15 @@ func (xTransport *XTransport) Fetch(
 			// Otherwise use traditional Alt-Svc detection
 			hasAltSupport = found && !negative
 			if hasAltSupport && altPort > 0 && int(altPort) == port {
-				client.Transport = xTransport.h3Transport
+				usingHTTP3 = true
 				dlog.Debugf("Using HTTP/3 transport for [%s]", url.Host)
 			}
 		}
+	}
+	if usingHTTP3 {
+		pool := xTransport.http3Pool
+		client.Transport = pool.acquire(url.Host)
+		defer pool.release(url.Host)
 	}
 	header := map[string][]string{"User-Agent": {"dnscrypt-proxy"}}
 	if len(accept) > 0 {
@@ -820,7 +927,7 @@ func (xTransport *XTransport) Fetch(
 
 	// Handle HTTP/3 error case - fallback to HTTP/2 when HTTP/3 fails
 	h3ProbeFailed := false
-	if err != nil && client.Transport == xTransport.h3Transport {
+	if err != nil && usingHTTP3 {
 		if xTransport.http3Probe {
 			// A probe is only an optimistic guess at HTTP/3 support, so the
 			// negative-cache decision is deferred until the HTTP/2 fallback below
@@ -863,7 +970,7 @@ func (xTransport *XTransport) Fetch(
 		dlog.Debugf("[%s]: [%s]", req.URL, err)
 		return nil, statusCode, nil, rtt, err
 	}
-	if xTransport.h3Transport != nil && !hasAltSupport {
+	if xTransport.http3Pool != nil && !hasAltSupport {
 		// In probe mode nothing rewrites the entry between the negative-cache read
 		// above and here, so reuse it rather than locking and looking it up again.
 		skipAltSvcParsing := xTransport.http3Probe && http3Suppressed
