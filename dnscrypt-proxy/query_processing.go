@@ -404,6 +404,8 @@ func processPlugins(
 ) ([]byte, error) {
 	var err error
 	upstreamRcode := Rcode(response)
+	// Read the attribution before the plugins re-pack the response.
+	upstreamBlamesZone := upstreamRcode == dns.RcodeServerFailure && servfailBlamesZone(response)
 
 	response, err = pluginsState.ApplyResponsePlugins(&proxy.pluginsGlobals, response)
 	if err != nil {
@@ -430,8 +432,9 @@ func processPlugins(
 	// Health belongs to the resolver's original response, not to a replacement
 	// supplied by a DNSSEC retry and not to a local enforcement response. A raw
 	// upstream SERVFAIL is a resolver failure even when another resolver repairs
-	// the client transaction; a locally generated DNSSEC SERVFAIL still means
-	// the original server completed its exchange and supplied judgeable data.
+	// the client transaction, unless the resolver attributed it to the zone; a
+	// locally generated DNSSEC SERVFAIL still means the original server
+	// completed its exchange and supplied judgeable data.
 	finalRcode := Rcode(response)
 	switch {
 	case pluginsState.servedStale:
@@ -439,9 +442,9 @@ func processPlugins(
 		// that failure was recorded when it happened. Crediting the server with
 		// the answer would hide that it stopped answering.
 	case upstreamRcode == dns.RcodeServerFailure:
-		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
+		serverInfo.noticeServfail(proxy, pluginsState.qName, upstreamBlamesZone)
 	case finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec:
-		serverInfo.noticeFailureReason(proxy, failureReasonServfail)
+		serverInfo.noticeServfail(proxy, pluginsState.qName, false)
 	default:
 		serverInfo.noticeSuccess(proxy)
 	}

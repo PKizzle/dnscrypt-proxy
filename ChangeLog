@@ -1,4 +1,11 @@
 # Unreleased
+  - Under the `first` load-balancing strategy, a SERVFAIL that the resolver
+attributes to the queried zone through an extended DNS error (unreachable
+authority, DNSSEC chain problems, filtered names) no longer counts toward
+failing the resolver over; it is reported as `zone_servfail` in
+`dnscrypt_proxy_server_failures_total`. Retries of one failing name count
+once, and a resolver that answers nothing but SERVFAIL for a sustained period
+is still failed over, however it labels the failures.
   - The monitoring query history now uses a fixed-size ring whose struct and
 string storage are both included in the configured memory budget. Eviction is
 constant-time and clears references to removed entries.

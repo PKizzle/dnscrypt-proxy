@@ -34,8 +34,19 @@ const (
 	// firstStrategyServfailDemotion is how many SERVFAILs in a row, with no
 	// successful answer between them, demote a server under the `first`
 	// strategy. A single SERVFAIL is usually a broken domain, which every
-	// upstream answers the same way, and must not move all traffic.
+	// upstream answers the same way, and must not move all traffic. SERVFAILs
+	// the server attributes to the zone through an extended DNS error do not
+	// count here, and retries of one name count once.
 	firstStrategyServfailDemotion = 3
+
+	// firstStrategyAttributedServfailDemotion and
+	// firstStrategyAttributedServfailDuration demote a server whose answers
+	// have been nothing but SERVFAILs, however attributed, for that many
+	// names over at least that long. A resolver that can reach no authority
+	// blames every failure on the zone; a burst of lookups for zones that
+	// really are unreachable is over before the duration passes.
+	firstStrategyAttributedServfailDemotion = 16
+	firstStrategyAttributedServfailDuration = 30 * time.Second
 )
 
 type RegisteredServer struct {
@@ -100,8 +111,15 @@ type failoverState struct {
 	// the failure, measured from live traffic.
 	demotedAt     time.Time
 	preFailureRtt float64
-	// consecutiveServfails counts SERVFAILs since the last successful answer.
-	consecutiveServfails int
+	// consecutiveServfails counts SERVFAILs since the last successful answer,
+	// retries of one name counted once; consecutiveServerServfails counts
+	// those among them that the server did not blame on the zone.
+	// servfailRunStartedAt is when the run began and lastServfailQName is the
+	// name of its latest SERVFAIL, so a stub retrying that name adds nothing.
+	consecutiveServfails       int
+	consecutiveServerServfails int
+	servfailRunStartedAt       time.Time
+	lastServfailQName          string
 	// lastResponseTS is when the server last returned any DNS response,
 	// SERVFAIL included. It separates a server that stopped answering from
 	// one that is slow for a particular name.
@@ -230,8 +248,12 @@ const (
 	failureReasonIsolatedTimeout = "isolated_timeout"
 	failureReasonNetwork         = "network"
 	failureReasonServfail        = "servfail"
-	failureReasonBadResponse     = "bad_response"
-	failureReasonOther           = "other"
+	// failureReasonZoneServfail is a SERVFAIL the server attributed to the
+	// zone through an extended DNS error: counted, but evidence about the
+	// zone rather than the server.
+	failureReasonZoneServfail = "zone_servfail"
+	failureReasonBadResponse  = "bad_response"
+	failureReasonOther        = "other"
 )
 
 type serverFailureKey struct {
@@ -1550,20 +1572,78 @@ func (serverInfo *ServerInfo) noticeFailure(proxy *Proxy) {
 
 func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	proxy.serversInfo.Lock()
+	defer proxy.serversInfo.Unlock()
+	serverInfo.countFailureLocked(proxy, reason)
+	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst && reason == failureReasonServfail {
+		// A SERVFAIL reported without its response: the name is unknown and
+		// the server is answerable for it.
+		if !serverInfo.failoverLocked().recordServfail(time.Now(), "", false) {
+			return
+		}
+	}
+	serverInfo.demoteLocked(proxy)
+}
+
+// noticeServfail records a SERVFAIL answer for qName. blamesZone says whether
+// the server attributed it to the zone through an extended DNS error; such an
+// answer is evidence about the zone, not the server, and only a sustained run
+// of nothing else demotes the server.
+func (serverInfo *ServerInfo) noticeServfail(proxy *Proxy, qName string, blamesZone bool) {
+	reason := failureReasonServfail
+	if blamesZone {
+		reason = failureReasonZoneServfail
+	}
+	proxy.serversInfo.Lock()
+	defer proxy.serversInfo.Unlock()
+	serverInfo.countFailureLocked(proxy, reason)
+	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
+		if !serverInfo.failoverLocked().recordServfail(time.Now(), qName, blamesZone) {
+			return
+		}
+	} else if blamesZone {
+		return
+	}
+	serverInfo.demoteLocked(proxy)
+}
+
+// recordServfail notes a SERVFAIL for qName and reports whether the run it
+// belongs to has become evidence that the server is failing: enough SERVFAILs
+// the server did not blame on the zone, or a sustained run of any kind.
+func (failover *failoverState) recordServfail(now time.Time, qName string, blamesZone bool) bool {
+	failover.lastResponseTS = now
+	if failover.consecutiveServfails == 0 {
+		failover.servfailRunStartedAt = now
+	}
+	retried := qName != "" && qName == failover.lastServfailQName
+	failover.lastServfailQName = qName
+	if retried {
+		return false
+	}
+	failover.consecutiveServfails++
+	if !blamesZone {
+		failover.consecutiveServerServfails++
+	}
+	if failover.consecutiveServerServfails >= firstStrategyServfailDemotion {
+		return true
+	}
+	return failover.consecutiveServfails >= firstStrategyAttributedServfailDemotion &&
+		now.Sub(failover.servfailRunStartedAt) >= firstStrategyAttributedServfailDuration
+}
+
+// countFailureLocked adds the failure to the per-server, per-reason counters.
+// The ServersInfo lock must be held.
+func (serverInfo *ServerInfo) countFailureLocked(proxy *Proxy, reason string) {
 	if proxy.serversInfo.failures == nil {
 		proxy.serversInfo.failures = make(map[serverFailureKey]uint64)
 	}
 	proxy.serversInfo.failures[serverFailureKey{server: serverInfo.Name, reason: reason}]++
+}
+
+// demoteLocked applies a failure the server is answerable for. The
+// ServersInfo lock must be held.
+func (serverInfo *ServerInfo) demoteLocked(proxy *Proxy) {
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
 		failover := serverInfo.failoverLocked()
-		if reason == failureReasonServfail {
-			failover.lastResponseTS = time.Now()
-			failover.consecutiveServfails++
-			if failover.consecutiveServfails < firstStrategyServfailDemotion {
-				proxy.serversInfo.Unlock()
-				return
-			}
-		}
 		// Keep the estimate from before the first failure of a run; a repeated
 		// failure only restarts the failback delay.
 		if failover.demotedAt.IsZero() {
@@ -1579,7 +1659,6 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
 		proxy.serversInfo.sortByRtt()
 	}
-	proxy.serversInfo.Unlock()
 }
 
 func (serverInfo *ServerInfo) noticeBegin(proxy *Proxy) {
@@ -1598,6 +1677,8 @@ func (serverInfo *ServerInfo) noticeSuccess(proxy *Proxy) {
 	}
 	failover := serverInfo.failoverLocked()
 	failover.consecutiveServfails = 0
+	failover.consecutiveServerServfails = 0
+	failover.lastServfailQName = ""
 	failover.lastResponseTS = now
 	proxy.serversInfo.Unlock()
 }
