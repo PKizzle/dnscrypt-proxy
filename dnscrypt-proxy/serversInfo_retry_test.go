@@ -2,12 +2,14 @@ package main
 
 import (
 	"errors"
+	"net"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/VividCortex/ewma"
+	stamps "github.com/jedisct1/go-dnsstamps"
 )
 
 func retryTestServer(name string) *ServerInfo {
@@ -602,5 +604,52 @@ func TestFirstStrategyNetworkErrorStillFailsOver(t *testing.T) {
 	fast.noticeExchangeError(proxy, errors.New("connection reset"), time.Now().Add(-time.Second))
 	if got := serverNames(proxy.serversInfo.inner)[0]; got != "slow" {
 		t.Fatalf("head after a network error = %q, want slow", got)
+	}
+}
+
+func TestProbeServerRttUsesTCPWhenTheProxyDoes(t *testing.T) {
+	// With force_tcp or an outbound proxy, live DNSCrypt queries go over TCP,
+	// and a probe over UDP would fail on every round.
+	tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpListener.Close()
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConn.Close()
+	received := make(chan struct{}, 1)
+	go func() {
+		conn, err := tcpListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := ReadPrefixed(conn); err == nil {
+			received <- struct{}{}
+		}
+	}()
+
+	proxy := NewProxy()
+	proxy.timeout = 200 * time.Millisecond
+	proxy.xTransport = NewXTransport()
+	proxy.xTransport.mainProto = "tcp"
+	server := &ServerInfo{
+		Proto:              stamps.StampProtoTypeDNSCrypt,
+		Name:               "dnscrypt",
+		CryptoConstruction: XSalsa20Poly1305,
+		TCPAddr:            tcpListener.Addr().(*net.TCPAddr),
+		UDPAddr:            udpConn.LocalAddr().(*net.UDPAddr),
+		Timeout:            proxy.timeout,
+	}
+	// The fake server answers nothing, so the probe fails; only the
+	// transport it chose matters here.
+	_, _ = probeServerRtt(proxy, server)
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("probe sent nothing over TCP")
 	}
 }

@@ -611,11 +611,13 @@ func (serversInfo *ServersInfo) probeFailback(demoted, head *ServerInfo, started
 	serversInfo.Lock()
 	defer serversInfo.Unlock()
 	serversInfo.probing = false
+	failover := demoted.failoverLocked()
 	if len(serversInfo.inner) == 0 || serversInfo.inner[0].Name != head.Name {
-		// The head changed during the round, so the comparison is stale.
+		// The head changed during the round, so the comparison is stale; the
+		// next round waits a full delay like any other.
+		failover.demotedAt = startedAt
 		return
 	}
-	failover := demoted.failoverLocked()
 	if math.IsInf(demotedRtt, 1) || demotedRtt > headRtt*firstStrategyFailbackTolerance {
 		dlog.Debugf("[%s] probed at %.0fms against %.0fms for [%s]; keeping it demoted", demoted.Name,
 			demotedRtt, headRtt, head.Name)
@@ -1251,11 +1253,31 @@ func probeServerRtt(proxy *Proxy, server *ServerInfo) (float64, error) {
 	var err error
 	switch server.Proto {
 	case stamps.StampProtoTypeDNSCrypt:
-		sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr := proxy.Encrypt(server, query.Data, "udp")
+		// Choose the transport as processDNSCryptQuery does for live queries.
+		proto := proxy.xTransport.mainProto
+		sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr := proxy.Encrypt(server, query.Data, proto)
+		if encryptErr != nil && proto == "udp" {
+			proto = "tcp"
+			sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr = proxy.Encrypt(server, query.Data, proto)
+		}
 		if encryptErr != nil {
 			return 0, encryptErr
 		}
-		response, err = proxy.exchangeWithUDPServer(server, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+		if proto == "udp" {
+			response, err = proxy.exchangeWithUDPServer(server, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+			neterr, isNetErr := err.(net.Error)
+			truncated := err == nil && len(response) >= MinDNSPacketSize && response[2]&0x02 == 0x02
+			if truncated || (isNetErr && neterr.Timeout()) {
+				proto = "tcp"
+				sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr = proxy.Encrypt(server, query.Data, proto)
+				if encryptErr != nil {
+					return 0, encryptErr
+				}
+			}
+		}
+		if proto == "tcp" {
+			response, err = proxy.exchangeWithTCPServer(server, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+		}
 	case stamps.StampProtoTypeDoH:
 		dohResponse, _, tlsState, _, dohErr := proxy.xTransport.DoHQuery(server.useGet, server.URL, query.Data, proxy.timeout)
 		response, err = dohResponse, dohErr
