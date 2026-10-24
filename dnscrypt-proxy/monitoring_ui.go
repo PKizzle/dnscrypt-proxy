@@ -458,13 +458,21 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 		responseTime = maxResponseTime
 	}
 
+	// A stale answer stands in for an exchange that failed: it came from the
+	// cache, and the failure is already counted against the server.
+	serverName, cacheHit := pluginsState.serverName, pluginsState.cacheHit
+	if pluginsState.servedStale {
+		serverName, cacheHit = "-", true
+	}
 	ev := metricEvent{
 		at:           now,
 		qName:        pluginsState.qName,
-		serverName:   pluginsState.serverName,
+		serverName:   serverName,
 		responseTime: responseTime,
-		cacheHit:     pluginsState.cacheHit,
-		countCache:   pluginsState.cacheHit || pluginsState.serverName != "-",
+		cacheHit:     cacheHit,
+		// Without the cache plugin nothing participates in caching, so an
+		// upstream answer is not a miss.
+		countCache: ui.proxy.cache && (cacheHit || serverName != "-"),
 		blocked: pluginsState.returnCode == PluginsReturnCodeReject ||
 			pluginsState.returnCode == PluginsReturnCodeDrop,
 		logQuery: ui.config.EnableQueryLog && mc.privacyLevel < 2,

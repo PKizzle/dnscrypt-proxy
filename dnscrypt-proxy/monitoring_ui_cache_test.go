@@ -106,6 +106,7 @@ func newTestMonitoringUIWithLimits(t *testing.T, maxEntries, maxMemoryMB int) *M
 			MaxQueryLogEntries: maxEntries,
 			MaxMemoryMB:        maxMemoryMB,
 		},
+		cache: true,
 	})
 	if ui == nil {
 		t.Fatal("Failed to create monitoring UI")
@@ -124,6 +125,7 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 			MaxQueryLogEntries: 100,
 			MaxMemoryMB:        1,
 		},
+		cache: true,
 	}
 
 	// Create monitoring UI and metrics collector
@@ -299,6 +301,66 @@ func TestCacheStatisticsAccuracy(t *testing.T) {
 	}
 	if blockedQueries != 2 {
 		t.Errorf("Expected blocked_queries to be 2, got %d", blockedQueries)
+	}
+
+	// Test case 5: A stale answer stands in for a failed exchange - a hit, and
+	// not a query answered by the server that failed
+	{
+		msg := &dns.Msg{}
+		msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "stale.com.", Class: dns.ClassINET}}}
+
+		serverQueries := mc.serverQueryCount["cloudflare"]
+		pluginsState := PluginsState{
+			requestStart: time.Now(),
+			timeout:      5 * time.Second,
+			qName:        "stale.com.",
+			serverName:   "cloudflare",
+			clientProto:  "udp",
+			servedStale:  true,
+			returnCode:   PluginsReturnCodePass,
+		}
+
+		ui.UpdateMetrics(&pluginsState, msg)
+		ui.Flush()
+
+		if mc.cacheHits != 2 {
+			t.Errorf("After stale answer, cacheHits should be 2, got %d", mc.cacheHits)
+		}
+		if mc.cacheMisses != 1 {
+			t.Errorf("After stale answer, cacheMisses should still be 1, got %d", mc.cacheMisses)
+		}
+		if got := mc.serverQueryCount["cloudflare"]; got != serverQueries {
+			t.Errorf("After stale answer, cloudflare queries should still be %d, got %d", serverQueries, got)
+		}
+	}
+
+	// Test case 6: Without the cache, an upstream answer is neither a hit nor a miss
+	{
+		off := NewMonitoringUI(&Proxy{monitoringUI: proxy.monitoringUI})
+		if off == nil {
+			t.Fatal("Failed to create monitoring UI")
+		}
+		defer func() { _ = off.Stop() }()
+
+		msg := &dns.Msg{}
+		msg.Question = []dns.RR{&dns.A{Hdr: dns.Header{Name: "nocache.com.", Class: dns.ClassINET}}}
+
+		pluginsState := PluginsState{
+			requestStart: time.Now(),
+			timeout:      5 * time.Second,
+			qName:        "nocache.com.",
+			serverName:   "cloudflare",
+			clientProto:  "udp",
+			returnCode:   PluginsReturnCodePass,
+		}
+
+		off.UpdateMetrics(&pluginsState, msg)
+		off.Flush()
+
+		if off.metricsCollector.cacheHits != 0 || off.metricsCollector.cacheMisses != 0 {
+			t.Errorf("With the cache off, hits/misses should be 0/0, got %d/%d",
+				off.metricsCollector.cacheHits, off.metricsCollector.cacheMisses)
+		}
 	}
 }
 

@@ -159,6 +159,16 @@ function safeUpdateDashboard(data) {
         updateElementText('cache-entries', formatNumber(cacheStats.entries));
         updateElementText('cache-capacity', formatNumber(cacheStats.capacity));
         updateElementText('cache-ttl-range', formatTTLRange(cacheStats));
+        // No cache plugin, nothing to report: hide the card and its nav entry.
+        const cacheOff = cacheStats.enabled === false;
+        const cacheHeading = document.getElementById('cache-performance');
+        if (cacheHeading) {
+            cacheHeading.closest('.card').hidden = cacheOff;
+        }
+        const cacheNav = document.querySelector('.section-nav a[href="#cache-performance"]');
+        if (cacheNav) {
+            cacheNav.hidden = cacheOff;
+        }
 
         // Update resolver health table
         const resolverTable = document.getElementById('resolver-table').getElementsByTagName('tbody')[0];
