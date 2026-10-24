@@ -21,7 +21,7 @@ that still contains `[dnssec_validation]` is rejected at startup;
 `require_dnssec` is unaffected.
   - Cache hits and misses are only counted while the cache is enabled, and the
 dashboard hides the cache card otherwise. Answers served from the stale cache
-count as hits and are no longer credited to the upstream that failed.
+count as hits and are not credited to the upstream that failed.
 
 # Version 2.1.19
   - Resumed PQDNSCrypt queries now use regular UDP padding, protecting their
