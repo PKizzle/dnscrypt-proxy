@@ -1,4 +1,9 @@
 # Unreleased
+  - Under the `first` load-balancing strategy, a resolver that was failed over
+is re-measured every five minutes with probe queries alongside the resolver
+that replaced it, and becomes the preferred resolver again once it answers
+about as fast or faster. Nothing is probed while no failover is in effect, and
+probes are not counted as client queries or failures.
   - Under the `first` load-balancing strategy, a SERVFAIL that the resolver
 attributes to the queried zone through an extended DNS error (unreachable
 authority, DNSSEC chain problems, filtered names) no longer counts toward

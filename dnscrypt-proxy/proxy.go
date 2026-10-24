@@ -951,9 +951,11 @@ func upstreamExchangeSucceeded(pluginsState *PluginsState, response []byte, err 
 }
 
 func NewProxy() *Proxy {
-	return &Proxy{
+	proxy := &Proxy{
 		serversInfo: NewServersInfo(),
 		udpConnPool: NewUDPConnPool(),
 		inflight:    newInflight(),
 	}
+	proxy.serversInfo.probeRtt = func(server *ServerInfo) (float64, error) { return probeServerRtt(proxy, server) }
+	return proxy
 }
