@@ -62,6 +62,9 @@ type FleetMetrics struct {
 	// are of those that did. Saying so is the difference between a number that
 	// is low and a number that is wrong.
 	Degraded bool `json:"degraded"`
+	// DiscoveryError is set when the discovery name did not resolve. It is not
+	// an instance, so it stays out of Instances and their count.
+	DiscoveryError string `json:"discovery_error,omitempty"`
 }
 
 type peerCollector struct {
@@ -245,9 +248,7 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 	// instead of presenting this instance alone as the fleet.
 	if discoveryErr != nil {
 		fleet.Degraded = true
-		fleet.Instances = append(fleet.Instances, peerMetrics{
-			Address: pc.ui.config.PeerDiscoveryDNS, Error: discoveryErr.Error(),
-		})
+		fleet.DiscoveryError = pc.ui.config.PeerDiscoveryDNS + ": " + discoveryErr.Error()
 	}
 	fleet.Totals = sumMetrics(fleet.Instances)
 
@@ -398,6 +399,9 @@ func browserFleetMetrics(fleet *FleetMetrics, recentLimit int) map[string]any {
 	metrics["recent_queries"] = aggregateFleetRecentQueries(fleet.Instances, recentLimit)
 	metrics["generated_at"] = time.Now().UTC()
 	var unreachable []string
+	if fleet.DiscoveryError != "" {
+		unreachable = append(unreachable, fleet.DiscoveryError)
+	}
 	for _, inst := range fleet.Instances {
 		if !inst.Reachable {
 			unreachable = append(unreachable, inst.Address+": "+inst.Error)

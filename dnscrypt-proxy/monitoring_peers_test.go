@@ -102,7 +102,14 @@ func TestFleetIsDegradedWhenDiscoveryFails(t *testing.T) {
 	if !fleet.Degraded {
 		t.Error("a fleet whose discovery failed should say so")
 	}
-	errs, _ := browserFleetMetrics(fleet, 10)["fleet"].(map[string]any)["errors"].([]string)
+	if len(fleet.Instances) != 1 {
+		t.Errorf("instances = %d, want only this instance", len(fleet.Instances))
+	}
+	metrics := browserFleetMetrics(fleet, 10)
+	if got, _ := toFloat(metrics["instances"]); got != 1 {
+		t.Errorf("reported instances = %v, want 1", metrics["instances"])
+	}
+	errs, _ := metrics["fleet"].(map[string]any)["errors"].([]string)
 	if len(errs) != 1 || !strings.Contains(errs[0], "peers.invalid") {
 		t.Errorf("fleet errors = %q, want one naming the discovery name", errs)
 	}
