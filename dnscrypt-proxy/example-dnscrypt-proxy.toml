@@ -1081,6 +1081,13 @@ privacy_level = 1
 
   # peer_discovery_resolver = '10.43.0.10'
 
+  ## Shared secret the instances present to each other. Required for the
+  ## fleet view: without it the page says so instead of showing one instance.
+  ## Taken from the DNSCRYPT_MONITORING_PEER_TOKEN environment variable when
+  ## not set here, so it can come from a Secret rather than the config file.
+
+  # peer_token = 'change-me'
+
 
 
 ###############################################################################

@@ -352,8 +352,11 @@ function updateFleetStatus(fleet) {
     const instances = totals.instances || 0;
     status.hidden = false;
     status.className = fleet.degraded ? 'fleet-status fleet-status-degraded' : 'fleet-status';
+    const errors = Array.isArray(fleet.errors) && fleet.errors.length > 0
+        ? ` (${fleet.errors.join('; ')})`
+        : '';
     status.textContent = fleet.degraded
-        ? `Fleet view is partial: ${reachable}/${instances} instances reachable`
+        ? `Fleet view is partial: ${reachable}/${instances} instances reachable${errors}`
         : `Fleet view: all ${reachable}/${instances} instances reachable`;
 }
 

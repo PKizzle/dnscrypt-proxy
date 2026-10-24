@@ -95,10 +95,11 @@ func (pc *peerCollector) configured() bool {
 // Kubernetes a headless Service resolves to one address per pod, and anywhere
 // else a name with several addresses does the same job. Neither requires this
 // process to know anything about the platform it runs on.
-func (pc *peerCollector) peerAddresses() []string {
+func (pc *peerCollector) peerAddresses() ([]string, error) {
 	cfg := pc.ui.config
 	seen := map[string]bool{}
 	var out []string
+	var discoveryErr error
 
 	add := func(addr string) {
 		if addr == "" || seen[addr] {
@@ -122,13 +123,14 @@ func (pc *peerCollector) peerAddresses() []string {
 		addrs, err := pc.resolver().LookupHost(ctx, host)
 		if err != nil {
 			dlog.Debugf("Monitoring peer discovery for [%s] failed: %v", host, err)
+			discoveryErr = fmt.Errorf("discovery of [%s] failed: %w", host, err)
 		}
 		sort.Strings(addrs)
 		for _, a := range preferredPeerAddresses(addrs) {
 			add(net.JoinHostPort(a, port))
 		}
 	}
-	return out
+	return out, discoveryErr
 }
 
 // A dual-stack headless Service exposes two addresses for every pod. A healthy
@@ -191,7 +193,7 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 		return pc.cached
 	}
 
-	peers := pc.peerAddresses()
+	peers, discoveryErr := pc.peerAddresses()
 	results := make([]peerMetrics, len(peers))
 	var wg sync.WaitGroup
 	for i, addr := range peers {
@@ -205,8 +207,8 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 
 	fleet := &FleetMetrics{Totals: map[string]any{}}
 	// This instance's own numbers are counted without being fetched over the
-	// network: it is one of the instances, and asking itself would be a request
-	// that can fail for reasons the answer already rules out.
+	// network. Discovery may still hand back one of its own addresses; that
+	// answer is recognised by instance ID below and folded in as an alias.
 	//
 	// Held as a copy, because the caller puts this result back into the very map
 	// it passed in. Keeping the original would make the fleet contain the map
@@ -238,6 +240,14 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 			byInstance[id] = len(fleet.Instances)
 		}
 		fleet.Instances = append(fleet.Instances, r)
+	}
+	// An unresolvable discovery name hides every other instance; report it
+	// instead of presenting this instance alone as the fleet.
+	if discoveryErr != nil {
+		fleet.Degraded = true
+		fleet.Instances = append(fleet.Instances, peerMetrics{
+			Address: pc.ui.config.PeerDiscoveryDNS, Error: discoveryErr.Error(),
+		})
 	}
 	fleet.Totals = sumMetrics(fleet.Instances)
 
@@ -387,10 +397,17 @@ func browserFleetMetrics(fleet *FleetMetrics, recentLimit int) map[string]any {
 	metrics["sources"] = aggregateFleetSources(fleet.Instances)
 	metrics["recent_queries"] = aggregateFleetRecentQueries(fleet.Instances, recentLimit)
 	metrics["generated_at"] = time.Now().UTC()
+	var unreachable []string
+	for _, inst := range fleet.Instances {
+		if !inst.Reachable {
+			unreachable = append(unreachable, inst.Address+": "+inst.Error)
+		}
+	}
 	metrics["fleet"] = map[string]any{
 		"mode":         "aggregate",
 		"totals":       fleet.Totals,
 		"degraded":     fleet.Degraded,
+		"errors":       unreachable,
 		"collected_at": time.Now().UTC(),
 	}
 	return metrics

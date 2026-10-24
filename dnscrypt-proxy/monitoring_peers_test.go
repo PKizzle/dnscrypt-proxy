@@ -88,6 +88,26 @@ func TestFleetMarksItselfDegradedWhenAPeerIsDown(t *testing.T) {
 	}
 }
 
+// A discovery name that does not resolve leaves this instance alone in the
+// fleet, which must not read as a healthy fleet of one.
+func TestFleetIsDegradedWhenDiscoveryFails(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.PeerDiscoveryDNS = "peers.invalid:8080"
+	// A port nothing is listening on, so the lookup fails at once.
+	ui.config.PeerDiscoveryResolver = "127.0.0.1:1"
+	pc := newPeerCollector(ui)
+
+	fleet := pc.Fleet(map[string]any{"total_queries": float64(7)})
+	if !fleet.Degraded {
+		t.Error("a fleet whose discovery failed should say so")
+	}
+	errs, _ := browserFleetMetrics(fleet, 10)["fleet"].(map[string]any)["errors"].([]string)
+	if len(errs) != 1 || !strings.Contains(errs[0], "peers.invalid") {
+		t.Errorf("fleet errors = %q, want one naming the discovery name", errs)
+	}
+}
+
 // A peer answers with its own numbers and must not aggregate in turn, or every
 // page view would fan out across the whole fleet repeatedly.
 func TestPeerRequestIsNotAggregatedAgain(t *testing.T) {
@@ -439,7 +459,7 @@ func TestStaticPeersNeedNoResolver(t *testing.T) {
 	defer func() { _ = ui.Stop() }()
 	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.3:8080"}
 
-	addrs := newPeerCollector(ui).peerAddresses()
+	addrs, _ := newPeerCollector(ui).peerAddresses()
 	if len(addrs) != 2 {
 		t.Fatalf("peerAddresses() = %v, want the two configured peers", addrs)
 	}
@@ -471,7 +491,7 @@ func TestPeerAddressesAreDeduplicated(t *testing.T) {
 	defer func() { _ = ui.Stop() }()
 	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.2:8080", "10.0.0.3:8080"}
 
-	addrs := newPeerCollector(ui).peerAddresses()
+	addrs, _ := newPeerCollector(ui).peerAddresses()
 	if len(addrs) != 2 {
 		t.Errorf("peerAddresses() = %v, want duplicates collapsed", addrs)
 	}

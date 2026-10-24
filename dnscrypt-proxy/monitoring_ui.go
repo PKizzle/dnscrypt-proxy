@@ -765,8 +765,6 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	}
 	mc.serverMutex.RUnlock()
 
-	// Add query type metrics
-	mc.queryTypesMutex.RLock()
 	// Failed upstream exchanges never reach the per-query metrics above: a
 	// query that gets no answer is not recorded there at all. These counters
 	// are the only place a timeout or a dead connection shows up.
@@ -802,6 +800,8 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 		}
 	}
 
+	// Add query type metrics
+	mc.queryTypesMutex.RLock()
 	result.WriteString("# HELP dnscrypt_proxy_query_type_total Total queries per DNS record type\n")
 	result.WriteString("# TYPE dnscrypt_proxy_query_type_total counter\n")
 	for qtype, count := range mc.queryTypes {
@@ -1372,44 +1372,11 @@ func setStaticCacheHeaders(w http.ResponseWriter, maxAge int) {
 	w.Header().Set("Expires", time.Now().Add(time.Duration(maxAge)*time.Second).Format(http.TimeFormat))
 }
 
-// handleTestQuery - Handles test query requests for debugging
-func (ui *MonitoringUI) handleTestQuery(w http.ResponseWriter, r *http.Request) {
-	// Test queries modify state - no cache
-	setDynamicCacheHeaders(w)
-
-	// Create a fake DNS message
-	msg := dns.NewMsg("test.example.com.", dns.TypeA)
-
-	// Create a fake plugin state
-	testStart := time.Now().Add(-10 * time.Millisecond)
-	pluginsState := PluginsState{
-		qName:        "test.example.com",
-		serverName:   "cloudflare",
-		clientProto:  "udp",
-		questionMsg:  msg,
-		cacheHit:     false,
-		requestStart: testStart,
-	}
-
-	// Update metrics
-	ui.UpdateMetrics(&pluginsState, msg)
-
-	// Return success
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("Test query added"))
-}
-
 // handleRoot - Handles the root path
 func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 	// Handle preflight OPTIONS request
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Test function to add a fake query for debugging
-	if r.URL.Query().Get("test") == "1" {
-		ui.handleTestQuery(w, r)
 		return
 	}
 
@@ -1567,14 +1534,6 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			conn.Close()
 			dlog.Debugf("WebSocket connection closed and cleaned up")
 		}()
-
-		// Set up ping/pong handlers for keep-alive (using WebSocket protocol level)
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		conn.SetPongHandler(func(string) error {
-			dlog.Debugf("Received pong from client")
-			conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-			return nil
-		})
 
 		for {
 			// Read message from client
