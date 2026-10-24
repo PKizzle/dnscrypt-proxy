@@ -123,10 +123,6 @@ type QueryLogEntry struct {
 	ResponseTime int64     `json:"response_time"`
 	Server       string    `json:"server"`
 	CacheHit     bool      `json:"cache_hit"`
-	// DNSSECVerdict is empty when validation is switched off, which is not the
-	// same as an answer nothing was concluded about.
-	DNSSECVerdict string `json:"dnssec_verdict,omitempty"`
-	DNSSECReason  string `json:"dnssec_reason,omitempty"`
 }
 
 // EstimateMemoryUsage estimates the memory usage of a QueryLogEntry in bytes
@@ -142,9 +138,7 @@ func (q *QueryLogEntry) estimateStringMemoryUsage() int64 {
 			len(q.Domain) +
 			len(q.Type) +
 			len(q.ResponseCode) +
-			len(q.Server) +
-			len(q.DNSSECVerdict) +
-			len(q.DNSSECReason))
+			len(q.Server))
 }
 
 func (mc *MetricsCollector) recentQueryCountLocked() int {
@@ -435,14 +429,10 @@ type metricEvent struct {
 	clientIP     string
 	returnCode   string
 	responseTime int64
-	// dnssecVerdict is empty when validation is off, which is not the same as
-	// an answer nothing could be concluded about.
-	dnssecVerdict string
-	dnssecReason  string
-	cacheHit      bool
-	countCache    bool
-	blocked       bool
-	logQuery      bool
+	cacheHit     bool
+	countCache   bool
+	blocked      bool
+	logQuery     bool
 	// done, when set, is closed once this event has been applied. It carries no
 	// measurement: it is how a caller waits for everything queued before it.
 	done chan struct{}
@@ -456,14 +446,6 @@ type metricEvent struct {
 // behind is a smaller problem than answers doing so.
 func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) {
 	if !ui.config.Enabled || pluginsState == nil {
-		return
-	}
-	// DNSSEC chain fetches pass through the normal query pipeline so that they
-	// retain DNS records needed by the validator. They are implementation
-	// detail, not client queries: recording them here inflates dashboard totals
-	// and top domains, and presents their deliberately absent verdict as
-	// "unchecked" traffic.
-	if pluginsState.clientProto == dnssecInternalProto {
 		return
 	}
 	mc := ui.metricsCollector
@@ -486,12 +468,6 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 		blocked: pluginsState.returnCode == PluginsReturnCodeReject ||
 			pluginsState.returnCode == PluginsReturnCodeDrop,
 		logQuery: ui.config.EnableQueryLog && mc.privacyLevel < 2,
-	}
-	if verdict, ok := pluginsState.sessionData[dnssecVerdictKey].(string); ok {
-		ev.dnssecVerdict = verdict
-		if reason, ok := pluginsState.sessionData[dnssecReasonKey].(string); ok {
-			ev.dnssecReason = reason
-		}
 	}
 	if msg != nil && len(msg.Question) > 0 {
 		rrType := dns.RRToType(msg.Question[0])
@@ -658,9 +634,6 @@ func (ui *MonitoringUI) applyMetrics(ev metricEvent) {
 			ResponseTime: responseTime,
 			Server:       html.EscapeString(ev.serverName),
 			CacheHit:     ev.cacheHit,
-			// Escaped: the reason quotes names taken from the answer.
-			DNSSECVerdict: html.EscapeString(ev.dnssecVerdict),
-			DNSSECReason:  html.EscapeString(ev.dnssecReason),
 		}
 
 		mc.queryLogMutex.Lock()
@@ -871,26 +844,6 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# HELP dnscrypt_proxy_aes_hardware_support Whether the CPU accelerates AES-GCM, which decides the preferred TLS cipher\n")
 	result.WriteString("# TYPE dnscrypt_proxy_aes_hardware_support gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_aes_hardware_support %d\n", aesHW))
-
-	// Export the active policy separately from the outcomes. A quiet counter
-	// stream cannot tell an operator whether validation was logging, enforcing,
-	// or disabled, and the pre-enforcement gate must be able to prove that every
-	// replica was actually observing traffic in the intended mode.
-	mode := dnssecMode.Load().(string)
-	result.WriteString("# HELP dnscrypt_proxy_dnssec_validation_mode Active DNSSEC validation policy (exactly one labelled series is 1)\n")
-	result.WriteString("# TYPE dnscrypt_proxy_dnssec_validation_mode gauge\n")
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_validation_mode{mode=\"%s\"} 1\n", mode))
-
-	// Split by verdict rather than counted as one, because the four outcomes
-	// mean different things. Both Bogus and Indeterminate are refused while
-	// enforcing; the latter is kept separate because it is a local inability to
-	// decide rather than evidence that the zone's data failed authentication.
-	result.WriteString("# HELP dnscrypt_proxy_dnssec_verdicts_total DNSSEC validation results by verdict\n")
-	result.WriteString("# TYPE dnscrypt_proxy_dnssec_verdicts_total counter\n")
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"secure\"} %d\n", dnssecVerdicts.secure.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"bogus\"} %d\n", dnssecVerdicts.bogus.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"insecure\"} %d\n", dnssecVerdicts.insecure.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"indeterminate\"} %d\n", dnssecVerdicts.indeterminate.Load()))
 
 	return result.String()
 }
@@ -1320,15 +1273,6 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		"sources":            sourceRefresh,
 		"generated_at":       generatedAt,
 		"instance_id":        instanceID,
-		// Counted apart because they mean different things: insecure is a zone
-		// that signs nothing, indeterminate is this resolver failing to check.
-		"dnssec": map[string]any{
-			"secure":        dnssecVerdicts.secure.Load(),
-			"bogus":         dnssecVerdicts.bogus.Load(),
-			"insecure":      dnssecVerdicts.insecure.Load(),
-			"indeterminate": dnssecVerdicts.indeterminate.Load(),
-			"mode":          dnssecMode.Load(),
-		},
 	}
 
 	// Cache the computed metrics, unless a query was recorded while they were

@@ -658,25 +658,6 @@ func (serversInfo *ServersInfo) recoverDormantServers() {
 }
 
 func (serversInfo *ServersInfo) getOne() *ServerInfo {
-	return serversInfo.getOneExcluding(nil)
-}
-
-// getOneExcept picks an eligible server while omitting excludedName. Ordinary
-// lookups preserve the existing strategy exactly. DNSSEC response retries use
-// the exclusion so they do not ask the same resolver for the same stale or
-// incomplete answer again.
-func (serversInfo *ServersInfo) getOneExcept(excludedName string) *ServerInfo {
-	if excludedName == "" {
-		return serversInfo.getOneExcluding(nil)
-	}
-	return serversInfo.getOneExcluding(map[string]struct{}{excludedName: {}})
-}
-
-// getOneExcluding is the set form used by a DNSSEC recovery transaction.  A
-// single bad answer can require more than one retry, and asking the same
-// alternate twice provides no independent evidence.  The caller owns and may
-// extend excludedNames between attempts.
-func (serversInfo *ServersInfo) getOneExcluding(excludedNames map[string]struct{}) *ServerInfo {
 	serversInfo.Lock()
 	serversCount := len(serversInfo.inner)
 	if serversCount <= 0 {
@@ -685,46 +666,6 @@ func (serversInfo *ServersInfo) getOneExcluding(excludedNames map[string]struct{
 	}
 
 	serversInfo.recoverDormantServers()
-	if len(excludedNames) > 0 {
-		// Exclusions can outlive a dynamic source refresh, so their count may
-		// exceed the current pool size.  Use a non-negative upper bound rather
-		// than deriving capacity from two independently changing collections.
-		eligible := make([]*ServerInfo, 0, serversCount)
-		for _, server := range serversInfo.inner {
-			if _, excluded := excludedNames[server.Name]; !excluded {
-				eligible = append(eligible, server)
-			}
-		}
-		if len(eligible) == 0 {
-			serversInfo.Unlock()
-			return nil
-		}
-
-		var serverInfo *ServerInfo
-		if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 && len(eligible) > 1 {
-			first := eligible[rand.Intn(len(eligible))]
-			second := eligible[rand.Intn(len(eligible))]
-			for second == first {
-				second = eligible[rand.Intn(len(eligible))]
-			}
-			if serversInfo.calculateServerScore(second) > serversInfo.calculateServerScore(first) {
-				serverInfo = second
-			} else {
-				serverInfo = first
-			}
-		} else {
-			// Retry traffic is exceptional. For strategies whose candidate indices
-			// refer to the complete server slice, choose uniformly from the
-			// remaining servers rather than accidentally reintroducing the excluded
-			// resolver through an index translation.
-			serverInfo = eligible[rand.Intn(len(eligible))]
-		}
-		dlog.Debugf("Using candidate [%s] (excluding %d tried server(s)) RTT: %d Score: %.3f",
-			serverInfo.Name, len(excludedNames), int(serverInfo.rtt.Value()),
-			serversInfo.calculateServerScore(serverInfo))
-		serversInfo.Unlock()
-		return serverInfo
-	}
 
 	var candidate int
 

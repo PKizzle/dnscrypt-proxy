@@ -127,11 +127,6 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	if len(proxy.cloakFile) != 0 {
 		*queryPlugins = append(*queryPlugins, Plugin(new(PluginCloak)))
 	}
-	// Before the payload-size plugin, which reads the DO bit and reinstates it:
-	// setting it here both survives and gets the larger budget signatures need.
-	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
-		*queryPlugins = append(*queryPlugins, Plugin(new(PluginDNSSECRequest)))
-	}
 	*queryPlugins = append(*queryPlugins, Plugin(new(PluginGetSetPayloadSize)))
 	if proxy.cache {
 		*queryPlugins = append(*queryPlugins, Plugin(new(PluginCache)))
@@ -147,11 +142,6 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	}
 
 	responsePlugins := &[]Plugin{}
-	// First, and so before the cache: an answer is judged once on the way in,
-	// on what upstream actually sent, rather than on every hit afterwards.
-	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
-		*responsePlugins = append(*responsePlugins, Plugin(new(PluginDNSSECValidate)))
-	}
 	if len(proxy.nxLogFile) != 0 {
 		*responsePlugins = append(*responsePlugins, Plugin(new(PluginNxLog)))
 	}
@@ -169,11 +159,6 @@ func (proxy *Proxy) InitPluginsGlobals() error {
 	}
 	if proxy.cache {
 		*responsePlugins = append(*responsePlugins, Plugin(new(PluginCacheResponse)))
-	}
-	// Last, and so after the cache: what the cache keeps is what upstream sent,
-	// and what each client receives is trimmed to what that client asked for.
-	if mode := proxy.dnssecValidationMode; mode != "" && mode != "off" {
-		*responsePlugins = append(*responsePlugins, Plugin(new(PluginDNSSECStrip)))
 	}
 
 	loggingPlugins := &[]Plugin{}
@@ -305,10 +290,10 @@ func (pluginsState *PluginsState) ApplyQueryPlugins(
 	if len(msg.Question) != 1 {
 		return packet, errors.New("Unexpected number of questions")
 	}
-	// Keep the client's EDNS capabilities before ECS, DNSSEC validation, or
-	// the payload-size plugin adds or enlarges an OPT RR for the upstream
-	// transaction. Response shaping and the UDP truncation limit must use what
-	// the client actually advertised, not those internal mutations.
+	// Keep the client's EDNS capabilities before ECS or the payload-size plugin
+	// adds or enlarges an OPT RR for the upstream transaction. Response shaping
+	// and the UDP truncation limit must use what the client actually
+	// advertised, not those internal mutations.
 	pluginsState.clientHadEDNS = messageHasEDNS(&msg)
 	pluginsState.clientUDPSize = msg.UDPSize
 	pluginsState.clientEDNSStateRecorded = true

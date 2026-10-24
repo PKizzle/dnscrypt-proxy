@@ -23,22 +23,9 @@ func validateQuery(query []byte) bool {
 
 // handleSynthesizedResponse - Handles a synthesized DNS response from plugins
 func handleSynthesizedResponse(pluginsState *PluginsState, synth *dns.Msg) ([]byte, error) {
-	// Query plugins may have enabled DO and CD solely to obtain material for
-	// local validation. Synthesized answers bypass the normal response-plugin
-	// chain, so restore the client's bits at this common exit point as well.
-	// The helper is a no-op unless DNSSEC validation saved the original values.
-	restoreDNSSECClientBits(pluginsState, synth)
 	if err := validateResponseForQuery(pluginsState.questionMsg, synth); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
 		return nil, err
-	}
-	// A synthesized answer goes straight to the client without the response
-	// plugins, so the trimming they would have done has to happen here. This is
-	// the path a cache hit takes, and the cache holds what upstream sent --
-	// signatures included, and the verdict already recorded in the AD bit by the
-	// validation done when the entry was made.
-	if pluginsState.clientProto != dnssecInternalProto {
-		stripDNSSECForClient(pluginsState, synth)
 	}
 	if err := synth.Pack(); err != nil {
 		pluginsState.returnCode = PluginsReturnCodeParseError
@@ -429,12 +416,9 @@ func processPlugins(
 		}
 	}
 
-	// Health belongs to the resolver's original response, not to a replacement
-	// supplied by a DNSSEC retry and not to a local enforcement response. A raw
-	// upstream SERVFAIL is a resolver failure even when another resolver repairs
-	// the client transaction, unless the resolver attributed it to the zone; a
-	// locally generated DNSSEC SERVFAIL still means the original server
-	// completed its exchange and supplied judgeable data.
+	// Health belongs to the resolver's original response: a raw upstream
+	// SERVFAIL is a resolver failure even when a plugin replaces the answer,
+	// unless the resolver attributed it to the zone.
 	finalRcode := Rcode(response)
 	switch {
 	case pluginsState.servedStale:

@@ -14,6 +14,11 @@ query when no WebSocket client is connected, and live broadcasts are limited
 to one every five seconds.
   - Prometheus metrics now expose the Go heap, runtime-reserved memory and
 goroutine count alongside the retained query-log estimate.
+  - The experimental local DNSSEC validator has been removed, together with
+its `[dnssec_validation]` table, the `dnssec_verdict`/`dnssec_reason` query-log
+fields and the `dnscrypt_proxy_dnssec_*` Prometheus series. A configuration
+that still contains `[dnssec_validation]` is rejected at startup;
+`require_dnssec` is unaffected.
 
 # Version 2.1.19
   - Resumed PQDNSCrypt queries now use regular UDP padding, protecting their

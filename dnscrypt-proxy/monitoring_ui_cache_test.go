@@ -10,24 +10,6 @@ import (
 	"codeberg.org/miekg/dns"
 )
 
-func TestQueryLogMemoryIncludesDNSSECDetails(t *testing.T) {
-	entry := QueryLogEntry{
-		ClientIP:      "anonymized",
-		Domain:        "example.com",
-		Type:          "HTTPS",
-		ResponseCode:  "PASS",
-		Server:        "resolver",
-		DNSSECVerdict: "indeterminate",
-		DNSSECReason:  strings.Repeat("x", 1024),
-	}
-	withoutDetails := entry
-	withoutDetails.DNSSECVerdict = ""
-	withoutDetails.DNSSECReason = ""
-	if got, want := entry.EstimateMemoryUsage()-withoutDetails.EstimateMemoryUsage(), int64(len(entry.DNSSECVerdict)+len(entry.DNSSECReason)); got != want {
-		t.Fatalf("DNSSEC detail memory = %d, want %d", got, want)
-	}
-}
-
 func TestQueryLogEvictionHonorsMemoryAndEntryLimits(t *testing.T) {
 	ui := newTestMonitoringUIWithLimits(t, 2, 1)
 	mc := ui.metricsCollector
@@ -35,13 +17,13 @@ func TestQueryLogEvictionHonorsMemoryAndEntryLimits(t *testing.T) {
 
 	for _, domain := range []string{"one.example", "two.example", "three.example"} {
 		ui.applyMetrics(metricEvent{
-			at:           time.Now(),
-			qName:        domain,
-			qType:        "A",
-			serverName:   "resolver",
-			returnCode:   "PASS",
-			dnssecReason: strings.Repeat("r", 256),
-			logQuery:     true,
+			at:         time.Now(),
+			qName:      domain,
+			qType:      "A",
+			serverName: "resolver",
+			returnCode: "PASS",
+			clientIP:   strings.Repeat("r", 256),
+			logQuery:   true,
 		})
 	}
 
@@ -59,13 +41,13 @@ func TestQueryLogEvictionHonorsMemoryAndEntryLimits(t *testing.T) {
 	// An individual entry larger than the budget is dropped instead of making
 	// the configured bound advisory.
 	ui.applyMetrics(metricEvent{
-		at:           time.Now(),
-		qName:        "oversized.example",
-		qType:        "A",
-		serverName:   "resolver",
-		returnCode:   "PASS",
-		dnssecReason: strings.Repeat("r", int(mc.maxMemoryBytes)),
-		logQuery:     true,
+		at:         time.Now(),
+		qName:      "oversized.example",
+		qType:      "A",
+		serverName: "resolver",
+		returnCode: "PASS",
+		clientIP:   strings.Repeat("r", int(mc.maxMemoryBytes)),
+		logQuery:   true,
 	})
 	if got := mc.recentQueryCountLocked(); got != 2 {
 		t.Fatalf("oversized entry changed retained count to %d", got)
@@ -75,18 +57,17 @@ func TestQueryLogEvictionHonorsMemoryAndEntryLimits(t *testing.T) {
 func TestLargeQueryHistoryStaysWithinConfiguredBounds(t *testing.T) {
 	ui := newTestMonitoringUIWithLimits(t, 10_000, 8)
 	mc := ui.metricsCollector
-	reason := strings.Repeat("validated DNSSEC chain; ", 24)
+	reason := strings.Repeat("client.example; ", 24)
 
 	for i := 0; i < 50_000; i++ {
 		ui.applyMetrics(metricEvent{
-			at:            time.Now(),
-			qName:         "retention-test.example",
-			qType:         "HTTPS",
-			serverName:    "resolver",
-			returnCode:    "PASS",
-			dnssecVerdict: "secure",
-			dnssecReason:  reason,
-			logQuery:      true,
+			at:         time.Now(),
+			qName:      "retention-test.example",
+			qType:      "HTTPS",
+			serverName: "resolver",
+			returnCode: "PASS",
+			clientIP:   reason,
+			logQuery:   true,
 		})
 	}
 

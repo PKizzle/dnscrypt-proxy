@@ -153,19 +153,6 @@ func RefusedResponseFromMessage(srcMsg *dns.Msg, refusedCode bool, ipv4 net.IP, 
 	return dstMsg
 }
 
-// DNSSECFailureResponseFromMessage returns the response RFC 4035 section 5.5
-// requires when validation fails for a client that did not disable checking.
-// This deliberately does not use the generic blocked-query response: an HINFO
-// answer or REFUSED would hide a DNSSEC validation failure from the client.
-func DNSSECFailureResponseFromMessage(srcMsg *dns.Msg, edeCode uint16) *dns.Msg {
-	dstMsg := EmptyResponseFromMessage(srcMsg)
-	dstMsg.Rcode = dns.RcodeServerFailure
-	if dstMsg.UDPSize > 0 {
-		dstMsg.Pseudo = append(dstMsg.Pseudo, &dns.EDE{InfoCode: edeCode})
-	}
-	return dstMsg
-}
-
 func HasTCFlag(packet []byte) bool {
 	return packet[2]&2 == 2
 }

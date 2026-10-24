@@ -31,9 +31,7 @@ type Proxy struct {
 	localDoHListeners        []*net.TCPListener
 	queryMeta                []string
 	enableHotReload          bool
-	dnssecValidationMode     string
 	inflight                 *inflight
-	dnssecInsecureZones      []string
 	udpListeners             []*net.UDPConn
 	sources                  []*Source
 	tcpListeners             []*net.TCPListener
@@ -806,48 +804,6 @@ func (proxy *Proxy) processIncomingQuery(
 	start time.Time,
 	onlyCached bool,
 ) []byte {
-	return proxy.processIncomingQueryExcluding(
-		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, nil,
-	)
-}
-
-// processIncomingQueryExcept is processIncomingQuery with one upstream omitted
-// from selection. It is used for a DNSSEC retry after that exact upstream has
-// supplied an answer that cannot be validated; DNSSEC chain fetches deliberately
-// do not use it, as those lookups have their own upstream provenance.
-func (proxy *Proxy) processIncomingQueryExcept(
-	clientProto string,
-	serverProto string,
-	query []byte,
-	clientAddr *net.Addr,
-	clientPc net.Conn,
-	start time.Time,
-	onlyCached bool,
-	excludeServerName string,
-) []byte {
-	var excludedServerNames map[string]struct{}
-	if excludeServerName != "" {
-		excludedServerNames = map[string]struct{}{excludeServerName: {}}
-	}
-	return proxy.processIncomingQueryExcluding(
-		clientProto, serverProto, query, clientAddr, clientPc, start, onlyCached, excludedServerNames,
-	)
-}
-
-// processIncomingQueryExcluding omits every server already tried by one
-// DNSSEC recovery transaction.  Selected servers are added to the caller's
-// set before exchange, so timeouts as well as incomplete answers move the next
-// attempt to a genuinely different recursive resolver.
-func (proxy *Proxy) processIncomingQueryExcluding(
-	clientProto string,
-	serverProto string,
-	query []byte,
-	clientAddr *net.Addr,
-	clientPc net.Conn,
-	start time.Time,
-	onlyCached bool,
-	excludedServerNames map[string]struct{},
-) []byte {
 	// Initialize metrics for this query
 	clientAddrStr := "unknown"
 	if clientAddr != nil {
@@ -866,17 +822,6 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 
 	var serverInfo *ServerInfo
 	var serverName string = "-"
-	pickServer := func() *ServerInfo {
-		server := proxy.serversInfo.getOneExcluding(excludedServerNames)
-		if server == nil {
-			return nil
-		}
-		serverName = server.Name
-		if excludedServerNames != nil {
-			excludedServerNames[serverName] = struct{}{}
-		}
-		return server
-	}
 
 	// Apply query plugins with lazy server selection
 	query, err := pluginsState.ApplyQueryPlugins(
@@ -885,7 +830,10 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 		func() (*ServerInfo, bool) {
 			// Only get server info once when actually needed
 			if serverInfo == nil {
-				serverInfo = pickServer()
+				serverInfo = proxy.serversInfo.getOne()
+				if serverInfo != nil {
+					serverName = serverInfo.Name
+				}
 			}
 			if serverInfo == nil {
 				return nil, false
@@ -933,7 +881,10 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 	// Note: if serverInfo is still nil here, we need to get it
 	if len(response) == 0 {
 		if serverInfo == nil {
-			serverInfo = pickServer()
+			serverInfo = proxy.serversInfo.getOne()
+			if serverInfo != nil {
+				serverName = serverInfo.Name
+			}
 		}
 		if serverInfo != nil {
 			pluginsState.serverName = serverName
@@ -991,10 +942,9 @@ func (proxy *Proxy) processIncomingQueryExcluding(
 
 // upstreamExchangeSucceeded distinguishes receiving a DNS-level failure from
 // successfully obtaining a usable answer. A SERVFAIL is transport-complete,
-// but rewarding that resolver would make WP2 increasingly likely to select the
-// exact server from which DNSSEC recovery had to escape. An answer from the
-// stale cache stands in for an exchange that failed, so it is not a success
-// either.
+// but rewarding that resolver would make WP2 increasingly likely to select
+// a server that is not answering. An answer from the stale cache stands in for
+// an exchange that failed, so it is not a success either.
 func upstreamExchangeSucceeded(pluginsState *PluginsState, response []byte, err error) bool {
 	return err == nil && !pluginsState.servedStale &&
 		len(response) >= MinDNSPacketSize && Rcode(response) != dns.RcodeServerFailure
