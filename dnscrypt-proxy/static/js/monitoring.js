@@ -525,6 +525,9 @@ function connectWebSocket() {
 
         // Create WebSocket connection
         var newWs = new WebSocket(wsUrl);
+        // The server drops a connection it has not heard from in 90 seconds,
+        // which is how it notices a client that vanished without closing.
+        var keepAlive = null;
 
         // Connection opened
         newWs.onopen = function() {
@@ -537,6 +540,11 @@ function connectWebSocket() {
             } catch (e) {
                 console.error('Error sending ping:', e);
             }
+            keepAlive = setInterval(function() {
+                if (newWs.readyState === WebSocket.OPEN) {
+                    newWs.send(JSON.stringify({type: 'ping'}));
+                }
+            }, 30000);
         };
 
         // Listen for messages
@@ -568,6 +576,7 @@ function connectWebSocket() {
         // Connection closed
         newWs.onclose = function(event) {
             console.log('WebSocket disconnected, code:', event.code, 'reason:', event.reason || 'No reason provided');
+            clearInterval(keepAlive);
 
             // Try to reconnect with exponential backoff
             if (wsReconnectAttempts < maxReconnectAttempts) {

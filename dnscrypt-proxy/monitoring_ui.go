@@ -227,6 +227,11 @@ type MonitoringUI struct {
 	broadcastMinDelay time.Duration
 	pendingBroadcast  bool
 
+	// wsReadTimeout drops a WebSocket client that has gone silent. The page
+	// pings every 30 seconds, so only a connection whose peer vanished without
+	// closing it runs into this.
+	wsReadTimeout time.Duration
+
 	// Prometheus metrics
 	prometheusPath string
 	peers          *peerCollector
@@ -314,6 +319,7 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 		// A dashboard is operational telemetry, not part of the DNS hot path.
 		// Full fleet snapshots can contain thousands of retained queries.
 		broadcastMinDelay: monitoringBroadcastMinDelay,
+		wsReadTimeout:     90 * time.Second,
 		// Initialize Prometheus path
 		prometheusPath: func() string {
 			if proxy.monitoringUI.PrometheusPath != "" {
@@ -1418,7 +1424,6 @@ func unavailableFleetMetrics(reason string) map[string]any {
 		"blocked_queries":    float64(0),
 		"avg_response_time":  float64(0),
 		"cache_stats": map[string]any{
-			"enabled":         false,
 			"configured_size": float64(0),
 			"entries":         float64(0),
 			"capacity":        float64(0),
@@ -1537,6 +1542,7 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 
 		for {
 			// Read message from client
+			conn.SetReadDeadline(time.Now().Add(ui.wsReadTimeout))
 			var msg map[string]any
 			err := conn.ReadJSON(&msg)
 			if err != nil {

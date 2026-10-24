@@ -942,9 +942,9 @@ func (proxy *Proxy) processIncomingQuery(
 
 // upstreamExchangeSucceeded distinguishes receiving a DNS-level failure from
 // successfully obtaining a usable answer. A SERVFAIL is transport-complete,
-// but rewarding that resolver would make WP2 increasingly likely to select
-// a server that is not answering. An answer from the stale cache stands in for
-// an exchange that failed, so it is not a success either.
+// but rewarding that resolver would make WP2 increasingly likely to select a
+// server that answers SERVFAIL. An answer from the stale cache stands in for an
+// exchange that failed, so it is not a success either.
 func upstreamExchangeSucceeded(pluginsState *PluginsState, response []byte, err error) bool {
 	return err == nil && !pluginsState.servedStale &&
 		len(response) >= MinDNSPacketSize && Rcode(response) != dns.RcodeServerFailure

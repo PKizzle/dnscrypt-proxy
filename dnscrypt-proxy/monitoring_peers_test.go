@@ -307,6 +307,42 @@ func TestWebSocketMetricsAlwaysCarryFleet(t *testing.T) {
 	assertFleetOnlyBrowserPayload(t, readPayload())
 }
 
+// A client that vanishes without closing its connection must not keep its
+// reader goroutine waiting forever, while one that pings stays connected.
+func TestWebSocketDropsASilentClient(t *testing.T) {
+	ui, cleanup := newFleetTestUI(t)
+	defer cleanup()
+	ui.wsReadTimeout = 300 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(ui.handleWebSocket))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	// Pinging past the timeout keeps the connection open.
+	for range 3 {
+		time.Sleep(150 * time.Millisecond)
+		if err := conn.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+			t.Fatalf("write ping: %v", err)
+		}
+	}
+	// Then going silent gets it closed; the server's messages are drained
+	// until the close arrives.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		var payload map[string]any
+		if err := conn.ReadJSON(&payload); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				t.Fatal("a silent client was not disconnected")
+			}
+			return
+		}
+	}
+}
+
 func TestBrowserFleetMetricsAggregatesAllDashboardPanels(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	instances := []peerMetrics{

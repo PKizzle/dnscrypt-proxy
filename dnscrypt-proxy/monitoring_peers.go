@@ -126,7 +126,7 @@ func (pc *peerCollector) peerAddresses() ([]string, error) {
 		addrs, err := pc.resolver().LookupHost(ctx, host)
 		if err != nil {
 			dlog.Debugf("Monitoring peer discovery for [%s] failed: %v", host, err)
-			discoveryErr = fmt.Errorf("discovery of [%s] failed: %w", host, err)
+			discoveryErr = err
 		}
 		sort.Strings(addrs)
 		for _, a := range preferredPeerAddresses(addrs) {

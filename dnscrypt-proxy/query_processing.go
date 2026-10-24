@@ -419,7 +419,6 @@ func processPlugins(
 	// Health belongs to the resolver's original response: a raw upstream
 	// SERVFAIL is a resolver failure even when a plugin replaces the answer,
 	// unless the resolver attributed it to the zone.
-	finalRcode := Rcode(response)
 	switch {
 	case pluginsState.servedStale:
 		// The answer came from the stale cache because the exchange failed, and
@@ -427,14 +426,12 @@ func processPlugins(
 		// the answer would hide that it stopped answering.
 	case upstreamRcode == dns.RcodeServerFailure:
 		serverInfo.noticeServfail(proxy, pluginsState.qName, upstreamBlamesZone)
-	case finalRcode == dns.RcodeServerFailure && !pluginsState.dnssec:
-		serverInfo.noticeServfail(proxy, pluginsState.qName, false)
 	default:
 		serverInfo.noticeSuccess(proxy)
 	}
 
-	if finalRcode == dns.RcodeServerFailure {
-		if pluginsState.dnssec && upstreamRcode != dns.RcodeServerFailure {
+	if upstreamRcode == dns.RcodeServerFailure {
+		if pluginsState.dnssec {
 			dlog.Debug("A response had an invalid DNSSEC signature")
 		} else {
 			dlog.Infof("A response with status code 2 was received - this is usually a temporary, remote issue with the configuration of the domain name")
