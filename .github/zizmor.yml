@@ -1,0 +1,8 @@
+rules:
+  # The Nydus build cache in image.yml is written only by that workflow, which
+  # runs on release tags and manual dispatch alone; an entry can only come from
+  # someone who can already push tags. Kept out of the `uses:` line, whose
+  # trailing comment must stay the version Dependabot and ref-version-mismatch read.
+  cache-poisoning:
+    ignore:
+      - image.yml
