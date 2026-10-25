@@ -140,6 +140,15 @@ func (proxy *Proxy) computeSharedKey(
 	return ComputeSharedKey(cryptoConstruction, &proxy.proxySecretKey, serverPk, providerName)
 }
 
+func minRelayedQuerySize(serverInfo *ServerInfo, proto string) int {
+	if proto == "tcp" && serverInfo.Relay != nil {
+		// The relay's next hop is UDP.  Padding to the stream-message limit
+		// would turn every relayed TCP query into a 64 KiB request.
+		return MaxDNSUDPPacketSize
+	}
+	return 0
+}
+
 func (proxy *Proxy) Encrypt(
 	serverInfo *ServerInfo,
 	packet []byte,
@@ -188,16 +197,13 @@ func (proxy *Proxy) Encrypt(
 		if _, err := crypto_rand.Read(xpad[:]); err != nil {
 			return nil, nil, nil, queryEpoch, err
 		}
-		minQuestionSize += int(xpad[0])
+		minQuestionSize += int(xpad[0]&3) * 64
 	}
 	paddedLength := Min(MaxDNSUDPPacketSize, (Max(minQuestionSize, QueryOverhead)+1+63) & ^63)
 	if serverInfo.knownBugs.fragmentsBlocked && proto == "udp" {
 		paddedLength = MaxDNSUDPSafePacketSize
-	} else if serverInfo.Relay != nil && proto == "tcp" {
-		// The relay's next hop is UDP.  Padding to the stream-message limit
-		// would turn every relayed TCP query into a 64 KiB request.
-		paddedLength = MaxDNSUDPPacketSize
 	}
+	paddedLength = Max(paddedLength, minRelayedQuerySize(serverInfo, proto))
 	if QueryOverhead+len(packet)+1 > paddedLength {
 		err = errors.New("Question too large; cannot be padded")
 		return sharedKey, encrypted, clientNonce, queryEpoch, err

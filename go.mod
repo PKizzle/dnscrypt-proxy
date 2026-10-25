@@ -1,9 +1,9 @@
 module github.com/dnscrypt/dnscrypt-proxy
 
-go 1.27.0
+go 1.27.2
 
 require (
-	codeberg.org/miekg/dns v0.6.117
+	codeberg.org/miekg/dns v0.6.119
 	github.com/BurntSushi/toml v1.6.0
 	github.com/VividCortex/ewma v1.2.0
 	github.com/cloudflare/circl v1.6.5
@@ -24,11 +24,12 @@ require (
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.3.0
 	github.com/lifenjoiner/dhcpdns v0.0.7
+	github.com/oneregex/revera/go v0.0.0-20261014081440-64b07f96fe82
 	github.com/powerman/check v1.14.0
-	github.com/quic-go/quic-go v0.63.0
-	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.59.0
-	golang.org/x/sys v0.48.0
+	github.com/quic-go/quic-go v0.64.1
+	golang.org/x/crypto v0.58.0
+	golang.org/x/net v0.61.0
+	golang.org/x/sys v0.49.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
@@ -36,7 +37,7 @@ require (
 	github.com/hashicorp/go-syslog v1.0.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
 
 // crypto/rsa refuses public exponents above 2^31-1 (golang/go#3161), so a
