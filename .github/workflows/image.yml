@@ -1,0 +1,193 @@
+# Publishes ghcr.io/<owner>/dnscrypt-proxy as an OCI + Nydus dual image.
+#
+# Release procedure: tag master as vX.Y.Z.N (upstream version plus fork build
+# number) and push the tag. releases.yml builds the binaries and creates the
+# GitHub release; this workflow publishes the image under the same tag. A
+# manual run (workflow_dispatch) builds the selected ref and publishes only
+# sha-<12 hex>, to exercise the pipeline without cutting a release. `latest`
+# is never published.
+#
+# GitHub creates ghcr packages private. The cluster pulls anonymously, so the
+# package must be made public once in its package settings.
+name: Container image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: image-${{ github.ref }}
+  # A cancelled run can leave a tag holding the plain OCI index without its
+  # nydus half; the next run converts it again, but there is no reason to
+  # interrupt one that is already publishing.
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write # push the image and its nydus manifests to ghcr.io
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Done in shell rather than with a third-party action: this job holds
+      # packages:write, and lowercasing a string is not worth an external
+      # dependency inside it.
+      - name: Compute image reference
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="sha-${GITHUB_SHA::12}"
+          fi
+          owner="$(tr '[:upper:]' '[:lower:]' <<< "$OWNER")"
+          {
+            echo "ref=ghcr.io/${owner}/dnscrypt-proxy:${tag}"
+            echo "version=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # Writes ~/.docker/config.json, which nydusify reads for the same push.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No provenance or SBOM attestations: the dual conversion republishes
+      # the index and requires it to hold exactly the platform manifests.
+      - name: Build and push the OCI image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx build . \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --tag "$IMAGE" \
+            --push
+
+      # The Rust nydusify (PKizzle/nydus fork) is required: it is the only one
+      # with --attach-oci-manifest, which publishes the OCI and nydus manifests
+      # under ONE tag instead of a separate `-nydus` tag. No release artifacts
+      # are published for the fork, so the two binaries are built from source
+      # (cached between runs).
+      # Pinned to a commit, not the branch. This checkout is built from source
+      # and then executed in a job that holds packages:write and an
+      # authenticated ghcr session, so anyone able to push to that branch could
+      # otherwise reach this project's published images. Bump deliberately.
+      - name: Check out Nydus fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PKizzle/nydus
+          ref: 09efa9d79968fa4ffd66dd33cc2f71c99f15e7ca # production
+          path: .nydus-src
+          persist-credentials: false
+
+      # Only this workflow writes this cache, and it runs on tags and manual
+      # dispatch alone, so an entry can only come from a run by someone who can
+      # already push tags. Dropping the cache costs a cold cargo build per run.
+      - name: Cache Nydus build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
+        with:
+          workspaces: .nydus-src
+
+      - name: Build Nydus tools from fork
+        working-directory: .nydus-src
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake pkg-config liblz4-dev libz-dev uuid-dev protobuf-compiler
+
+          # rust-toolchain.toml in the fork pins the toolchain; cargo installs it on demand.
+          cargo build --release -p nydusify --bin nydusify
+          cargo build --release --bin nydus-image
+
+          sudo install -m 0755 target/release/nydusify /usr/local/bin/nydusify
+          sudo install -m 0755 target/release/nydus-image /usr/local/bin/nydus-image
+
+          nydusify --version
+
+      # --oci-ref (zran) makes the nydus half reference the OCI half's gzip
+      # layers instead of duplicating them: ~3-5% extra registry storage rather
+      # than ~100%. Both halves live under the same tag, so the referenced
+      # layers persist as long as the nydus manifests do.
+      - name: Attach Nydus manifests (dual image)
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          work_dir="$RUNNER_TEMP/nydusify"
+          nydusify convert \
+            --source "$IMAGE" \
+            --target "$IMAGE" \
+            --oci-ref \
+            --attach-oci-manifest \
+            --platform linux/amd64,linux/arm64 \
+            --merge-platform \
+            --nydus-image /usr/local/bin/nydus-image \
+            --work-dir "$work_dir/convert"
+          for arch in amd64 arm64; do
+            nydusify check \
+              --target "$IMAGE" \
+              --multi-platform \
+              --platform "linux/${arch}" \
+              --nydus-image /usr/local/bin/nydus-image \
+              --work-dir "$work_dir/check-${arch}"
+          done
+
+      # A kubelet without the nydus snapshotter picks the first matching
+      # platform entry, so the OCI manifests must come first and must not carry
+      # the nydus os.features marker.
+      - name: Verify the dual index
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          index="$(docker buildx imagetools inspect --raw "$IMAGE")"
+          jq . <<< "$index"
+          jq -e '
+            .manifests as $m
+            | ($m | length) == 4
+            and ($m[0:2] | all(.platform["os.features"] == null and .artifactType == null))
+            and ($m[2:4] | all(.artifactType == "application/vnd.nydus.image.manifest.v1+json"))
+            and ([$m[0:2][].platform.architecture] | sort) == ["amd64", "arm64"]
+            and ([$m[2:4][].platform.architecture] | sort) == ["amd64", "arm64"]
+          ' <<< "$index" > /dev/null || {
+            echo "::error::${IMAGE} is not a 2 OCI + 2 nydus dual index"
+            exit 1
+          }
+
+          digest="$(docker buildx imagetools inspect --format '{{ .Manifest.Digest }}' "$IMAGE")"
+          {
+            echo "## Container image"
+            echo
+            echo "\`${IMAGE}\`"
+            echo
+            echo "Index digest: \`${digest}\` (OCI + Nydus, linux/amd64 and linux/arm64)"
+          } >> "$GITHUB_STEP_SUMMARY"

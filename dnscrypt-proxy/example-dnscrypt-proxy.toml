@@ -323,6 +323,15 @@ cert_refresh_delay = 240
 # tls_disable_session_tickets = false
 
 
+## DoH: Check the certificate hashes of server stamps on every new connection,
+## not only at startup and when certificates are reloaded.
+##
+## This improves security, but also increases the risks of downtime if you
+## don't use DNSCrypt servers in addition to DoH servers.
+
+# doh_check_cert_hashes_on_connect = false
+
+
 ## Prefer RSA certificates over ECDSA for TLS connections.
 ## When this is enabled, some servers may become impossible to use,
 ## or may stop working later as they upgrade their configuration.
@@ -638,6 +647,11 @@ format = 'tsv'
 ##   ads.*
 ##   ads*.example.*
 ##   ads*.example[0-9]*.com
+##   regex: `^ads[0-9]+\.example\.com$`
+##
+## The last one is a regular expression, see `example-blocked-names.txt`.
+## If a regex rule is invalid or too slow, the proxy won't start, and a
+## reload keeps the old rules.
 ##
 ## Example blocklist files can be found at https://download.dnscrypt.info/blocklists/
 ## A script to build blocklists from public feeds can be found in the
@@ -694,6 +708,10 @@ format = 'tsv'
 ## Allowlists support the same patterns as blocklists
 ## If a name matches an allowlist entry, the corresponding session
 ## will bypass names and IP filters.
+##
+## Regular expressions work here too, see `example-allowed-names.txt`.
+## If a regex rule is invalid or too slow, the proxy won't start, and a
+## reload keeps the old rules.
 ##
 ## Time-based rules are also supported to make some websites only accessible at specific times of the day.
 

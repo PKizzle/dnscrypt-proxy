@@ -110,6 +110,7 @@ type XTransport struct {
 	httpProxyFunction        func(*http.Request) (*url.URL, error)
 	tlsClientCreds           DOHClientCreds
 	keyLogWriter             io.Writer
+	certHashes               atomic.Pointer[map[string][][]byte]
 }
 
 func NewXTransport() *XTransport {
@@ -305,7 +306,7 @@ func (xTransport *XTransport) rebuildTransport() {
 		IdleConnTimeout:        xTransport.idleConnTimeout,
 		ResponseHeaderTimeout:  timeout,
 		ExpectContinueTimeout:  timeout,
-		MaxResponseHeaderBytes: 4096,
+		MaxResponseHeaderBytes: MaxHTTPResponseHeaderBytes,
 		DialContext: func(ctx context.Context, network, addrStr string) (net.Conn, error) {
 			host, port := ExtractHostAndPort(addrStr, stamps.DefaultPort)
 			formatEndpoint := func(ip net.IP) string {
@@ -406,6 +407,24 @@ func (xTransport *XTransport) rebuildTransport() {
 
 	if xTransport.tlsDisableSessionTickets {
 		tlsClientConfig.SessionTicketsDisabled = true
+	}
+	if xTransport.certHashes.Load() != nil {
+		tlsClientConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+			certHashes := xTransport.certHashes.Load()
+			var hashes [][]byte
+			if cs.ServerName != "" {
+				hashes = (*certHashes)[certHashesHostKey(cs.ServerName)]
+			} else if len(cs.PeerCertificates) > 0 {
+				// The stamp host name is an IP address, so there is no SNI: use the certificate addresses.
+				for _, ip := range cs.PeerCertificates[0].IPAddresses {
+					hashes = append(hashes, (*certHashes)[ip.String()]...)
+				}
+			}
+			if len(hashes) > 0 && !certHashesMatch(&cs, hashes) {
+				return errCertHashNotFound
+			}
+			return nil
+		}
 	}
 	if xTransport.tlsPreferRSA {
 		tlsClientConfig.MaxVersion = tls.VersionTLS12
@@ -509,8 +528,9 @@ func (xTransport *XTransport) rebuildTransport() {
 		}
 		xTransport.http3Pool = newHTTP3Pool(func() *http3.Transport {
 			return &http3.Transport{
-				DisableCompression: true,
-				TLSClientConfig:    &tlsClientConfig,
+				DisableCompression:     true,
+				TLSClientConfig:        &tlsClientConfig,
+				MaxResponseHeaderBytes: MaxHTTPResponseHeaderBytes,
 				QUICConfig: &quic.Config{
 					MaxIdleTimeout:  HTTP3MaxIdleTimeout,
 					KeepAlivePeriod: HTTP3KeepAlivePeriod,
@@ -852,6 +872,12 @@ func (xTransport *XTransport) Fetch(
 	client := http.Client{
 		Transport: xTransport.transport,
 		Timeout:   timeout,
+	}
+	if certHashes := xTransport.certHashes.Load(); certHashes != nil && len((*certHashes)[certHashesHostKey(url.Host)]) > 0 {
+		// The other host's certificate wouldn't be checked against these hashes
+		client.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return errors.New("Redirects are not followed for servers with certificate hashes")
+		}
 	}
 	host, port := ExtractHostAndPort(url.Host, 443)
 	hasAltSupport := false
