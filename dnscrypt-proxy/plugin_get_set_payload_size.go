@@ -63,3 +63,18 @@ func (plugin *PluginGetSetPayloadSize) Eval(pluginsState *PluginsState, msg *dns
 
 	return nil
 }
+
+func messageHasEDNS(msg *dns.Msg) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.UDPSize != 0 || msg.Security || msg.CompactAnswers || msg.Delegation || msg.Rcode > 0xf {
+		return true
+	}
+	for _, rr := range msg.Pseudo {
+		if _, ok := rr.(dns.EDNS0); ok {
+			return true
+		}
+	}
+	return false
+}

@@ -198,7 +198,7 @@ func configureServerParams(proxy *Proxy, config *Config) {
 }
 
 // configureLoadBalancing - Configures load balancing strategy
-func configureLoadBalancing(proxy *Proxy, config *Config) {
+func configureLoadBalancing(proxy *Proxy, config *Config) error {
 	lbStrategy := LBStrategy(DefaultLBStrategy)
 	switch lbStrategyStr := strings.ToLower(config.LBStrategy); lbStrategyStr {
 	case "":
@@ -231,6 +231,27 @@ func configureLoadBalancing(proxy *Proxy, config *Config) {
 	}
 	proxy.serversInfo.lbStrategy = lbStrategy
 	proxy.serversInfo.lbEstimator = config.LBEstimator
+
+	switch {
+	case config.LBFailbackDelay < 10:
+		return fmt.Errorf("lb_failback_delay must be at least 10 seconds: [%d]", config.LBFailbackDelay)
+	case config.LBFailbackTolerance < 0 || config.LBFailbackTolerance > 100:
+		return fmt.Errorf("lb_failback_tolerance must be between 0 and 100: [%d]", config.LBFailbackTolerance)
+	case config.LBServfailFailover < 1:
+		return fmt.Errorf("lb_servfail_failover must be at least 1: [%d]", config.LBServfailFailover)
+	case config.LBSustainedServfails < 1:
+		return fmt.Errorf("lb_servfail_sustained_count must be at least 1: [%d]", config.LBSustainedServfails)
+	case config.LBSustainedWindow < 0:
+		return fmt.Errorf("lb_servfail_sustained_window must not be negative: [%d]", config.LBSustainedWindow)
+	}
+	proxy.serversInfo.firstPolicy = firstStrategyPolicy{
+		failbackDelay:           time.Duration(config.LBFailbackDelay) * time.Second,
+		failbackTolerance:       1 + float64(config.LBFailbackTolerance)/100,
+		servfailFailover:        config.LBServfailFailover,
+		servfailSustainedCount:  config.LBSustainedServfails,
+		servfailSustainedWindow: time.Duration(config.LBSustainedWindow) * time.Second,
+	}
+	return nil
 }
 
 // configurePlugins - Configures DNS plugins

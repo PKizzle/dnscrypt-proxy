@@ -1,4 +1,14 @@
 # Unreleased
+  - New `lb_failback_delay`, `lb_failback_tolerance`, `lb_servfail_failover`,
+`lb_servfail_sustained_count` and `lb_servfail_sustained_window` settings tune
+when the `first` load-balancing strategy fails a resolver over on SERVFAIL
+responses and when it makes a failed-over resolver preferred again. The
+defaults keep the existing behavior.
+  - Under the `first` load-balancing strategy, a resolver that was failed over
+is re-measured every five minutes with probe queries alongside the resolver
+that replaced it, and becomes the preferred resolver again once it answers
+about as fast or faster. Nothing is probed while no failover is in effect, and
+probes are not counted as client queries or failures.
   - Under the `first` load-balancing strategy, a SERVFAIL that the resolver
 attributes to the queried zone through an extended DNS error (unreachable
 authority, DNSSEC chain problems, filtered names) no longer counts toward
@@ -14,6 +24,14 @@ query when no WebSocket client is connected, and live broadcasts are limited
 to one every five seconds.
   - Prometheus metrics now expose the Go heap, runtime-reserved memory and
 goroutine count alongside the retained query-log estimate.
+  - The experimental local DNSSEC validator has been removed, together with
+its `[dnssec_validation]` table, the `dnssec_verdict`/`dnssec_reason` query-log
+fields and the `dnscrypt_proxy_dnssec_*` Prometheus series. A configuration
+that still contains `[dnssec_validation]` is rejected at startup;
+`require_dnssec` is unaffected.
+  - Cache hits and misses are only counted while the cache is enabled, and the
+dashboard hides the cache card otherwise. Answers served from the stale cache
+count as hits and are not credited to the upstream that failed.
 
 # Version 2.1.19
   - Resumed PQDNSCrypt queries now use regular UDP padding, protecting their

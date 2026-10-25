@@ -32,44 +32,6 @@ func TestSumMetricsAddsCounters(t *testing.T) {
 	}
 }
 
-func TestSumMetricsAddsDNSSECVerdicts(t *testing.T) {
-	totals := sumMetrics([]peerMetrics{
-		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{
-			"mode": "log", "secure": float64(10), "insecure": float64(20),
-			"indeterminate": float64(1), "bogus": float64(0),
-		}}},
-		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{
-			"mode": "log", "secure": float64(30), "insecure": float64(40),
-			"indeterminate": float64(2), "bogus": float64(3),
-		}}},
-	})
-	dnssec, ok := totals["dnssec"].(map[string]any)
-	if !ok {
-		t.Fatal("fleet totals omit DNSSEC")
-	}
-	for verdict, want := range map[string]float64{
-		"secure": 40, "insecure": 60, "indeterminate": 3, "bogus": 3,
-	} {
-		if got, _ := toFloat(dnssec[verdict]); got != want {
-			t.Errorf("%s = %v, want %v", verdict, dnssec[verdict], want)
-		}
-	}
-	if mode, _ := dnssec["mode"].(string); mode != "log" {
-		t.Errorf("mode = %q, want log", mode)
-	}
-}
-
-func TestSumMetricsReportsMixedDNSSECModes(t *testing.T) {
-	totals := sumMetrics([]peerMetrics{
-		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{"mode": "log"}}},
-		{Reachable: true, Metrics: map[string]any{"dnssec": map[string]any{"mode": "enforce"}}},
-	})
-	dnssec := totals["dnssec"].(map[string]any)
-	if mode, _ := dnssec["mode"].(string); mode != "mixed" {
-		t.Errorf("mode = %q, want mixed", mode)
-	}
-}
-
 // An average cannot be averaged: an instance that answered ten queries must not
 // weigh as much as one that answered ten thousand.
 func TestSumMetricsWeightsTheAverageByQueries(t *testing.T) {
@@ -123,6 +85,33 @@ func TestFleetMarksItselfDegradedWhenAPeerIsDown(t *testing.T) {
 	}
 	if len(fleet.Instances) != 2 {
 		t.Errorf("instances = %d, want self plus the unreachable peer", len(fleet.Instances))
+	}
+}
+
+// A discovery name that does not resolve leaves this instance alone in the
+// fleet, which must not read as a healthy fleet of one.
+func TestFleetIsDegradedWhenDiscoveryFails(t *testing.T) {
+	ui := newTestMonitoringUI(t)
+	defer func() { _ = ui.Stop() }()
+	ui.config.PeerDiscoveryDNS = "peers.invalid:8080"
+	// A port nothing is listening on, so the lookup fails at once.
+	ui.config.PeerDiscoveryResolver = "127.0.0.1:1"
+	pc := newPeerCollector(ui)
+
+	fleet := pc.Fleet(map[string]any{"total_queries": float64(7)})
+	if !fleet.Degraded {
+		t.Error("a fleet whose discovery failed should say so")
+	}
+	if len(fleet.Instances) != 1 {
+		t.Errorf("instances = %d, want only this instance", len(fleet.Instances))
+	}
+	metrics := browserFleetMetrics(fleet, 10)
+	if got, _ := toFloat(metrics["instances"]); got != 1 {
+		t.Errorf("reported instances = %v, want 1", metrics["instances"])
+	}
+	errs, _ := metrics["fleet"].(map[string]any)["errors"].([]string)
+	if len(errs) != 1 || !strings.Contains(errs[0], "peers.invalid") {
+		t.Errorf("fleet errors = %q, want one naming the discovery name", errs)
 	}
 }
 
@@ -318,6 +307,42 @@ func TestWebSocketMetricsAlwaysCarryFleet(t *testing.T) {
 	assertFleetOnlyBrowserPayload(t, readPayload())
 }
 
+// A client that vanishes without closing its connection must not keep its
+// reader goroutine waiting forever, while one that pings stays connected.
+func TestWebSocketDropsASilentClient(t *testing.T) {
+	ui, cleanup := newFleetTestUI(t)
+	defer cleanup()
+	ui.wsReadTimeout = 300 * time.Millisecond
+
+	server := httptest.NewServer(http.HandlerFunc(ui.handleWebSocket))
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	// Pinging past the timeout keeps the connection open.
+	for range 3 {
+		time.Sleep(150 * time.Millisecond)
+		if err := conn.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+			t.Fatalf("write ping: %v", err)
+		}
+	}
+	// Then going silent gets it closed; the server's messages are drained
+	// until the close arrives.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		var payload map[string]any
+		if err := conn.ReadJSON(&payload); err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				t.Fatal("a silent client was not disconnected")
+			}
+			return
+		}
+	}
+}
+
 func TestBrowserFleetMetricsAggregatesAllDashboardPanels(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	instances := []peerMetrics{
@@ -477,7 +502,7 @@ func TestStaticPeersNeedNoResolver(t *testing.T) {
 	defer func() { _ = ui.Stop() }()
 	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.3:8080"}
 
-	addrs := newPeerCollector(ui).peerAddresses()
+	addrs, _ := newPeerCollector(ui).peerAddresses()
 	if len(addrs) != 2 {
 		t.Fatalf("peerAddresses() = %v, want the two configured peers", addrs)
 	}
@@ -509,7 +534,7 @@ func TestPeerAddressesAreDeduplicated(t *testing.T) {
 	defer func() { _ = ui.Stop() }()
 	ui.config.Peers = []string{"10.0.0.2:8080", "10.0.0.2:8080", "10.0.0.3:8080"}
 
-	addrs := newPeerCollector(ui).peerAddresses()
+	addrs, _ := newPeerCollector(ui).peerAddresses()
 	if len(addrs) != 2 {
 		t.Errorf("peerAddresses() = %v, want duplicates collapsed", addrs)
 	}

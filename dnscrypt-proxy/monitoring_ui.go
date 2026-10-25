@@ -123,10 +123,6 @@ type QueryLogEntry struct {
 	ResponseTime int64     `json:"response_time"`
 	Server       string    `json:"server"`
 	CacheHit     bool      `json:"cache_hit"`
-	// DNSSECVerdict is empty when validation is switched off, which is not the
-	// same as an answer nothing was concluded about.
-	DNSSECVerdict string `json:"dnssec_verdict,omitempty"`
-	DNSSECReason  string `json:"dnssec_reason,omitempty"`
 }
 
 // EstimateMemoryUsage estimates the memory usage of a QueryLogEntry in bytes
@@ -142,9 +138,7 @@ func (q *QueryLogEntry) estimateStringMemoryUsage() int64 {
 			len(q.Domain) +
 			len(q.Type) +
 			len(q.ResponseCode) +
-			len(q.Server) +
-			len(q.DNSSECVerdict) +
-			len(q.DNSSECReason))
+			len(q.Server))
 }
 
 func (mc *MetricsCollector) recentQueryCountLocked() int {
@@ -233,6 +227,11 @@ type MonitoringUI struct {
 	broadcastMinDelay time.Duration
 	pendingBroadcast  bool
 
+	// wsReadTimeout drops a WebSocket client that has gone silent. The page
+	// pings every 30 seconds, so only a connection whose peer vanished without
+	// closing it runs into this.
+	wsReadTimeout time.Duration
+
 	// Prometheus metrics
 	prometheusPath string
 	peers          *peerCollector
@@ -320,6 +319,7 @@ func NewMonitoringUI(proxy *Proxy) *MonitoringUI {
 		// A dashboard is operational telemetry, not part of the DNS hot path.
 		// Full fleet snapshots can contain thousands of retained queries.
 		broadcastMinDelay: monitoringBroadcastMinDelay,
+		wsReadTimeout:     90 * time.Second,
 		// Initialize Prometheus path
 		prometheusPath: func() string {
 			if proxy.monitoringUI.PrometheusPath != "" {
@@ -435,14 +435,10 @@ type metricEvent struct {
 	clientIP     string
 	returnCode   string
 	responseTime int64
-	// dnssecVerdict is empty when validation is off, which is not the same as
-	// an answer nothing could be concluded about.
-	dnssecVerdict string
-	dnssecReason  string
-	cacheHit      bool
-	countCache    bool
-	blocked       bool
-	logQuery      bool
+	cacheHit     bool
+	countCache   bool
+	blocked      bool
+	logQuery     bool
 	// done, when set, is closed once this event has been applied. It carries no
 	// measurement: it is how a caller waits for everything queued before it.
 	done chan struct{}
@@ -458,14 +454,6 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 	if !ui.config.Enabled || pluginsState == nil {
 		return
 	}
-	// DNSSEC chain fetches pass through the normal query pipeline so that they
-	// retain DNS records needed by the validator. They are implementation
-	// detail, not client queries: recording them here inflates dashboard totals
-	// and top domains, and presents their deliberately absent verdict as
-	// "unchecked" traffic.
-	if pluginsState.clientProto == dnssecInternalProto {
-		return
-	}
 	mc := ui.metricsCollector
 	now := time.Now()
 
@@ -476,22 +464,24 @@ func (ui *MonitoringUI) UpdateMetrics(pluginsState *PluginsState, msg *dns.Msg) 
 		responseTime = maxResponseTime
 	}
 
+	// A stale answer stands in for an exchange that failed: it came from the
+	// cache, and the failure is already counted against the server.
+	serverName, cacheHit := pluginsState.serverName, pluginsState.cacheHit
+	if pluginsState.servedStale {
+		serverName, cacheHit = "-", true
+	}
 	ev := metricEvent{
 		at:           now,
 		qName:        pluginsState.qName,
-		serverName:   pluginsState.serverName,
+		serverName:   serverName,
 		responseTime: responseTime,
-		cacheHit:     pluginsState.cacheHit,
-		countCache:   pluginsState.cacheHit || pluginsState.serverName != "-",
+		cacheHit:     cacheHit,
+		// Without the cache plugin nothing participates in caching, so an
+		// upstream answer is not a miss.
+		countCache: ui.proxy.cache && (cacheHit || serverName != "-"),
 		blocked: pluginsState.returnCode == PluginsReturnCodeReject ||
 			pluginsState.returnCode == PluginsReturnCodeDrop,
 		logQuery: ui.config.EnableQueryLog && mc.privacyLevel < 2,
-	}
-	if verdict, ok := pluginsState.sessionData[dnssecVerdictKey].(string); ok {
-		ev.dnssecVerdict = verdict
-		if reason, ok := pluginsState.sessionData[dnssecReasonKey].(string); ok {
-			ev.dnssecReason = reason
-		}
 	}
 	if msg != nil && len(msg.Question) > 0 {
 		rrType := dns.RRToType(msg.Question[0])
@@ -658,9 +648,6 @@ func (ui *MonitoringUI) applyMetrics(ev metricEvent) {
 			ResponseTime: responseTime,
 			Server:       html.EscapeString(ev.serverName),
 			CacheHit:     ev.cacheHit,
-			// Escaped: the reason quotes names taken from the answer.
-			DNSSECVerdict: html.EscapeString(ev.dnssecVerdict),
-			DNSSECReason:  html.EscapeString(ev.dnssecReason),
 		}
 
 		mc.queryLogMutex.Lock()
@@ -784,8 +771,6 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	}
 	mc.serverMutex.RUnlock()
 
-	// Add query type metrics
-	mc.queryTypesMutex.RLock()
 	// Failed upstream exchanges never reach the per-query metrics above: a
 	// query that gets no answer is not recorded there at all. These counters
 	// are the only place a timeout or a dead connection shows up.
@@ -821,6 +806,8 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 		}
 	}
 
+	// Add query type metrics
+	mc.queryTypesMutex.RLock()
 	result.WriteString("# HELP dnscrypt_proxy_query_type_total Total queries per DNS record type\n")
 	result.WriteString("# TYPE dnscrypt_proxy_query_type_total counter\n")
 	for qtype, count := range mc.queryTypes {
@@ -871,26 +858,6 @@ func (mc *MetricsCollector) generatePrometheusMetrics() string {
 	result.WriteString("# HELP dnscrypt_proxy_aes_hardware_support Whether the CPU accelerates AES-GCM, which decides the preferred TLS cipher\n")
 	result.WriteString("# TYPE dnscrypt_proxy_aes_hardware_support gauge\n")
 	result.WriteString(fmt.Sprintf("dnscrypt_proxy_aes_hardware_support %d\n", aesHW))
-
-	// Export the active policy separately from the outcomes. A quiet counter
-	// stream cannot tell an operator whether validation was logging, enforcing,
-	// or disabled, and the pre-enforcement gate must be able to prove that every
-	// replica was actually observing traffic in the intended mode.
-	mode := dnssecMode.Load().(string)
-	result.WriteString("# HELP dnscrypt_proxy_dnssec_validation_mode Active DNSSEC validation policy (exactly one labelled series is 1)\n")
-	result.WriteString("# TYPE dnscrypt_proxy_dnssec_validation_mode gauge\n")
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_validation_mode{mode=\"%s\"} 1\n", mode))
-
-	// Split by verdict rather than counted as one, because the four outcomes
-	// mean different things. Both Bogus and Indeterminate are refused while
-	// enforcing; the latter is kept separate because it is a local inability to
-	// decide rather than evidence that the zone's data failed authentication.
-	result.WriteString("# HELP dnscrypt_proxy_dnssec_verdicts_total DNSSEC validation results by verdict\n")
-	result.WriteString("# TYPE dnscrypt_proxy_dnssec_verdicts_total counter\n")
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"secure\"} %d\n", dnssecVerdicts.secure.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"bogus\"} %d\n", dnssecVerdicts.bogus.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"insecure\"} %d\n", dnssecVerdicts.insecure.Load()))
-	result.WriteString(fmt.Sprintf("dnscrypt_proxy_dnssec_verdicts_total{verdict=\"indeterminate\"} %d\n", dnssecVerdicts.indeterminate.Load()))
 
 	return result.String()
 }
@@ -1320,15 +1287,6 @@ func (mc *MetricsCollector) GetMetrics() map[string]any {
 		"sources":            sourceRefresh,
 		"generated_at":       generatedAt,
 		"instance_id":        instanceID,
-		// Counted apart because they mean different things: insecure is a zone
-		// that signs nothing, indeterminate is this resolver failing to check.
-		"dnssec": map[string]any{
-			"secure":        dnssecVerdicts.secure.Load(),
-			"bogus":         dnssecVerdicts.bogus.Load(),
-			"insecure":      dnssecVerdicts.insecure.Load(),
-			"indeterminate": dnssecVerdicts.indeterminate.Load(),
-			"mode":          dnssecMode.Load(),
-		},
 	}
 
 	// Cache the computed metrics, unless a query was recorded while they were
@@ -1420,44 +1378,11 @@ func setStaticCacheHeaders(w http.ResponseWriter, maxAge int) {
 	w.Header().Set("Expires", time.Now().Add(time.Duration(maxAge)*time.Second).Format(http.TimeFormat))
 }
 
-// handleTestQuery - Handles test query requests for debugging
-func (ui *MonitoringUI) handleTestQuery(w http.ResponseWriter, r *http.Request) {
-	// Test queries modify state - no cache
-	setDynamicCacheHeaders(w)
-
-	// Create a fake DNS message
-	msg := dns.NewMsg("test.example.com.", dns.TypeA)
-
-	// Create a fake plugin state
-	testStart := time.Now().Add(-10 * time.Millisecond)
-	pluginsState := PluginsState{
-		qName:        "test.example.com",
-		serverName:   "cloudflare",
-		clientProto:  "udp",
-		questionMsg:  msg,
-		cacheHit:     false,
-		requestStart: testStart,
-	}
-
-	// Update metrics
-	ui.UpdateMetrics(&pluginsState, msg)
-
-	// Return success
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write([]byte("Test query added"))
-}
-
 // handleRoot - Handles the root path
 func (ui *MonitoringUI) handleRoot(w http.ResponseWriter, r *http.Request) {
 	// Handle preflight OPTIONS request
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Test function to add a fake query for debugging
-	if r.URL.Query().Get("test") == "1" {
-		ui.handleTestQuery(w, r)
 		return
 	}
 
@@ -1499,7 +1424,6 @@ func unavailableFleetMetrics(reason string) map[string]any {
 		"blocked_queries":    float64(0),
 		"avg_response_time":  float64(0),
 		"cache_stats": map[string]any{
-			"enabled":         false,
 			"configured_size": float64(0),
 			"entries":         float64(0),
 			"capacity":        float64(0),
@@ -1616,16 +1540,9 @@ func (ui *MonitoringUI) handleWebSocket(w http.ResponseWriter, r *http.Request) 
 			dlog.Debugf("WebSocket connection closed and cleaned up")
 		}()
 
-		// Set up ping/pong handlers for keep-alive (using WebSocket protocol level)
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		conn.SetPongHandler(func(string) error {
-			dlog.Debugf("Received pong from client")
-			conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-			return nil
-		})
-
 		for {
 			// Read message from client
+			conn.SetReadDeadline(time.Now().Add(ui.wsReadTimeout))
 			var msg map[string]any
 			err := conn.ReadJSON(&msg)
 			if err != nil {

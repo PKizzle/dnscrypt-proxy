@@ -4,7 +4,6 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
-	"github.com/dnscrypt/dnscrypt-proxy/dnscrypt-proxy/dnssec"
 	"time"
 
 	"codeberg.org/miekg/dns"
@@ -14,10 +13,8 @@ import (
 const StaleResponseTTL = 30 * time.Second
 
 type CachedResponse struct {
-	expiration    time.Time
-	msg           *dns.Msg
-	dnssecVerdict string
-	dnssecReason  string
+	expiration time.Time
+	msg        *dns.Msg
 }
 
 // cachedResponses is created once, before any goroutine that reads it exists
@@ -44,17 +41,7 @@ func computeCacheKey(pluginsState *PluginsState, msg *dns.Msg) [32]byte {
 	if pluginsState.dnssec {
 		tmp[4] = 1
 	}
-	// The DNSSEC request plugin forces CD on the upstream transaction so the
-	// local validator receives raw data (RFC 6840 section 5.9). Keep cache
-	// isolation based on the client's original CD bit, saved before that
-	// mutation. Otherwise a CD client can put a Bogus answer in the shared cache
-	// and a later non-CD client in enforce mode receives it without traversing
-	// the response validator, contrary to RFC 4035 section 5.5.
-	checkingDisabled := msg.CheckingDisabled
-	if original, ok := pluginsState.sessionData[dnssecClientCheckingDisabledKey].(bool); ok {
-		checkingDisabled = original
-	}
-	if checkingDisabled {
+	if msg.CheckingDisabled {
 		tmp[4] |= 2
 	}
 	h.Write(tmp[:])
@@ -92,14 +79,6 @@ func (plugin *PluginCache) Reload() error {
 }
 
 func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
-	// DNSSEC's internal DNSKEY and DS fetches have their own cache, which only
-	// retains the material the chain walk has accepted. Replaying a response
-	// from the general cache here would defeat the chain walk's retry path: a
-	// malformed or incomplete delegation proof is evicted from that cache, but
-	// would still be served again before a different upstream could be tried.
-	if pluginsState.clientProto == dnssecInternalProto {
-		return nil
-	}
 	if cachedResponses == nil {
 		return nil
 	}
@@ -127,21 +106,6 @@ func (plugin *PluginCache) Eval(pluginsState *PluginsState, msg *dns.Msg) error 
 	pluginsState.synthResponse = synth
 	pluginsState.action = PluginsActionSynth
 	pluginsState.cacheHit = true
-	// A cache hit did not run the validator again, but it is serving the exact
-	// response the validator classified before it entered this cache. Carry that
-	// classification to monitoring so an empty per-query verdict never looks
-	// like validation was disabled. The cache expiry below is capped at the
-	// earliest RRSIG expiration, so the stored conclusion cannot outlive the
-	// data it describes.
-	if cached.dnssecVerdict != "" {
-		if pluginsState.sessionData == nil {
-			pluginsState.sessionData = make(map[string]any)
-		}
-		pluginsState.sessionData[dnssecVerdictKey] = cached.dnssecVerdict
-		if cached.dnssecReason != "" {
-			pluginsState.sessionData[dnssecReasonKey] = cached.dnssecReason
-		}
-	}
 	return nil
 }
 
@@ -170,12 +134,6 @@ func (plugin *PluginCacheResponse) Reload() error {
 }
 
 func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg) error {
-	// See PluginCache.Eval. Internal validation material is cached only after
-	// the DNSSEC fetcher has accepted it; the general cache must not preserve a
-	// reply which the chain walk later rejects.
-	if pluginsState.clientProto == dnssecInternalProto {
-		return nil
-	}
 	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError && msg.Rcode != dns.RcodeNotAuth {
 		return nil
 	}
@@ -194,25 +152,9 @@ func (plugin *PluginCacheResponse) Eval(pluginsState *PluginsState, msg *dns.Msg
 		pluginsState.cacheNegMaxTTL,
 	)
 	expiration := time.Now().Add(ttl)
-	// An answer must not outlive the signatures that vouch for it. RFC 4035
-	// section 5.3.3 puts the RRSIG expiration as a hard bound on how long the
-	// data may be used, and this cache carries the validator's verdict with the
-	// entry -- so without the bound it would keep serving a verdict that had
-	// stopped being true, and cache_min_ttl could push an entry past the
-	// signature on its own.
-	if until, ok := dnssec.EarliestSignatureExpiry(time.Now(), msg.Answer, msg.Ns); ok && until.Before(expiration) {
-		expiration = until
-	}
 	cachedMsg := cloneMsg(msg)
 	cachedMsg.Question = nil
-	verdict, _ := pluginsState.sessionData[dnssecVerdictKey].(string)
-	reason, _ := pluginsState.sessionData[dnssecReasonKey].(string)
-	cachedResponses.Insert(cacheKey, CachedResponse{
-		expiration:    expiration,
-		msg:           cachedMsg,
-		dnssecVerdict: verdict,
-		dnssecReason:  reason,
-	})
+	cachedResponses.Insert(cacheKey, CachedResponse{expiration: expiration, msg: cachedMsg})
 	updateTTL(msg, expiration)
 
 	return nil

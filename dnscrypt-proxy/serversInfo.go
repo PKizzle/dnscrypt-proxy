@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"math/rand"
 	"net"
@@ -27,9 +28,19 @@ import (
 const (
 	RTTEwmaDecay = 10.0
 
+	// The firstStrategy* constants are the defaults of firstStrategyPolicy,
+	// which lb_failback_delay, lb_failback_tolerance, lb_servfail_failover,
+	// lb_servfail_sustained_count and lb_servfail_sustained_window override.
+
 	// firstStrategyFailbackDelay is how long a server demoted by a failure
 	// under the `first` strategy waits before it may take the head again.
 	firstStrategyFailbackDelay = 5 * time.Minute
+
+	// firstStrategyFailbackTolerance is how much slower than the head, in
+	// percent, a demoted server may probe and still regain the head. Single
+	// probes jitter by a few milliseconds, and the demoted server held the
+	// head before it failed.
+	firstStrategyFailbackTolerance = 10
 
 	// firstStrategyServfailDemotion is how many SERVFAILs in a row, with no
 	// successful answer between them, demote a server under the `first`
@@ -48,6 +59,28 @@ const (
 	firstStrategyAttributedServfailDemotion = 16
 	firstStrategyAttributedServfailDuration = 30 * time.Second
 )
+
+// firstStrategyPolicy holds the thresholds of failover and failback under the
+// `first` strategy.
+type firstStrategyPolicy struct {
+	failbackDelay time.Duration
+	// failbackTolerance is the factor by which a demoted server's probe may
+	// exceed the head's.
+	failbackTolerance       float64
+	servfailFailover        int
+	servfailSustainedCount  int
+	servfailSustainedWindow time.Duration
+}
+
+func defaultFirstStrategyPolicy() firstStrategyPolicy {
+	return firstStrategyPolicy{
+		failbackDelay:           firstStrategyFailbackDelay,
+		failbackTolerance:       1 + firstStrategyFailbackTolerance/100.0,
+		servfailFailover:        firstStrategyServfailDemotion,
+		servfailSustainedCount:  firstStrategyAttributedServfailDemotion,
+		servfailSustainedWindow: firstStrategyAttributedServfailDuration,
+	}
+}
 
 type RegisteredServer struct {
 	name        string
@@ -106,11 +139,10 @@ type ServerInfo struct {
 // pointer, as it shares the RTT estimate. An outcome recorded through either
 // ServerInfo is then seen through both. The ServersInfo lock guards it.
 type failoverState struct {
-	// demotedAt and preFailureRtt let a server demoted by a failure return once
-	// it has had time to recover. preFailureRtt is the estimate it held before
-	// the failure, measured from live traffic.
-	demotedAt     time.Time
-	preFailureRtt float64
+	// demotedAt is when a failure demoted the server, or when a probe round
+	// last found it no faster than the head. It is zero while the server is
+	// not demoted.
+	demotedAt time.Time
 	// consecutiveServfails counts SERVFAILs since the last successful answer,
 	// retries of one name counted once; consecutiveServerServfails counts
 	// those among them that the server did not blame on the zone.
@@ -230,6 +262,7 @@ type ServersInfo struct {
 	registeredRelays    []RegisteredServer
 	lbStrategy          LBStrategy
 	lbEstimator         bool
+	firstPolicy         firstStrategyPolicy
 	odohRefreshMu       sync.Mutex
 	odohRefreshInFlight map[string]bool
 	odohLastFailureAt   map[string]time.Time
@@ -237,6 +270,10 @@ type ServersInfo struct {
 	// here rather than on ServerInfo because a certificate refresh replaces
 	// the ServerInfo, and a counter must not reset with it.
 	failures map[serverFailureKey]uint64
+	// probeRtt measures a server outside the client query path, in
+	// milliseconds; probing is set while a failback probe round runs.
+	probeRtt func(*ServerInfo) (float64, error)
+	probing  bool
 }
 
 // Reasons an upstream exchange counts as failed.
@@ -274,6 +311,7 @@ func NewServersInfo() ServersInfo {
 	return ServersInfo{
 		lbStrategy:          DefaultLBStrategy,
 		lbEstimator:         true,
+		firstPolicy:         defaultFirstStrategyPolicy(),
 		registeredServers:   make([]RegisteredServer, 0),
 		registeredRelays:    make([]RegisteredServer, 0),
 		odohRefreshInFlight: make(map[string]bool),
@@ -563,35 +601,84 @@ func (serversInfo *ServersInfo) sortByRtt() {
 	}
 }
 
-// failBackFirstStrategy restores servers that a failure demoted under the
-// `first` strategy, once firstStrategyFailbackDelay has passed without another
-// failure. Each gets back the RTT estimate it had before the failure. The one
-// with the lowest restored estimate regains the head if that estimate beats the
-// measured estimate of the server that replaced it. No other server changes
-// place, so a server that never failed is never promoted and the choice stays
-// sticky.
+// failBackFirstStrategy re-evaluates a server that a failure moved off the
+// head under the `first` strategy, once the failback delay has passed
+// since it was demoted or last re-evaluated. The server gets no traffic while
+// it is demoted, so its estimate says nothing about how it answers now: a
+// background round probes it and the head instead. Nothing is probed while no
+// failover is in effect, and at most one round runs at a time.
 func (serversInfo *ServersInfo) failBackFirstStrategy(now time.Time) {
 	// serversInfo.RWMutex is assumed to be Locked
-	if _, isFirst := serversInfo.lbStrategy.(LBStrategyFirst); !isFirst {
+	if _, isFirst := serversInfo.lbStrategy.(LBStrategyFirst); !isFirst || serversInfo.probeRtt == nil || serversInfo.probing {
 		return
 	}
-	var best *ServerInfo
-	for _, server := range serversInfo.inner {
+	head := serversInfo.inner[0]
+	// A failure that left the server at the head did not fail it over.
+	head.failoverLocked().demotedAt = time.Time{}
+	for _, server := range serversInfo.inner[1:] {
 		failover := server.failoverLocked()
-		if failover.demotedAt.IsZero() || now.Sub(failover.demotedAt) < firstStrategyFailbackDelay {
+		if failover.demotedAt.IsZero() || now.Sub(failover.demotedAt) < serversInfo.firstPolicy.failbackDelay {
 			continue
 		}
-		server.rtt.Set(failover.preFailureRtt)
-		failover.demotedAt = time.Time{}
-		dlog.Debugf("[%s] had no failure for %v; restoring its RTT estimate to %d", server.Name,
-			firstStrategyFailbackDelay, int(failover.preFailureRtt))
-		if best == nil || server.rtt.Value() < best.rtt.Value() {
-			best = server
+		serversInfo.probing = true
+		go serversInfo.probeFailback(server, head, now)
+		return
+	}
+}
+
+// probeFailback probes the demoted server and then the head, and gives the
+// demoted server the head back if it answered within the failback tolerance
+// of the head's time. Otherwise it stays demoted and is re-evaluated after
+// another failback delay. No
+// other server changes place, so a server that never failed is never promoted.
+func (serversInfo *ServersInfo) probeFailback(demoted, head *ServerInfo, startedAt time.Time) {
+	demotedRtt, headRtt := serversInfo.bestProbeRtt(demoted), math.Inf(1)
+	if !math.IsInf(demotedRtt, 1) {
+		headRtt = serversInfo.bestProbeRtt(head)
+	}
+	serversInfo.Lock()
+	defer serversInfo.Unlock()
+	serversInfo.probing = false
+	failover := demoted.failoverLocked()
+	if len(serversInfo.inner) == 0 || serversInfo.inner[0].Name != head.Name {
+		// The head changed during the round, so the comparison is stale; the
+		// next round waits a full delay like any other.
+		failover.demotedAt = startedAt
+		return
+	}
+	if math.IsInf(demotedRtt, 1) || demotedRtt > headRtt*serversInfo.firstPolicy.failbackTolerance {
+		dlog.Debugf("[%s] probed at %.0fms against %.0fms for [%s]; keeping it demoted", demoted.Name,
+			demotedRtt, headRtt, head.Name)
+		failover.demotedAt = startedAt
+		return
+	}
+	dlog.Infof("[%s] probed at %.0fms against %.0fms for [%s]; restoring it as the preferred server",
+		demoted.Name, demotedRtt, headRtt, head.Name)
+	failover.demotedAt = time.Time{}
+	demoted.rtt.Set(demotedRtt)
+	for _, server := range serversInfo.inner {
+		// A refresh may have replaced the ServerInfo since the round started.
+		if server.Name == demoted.Name {
+			serversInfo.moveToHead(server)
+			return
 		}
 	}
-	if best != nil && best.rtt.Value() < serversInfo.inner[0].rtt.Value() {
-		serversInfo.moveToHead(best)
+}
+
+// bestProbeRtt returns the faster of two probes of server, or +Inf if neither
+// was answered. The first probe may pay for a connection that live traffic
+// keeps open for the head but not for a server it has left.
+func (serversInfo *ServersInfo) bestProbeRtt(server *ServerInfo) float64 {
+	best := math.Inf(1)
+	for range 2 {
+		rtt, err := serversInfo.probeRtt(server)
+		if err != nil {
+			dlog.Debugf("[%s] failback probe: %v", server.Name, err)
+			continue
+		}
+		best = min(best, rtt)
 	}
+	return best
 }
 
 // moveToHead puts server first. The servers that were ahead of it move back by
@@ -658,25 +745,6 @@ func (serversInfo *ServersInfo) recoverDormantServers() {
 }
 
 func (serversInfo *ServersInfo) getOne() *ServerInfo {
-	return serversInfo.getOneExcluding(nil)
-}
-
-// getOneExcept picks an eligible server while omitting excludedName. Ordinary
-// lookups preserve the existing strategy exactly. DNSSEC response retries use
-// the exclusion so they do not ask the same resolver for the same stale or
-// incomplete answer again.
-func (serversInfo *ServersInfo) getOneExcept(excludedName string) *ServerInfo {
-	if excludedName == "" {
-		return serversInfo.getOneExcluding(nil)
-	}
-	return serversInfo.getOneExcluding(map[string]struct{}{excludedName: {}})
-}
-
-// getOneExcluding is the set form used by a DNSSEC recovery transaction.  A
-// single bad answer can require more than one retry, and asking the same
-// alternate twice provides no independent evidence.  The caller owns and may
-// extend excludedNames between attempts.
-func (serversInfo *ServersInfo) getOneExcluding(excludedNames map[string]struct{}) *ServerInfo {
 	serversInfo.Lock()
 	serversCount := len(serversInfo.inner)
 	if serversCount <= 0 {
@@ -685,46 +753,6 @@ func (serversInfo *ServersInfo) getOneExcluding(excludedNames map[string]struct{
 	}
 
 	serversInfo.recoverDormantServers()
-	if len(excludedNames) > 0 {
-		// Exclusions can outlive a dynamic source refresh, so their count may
-		// exceed the current pool size.  Use a non-negative upper bound rather
-		// than deriving capacity from two independently changing collections.
-		eligible := make([]*ServerInfo, 0, serversCount)
-		for _, server := range serversInfo.inner {
-			if _, excluded := excludedNames[server.Name]; !excluded {
-				eligible = append(eligible, server)
-			}
-		}
-		if len(eligible) == 0 {
-			serversInfo.Unlock()
-			return nil
-		}
-
-		var serverInfo *ServerInfo
-		if _, isWP2 := serversInfo.lbStrategy.(LBStrategyWP2); isWP2 && len(eligible) > 1 {
-			first := eligible[rand.Intn(len(eligible))]
-			second := eligible[rand.Intn(len(eligible))]
-			for second == first {
-				second = eligible[rand.Intn(len(eligible))]
-			}
-			if serversInfo.calculateServerScore(second) > serversInfo.calculateServerScore(first) {
-				serverInfo = second
-			} else {
-				serverInfo = first
-			}
-		} else {
-			// Retry traffic is exceptional. For strategies whose candidate indices
-			// refer to the complete server slice, choose uniformly from the
-			// remaining servers rather than accidentally reintroducing the excluded
-			// resolver through an index translation.
-			serverInfo = eligible[rand.Intn(len(eligible))]
-		}
-		dlog.Debugf("Using candidate [%s] (excluding %d tried server(s)) RTT: %d Score: %.3f",
-			serverInfo.Name, len(excludedNames), int(serverInfo.rtt.Value()),
-			serversInfo.calculateServerScore(serverInfo))
-		serversInfo.Unlock()
-		return serverInfo
-	}
 
 	var candidate int
 
@@ -1242,6 +1270,90 @@ func plainNXTestPacket(msgID uint16) *dns.Msg {
 	return msg
 }
 
+// probeServerRtt sends the root NS query that refresh tests servers with to
+// server, over the server's own protocol, and returns how long the answer
+// took in milliseconds. It records nothing on the server: no counters and no
+// RTT estimate, so a probe is not a client query.
+func probeServerRtt(proxy *Proxy, server *ServerInfo) (float64, error) {
+	query := dohTestPacket(0xcafe)
+	start := time.Now()
+	var response []byte
+	var err error
+	switch server.Proto {
+	case stamps.StampProtoTypeDNSCrypt:
+		// Choose the transport as processDNSCryptQuery does for live queries.
+		proto := proxy.xTransport.mainProto
+		sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr := proxy.Encrypt(server, query.Data, proto)
+		if encryptErr != nil && proto == "udp" {
+			proto = "tcp"
+			sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr = proxy.Encrypt(server, query.Data, proto)
+		}
+		if encryptErr != nil {
+			return 0, encryptErr
+		}
+		if proto == "udp" {
+			response, err = proxy.exchangeWithUDPServer(server, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+			neterr, isNetErr := err.(net.Error)
+			truncated := err == nil && len(response) >= MinDNSPacketSize && response[2]&0x02 == 0x02
+			if truncated || (isNetErr && neterr.Timeout()) {
+				proto = "tcp"
+				sharedKey, encryptedQuery, clientNonce, queryEpoch, encryptErr = proxy.Encrypt(server, query.Data, proto)
+				if encryptErr != nil {
+					return 0, encryptErr
+				}
+			}
+		}
+		if proto == "tcp" {
+			response, err = proxy.exchangeWithTCPServer(server, sharedKey, encryptedQuery, clientNonce, queryEpoch)
+		}
+	case stamps.StampProtoTypeDoH:
+		dohResponse, _, tlsState, _, dohErr := proxy.xTransport.DoHQuery(server.useGet, server.URL, query.Data, proxy.timeout)
+		response, err = dohResponse, dohErr
+		if err == nil && (tlsState == nil || !tlsState.HandshakeComplete) {
+			err = errors.New("TLS handshake failed")
+		}
+	case stamps.StampProtoTypeODoHTarget:
+		if len(server.odohTargetConfigs) == 0 {
+			return 0, errors.New("no ODoH target configuration")
+		}
+		target := server.odohTargetConfigs[rand.Intn(len(server.odohTargetConfigs))]
+		odohQuery, encryptErr := target.encryptQuery(query.Data)
+		if encryptErr != nil {
+			return 0, encryptErr
+		}
+		targetURL := server.URL
+		if server.Relay != nil && server.Relay.ODoH != nil {
+			targetURL = server.Relay.ODoH.URL
+		}
+		var body []byte
+		var status int
+		body, status, _, _, err = proxy.xTransport.ObliviousDoHQuery(server.useGet, targetURL, odohQuery.odohMessage, proxy.timeout)
+		if err == nil && status != 200 {
+			err = fmt.Errorf("HTTP status %d", status)
+		}
+		if err == nil {
+			response, err = odohQuery.decryptResponse(body)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported protocol %v", server.Proto)
+	}
+	if err != nil {
+		return 0, err
+	}
+	elapsed := time.Since(start)
+	msg := dns.Msg{Data: response}
+	if err := msg.Unpack(); err != nil {
+		return 0, err
+	}
+	if err := validateResponseForQuery(query, &msg); err != nil {
+		return 0, err
+	}
+	if msg.Rcode != dns.RcodeSuccess {
+		return 0, fmt.Errorf("rcode %d", msg.Rcode)
+	}
+	return float64(elapsed.Microseconds()) / 1000, nil
+}
+
 func fetchDoHServerInfo(proxy *Proxy, name string, stamp stamps.ServerStamp, isNew bool) (ServerInfo, error) {
 	// If an IP has been provided, use it forever.
 	// Or else, if the fallback server and the DoH server are operated
@@ -1577,7 +1689,7 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst && reason == failureReasonServfail {
 		// A SERVFAIL reported without its response: the name is unknown and
 		// the server is answerable for it.
-		if !serverInfo.failoverLocked().recordServfail(time.Now(), "", false) {
+		if !serverInfo.failoverLocked().recordServfail(proxy.serversInfo.firstPolicy, time.Now(), "", false) {
 			return
 		}
 	}
@@ -1597,7 +1709,7 @@ func (serverInfo *ServerInfo) noticeServfail(proxy *Proxy, qName string, blamesZ
 	defer proxy.serversInfo.Unlock()
 	serverInfo.countFailureLocked(proxy, reason)
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
-		if !serverInfo.failoverLocked().recordServfail(time.Now(), qName, blamesZone) {
+		if !serverInfo.failoverLocked().recordServfail(proxy.serversInfo.firstPolicy, time.Now(), qName, blamesZone) {
 			return
 		}
 	} else if blamesZone {
@@ -1609,7 +1721,7 @@ func (serverInfo *ServerInfo) noticeServfail(proxy *Proxy, qName string, blamesZ
 // recordServfail notes a SERVFAIL for qName and reports whether the run it
 // belongs to has become evidence that the server is failing: enough SERVFAILs
 // the server did not blame on the zone, or a sustained run of any kind.
-func (failover *failoverState) recordServfail(now time.Time, qName string, blamesZone bool) bool {
+func (failover *failoverState) recordServfail(policy firstStrategyPolicy, now time.Time, qName string, blamesZone bool) bool {
 	failover.lastResponseTS = now
 	if failover.consecutiveServfails == 0 {
 		failover.servfailRunStartedAt = now
@@ -1623,11 +1735,11 @@ func (failover *failoverState) recordServfail(now time.Time, qName string, blame
 	if !blamesZone {
 		failover.consecutiveServerServfails++
 	}
-	if failover.consecutiveServerServfails >= firstStrategyServfailDemotion {
+	if failover.consecutiveServerServfails >= policy.servfailFailover {
 		return true
 	}
-	return failover.consecutiveServfails >= firstStrategyAttributedServfailDemotion &&
-		now.Sub(failover.servfailRunStartedAt) >= firstStrategyAttributedServfailDuration
+	return failover.consecutiveServfails >= policy.servfailSustainedCount &&
+		now.Sub(failover.servfailRunStartedAt) >= policy.servfailSustainedWindow
 }
 
 // countFailureLocked adds the failure to the per-server, per-reason counters.
@@ -1643,13 +1755,8 @@ func (serverInfo *ServerInfo) countFailureLocked(proxy *Proxy, reason string) {
 // ServersInfo lock must be held.
 func (serverInfo *ServerInfo) demoteLocked(proxy *Proxy) {
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
-		failover := serverInfo.failoverLocked()
-		// Keep the estimate from before the first failure of a run; a repeated
-		// failure only restarts the failback delay.
-		if failover.demotedAt.IsZero() {
-			failover.preFailureRtt = serverInfo.rtt.Value()
-		}
-		failover.demotedAt = time.Now()
+		// A repeated failure restarts the failback delay.
+		serverInfo.failoverLocked().demotedAt = time.Now()
 	}
 	serverInfo.rtt.Add(float64(proxy.timeout.Nanoseconds() / 1000000))
 	// The first strategy normally keeps using index zero. Move a failed

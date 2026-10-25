@@ -108,7 +108,6 @@ function safeUpdateDashboard(data) {
             : null;
         const panelTitle = title => fleetLabel ? `${title} (${fleetLabel})` : title;
         updateElementText('overview', panelTitle('Overview'));
-        updateElementText('dnssec', panelTitle('DNSSEC'));
         updateElementText('cache-performance', panelTitle('Cache Performance'));
         updateElementText('query-types', panelTitle('Query Types'));
         updateElementText('resolver-health', panelTitle('Resolver Health'));
@@ -147,30 +146,6 @@ function safeUpdateDashboard(data) {
         }
 
         // Update cache stats with null checks
-        // DNSSEC summary. The share is of answers that could be judged at all --
-        // counting unsigned zones in the denominator would report a resolver
-        // that validates everything it can as mostly failing.
-        const dnssec = summary.dnssec || data.dnssec || {};
-        const secure = dnssec.secure || 0;
-        const bogus = dnssec.bogus || 0;
-        const indeterminate = dnssec.indeterminate || 0;
-        updateElementText('dnssec-mode', dnssec.mode || 'off');
-        updateElementText('dnssec-secure', secure.toLocaleString());
-        updateElementText('dnssec-insecure', (dnssec.insecure || 0).toLocaleString());
-        updateElementText('dnssec-indeterminate', indeterminate.toLocaleString());
-        updateElementText('dnssec-bogus', bogus.toLocaleString());
-        const checkable = secure + bogus + indeterminate;
-        updateElementText('dnssec-verified-share',
-            checkable > 0 ? (secure / checkable * 100).toFixed(1) + '% verified' : 'nothing to check yet');
-        const bogusEl = document.getElementById('dnssec-bogus');
-        if (bogusEl) {
-            bogusEl.className = bogus > 0 ? 'dnssec-bogus' : '';
-        }
-        const indetEl = document.getElementById('dnssec-indeterminate');
-        if (indetEl) {
-            indetEl.className = indeterminate > 0 ? 'dnssec-indeterminate' : '';
-        }
-
         const cacheHitRatio = summary.cache_hit_ratio !== undefined ? summary.cache_hit_ratio : 0;
         const cacheHits = summary.cache_hits !== undefined ? summary.cache_hits : 0;
         const cacheMisses = summary.cache_misses !== undefined ? summary.cache_misses : 0;
@@ -184,6 +159,16 @@ function safeUpdateDashboard(data) {
         updateElementText('cache-entries', formatNumber(cacheStats.entries));
         updateElementText('cache-capacity', formatNumber(cacheStats.capacity));
         updateElementText('cache-ttl-range', formatTTLRange(cacheStats));
+        // No cache plugin, nothing to report: hide the card and its nav entry.
+        const cacheOff = cacheStats.enabled === false;
+        const cacheHeading = document.getElementById('cache-performance');
+        if (cacheHeading) {
+            cacheHeading.closest('.card').hidden = cacheOff;
+        }
+        const cacheNav = document.querySelector('.section-nav a[href="#cache-performance"]');
+        if (cacheNav) {
+            cacheNav.hidden = cacheOff;
+        }
 
         // Update resolver health table
         const resolverTable = document.getElementById('resolver-table').getElementsByTagName('tbody')[0];
@@ -304,16 +289,7 @@ function safeUpdateDashboard(data) {
                 row.insertCell(3).textContent = query.client_ip || '-';
                 row.insertCell(4).textContent = query.server || '-';
                 row.insertCell(5).textContent = query.response_code || '-';
-                const dnssecCell = row.insertCell(6);
-                const verdict = describeDnssec(query.dnssec_verdict);
-                dnssecCell.textContent = verdict.text;
-                dnssecCell.className = verdict.className;
-                // The reason is why a name will not resolve under enforce, so it
-                // belongs where someone looking at the row will find it.
-                dnssecCell.title = query.dnssec_reason
-                    ? verdict.label + ': ' + query.dnssec_reason
-                    : verdict.label;
-                row.insertCell(7).textContent = formatMilliseconds(query.response_time);
+                row.insertCell(6).textContent = formatMilliseconds(query.response_time);
             });
         }
 
@@ -376,8 +352,11 @@ function updateFleetStatus(fleet) {
     const instances = totals.instances || 0;
     status.hidden = false;
     status.className = fleet.degraded ? 'fleet-status fleet-status-degraded' : 'fleet-status';
+    const errors = Array.isArray(fleet.errors) && fleet.errors.length > 0
+        ? ` (${fleet.errors.join('; ')})`
+        : '';
     status.textContent = fleet.degraded
-        ? `Fleet view is partial: ${reachable}/${instances} instances reachable`
+        ? `Fleet view is partial: ${reachable}/${instances} known instances reachable${errors}`
         : `Fleet view: all ${reachable}/${instances} instances reachable`;
 }
 
@@ -546,6 +525,9 @@ function connectWebSocket() {
 
         // Create WebSocket connection
         var newWs = new WebSocket(wsUrl);
+        // The server drops a connection it has not heard from in 90 seconds,
+        // which is how it notices a client that vanished without closing.
+        var keepAlive = null;
 
         // Connection opened
         newWs.onopen = function() {
@@ -558,6 +540,11 @@ function connectWebSocket() {
             } catch (e) {
                 console.error('Error sending ping:', e);
             }
+            keepAlive = setInterval(function() {
+                if (newWs.readyState === WebSocket.OPEN) {
+                    newWs.send(JSON.stringify({type: 'ping'}));
+                }
+            }, 30000);
         };
 
         // Listen for messages
@@ -589,6 +576,7 @@ function connectWebSocket() {
         // Connection closed
         newWs.onclose = function(event) {
             console.log('WebSocket disconnected, code:', event.code, 'reason:', event.reason || 'No reason provided');
+            clearInterval(keepAlive);
 
             // Try to reconnect with exponential backoff
             if (wsReconnectAttempts < maxReconnectAttempts) {
@@ -652,29 +640,3 @@ function initializeDashboard() {
 initializeDashboard();
 
 setInterval(pollMetrics, 5000);
-
-
-// describeDnssec turns a verdict into what the table shows for it.
-//
-// A word rather than a symbol: these four have to be told apart at a glance in
-// a dense table, and read aloud by a screen reader. The colour is emphasis
-// only, so the meaning survives without it.
-//
-// The four are deliberately distinct. "Unsigned" is a fact about the zone and
-// the ordinary case for most of the internet; "unchecked" is this resolver
-// failing to check and is the one worth chasing; "failed" is the only one that
-// costs anyone an answer, and only while the mode is enforce.
-function describeDnssec(verdict) {
-    switch (verdict) {
-        case 'secure':
-            return { text: 'verified', label: 'Verified', className: 'dnssec-secure' };
-        case 'insecure':
-            return { text: 'unsigned', label: 'Unsigned zone', className: 'dnssec-insecure' };
-        case 'indeterminate':
-            return { text: 'unchecked', label: 'Could not be checked', className: 'dnssec-indeterminate' };
-        case 'bogus':
-            return { text: 'failed', label: 'Signature did not hold up', className: 'dnssec-bogus' };
-        default:
-            return { text: '-', label: 'Validation is switched off', className: '' };
-    }
-}

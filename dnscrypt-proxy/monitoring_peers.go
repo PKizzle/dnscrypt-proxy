@@ -62,6 +62,9 @@ type FleetMetrics struct {
 	// are of those that did. Saying so is the difference between a number that
 	// is low and a number that is wrong.
 	Degraded bool `json:"degraded"`
+	// DiscoveryError is set when the discovery name did not resolve. It is not
+	// an instance, so it stays out of Instances and their count.
+	DiscoveryError string `json:"discovery_error,omitempty"`
 }
 
 type peerCollector struct {
@@ -95,10 +98,11 @@ func (pc *peerCollector) configured() bool {
 // Kubernetes a headless Service resolves to one address per pod, and anywhere
 // else a name with several addresses does the same job. Neither requires this
 // process to know anything about the platform it runs on.
-func (pc *peerCollector) peerAddresses() []string {
+func (pc *peerCollector) peerAddresses() ([]string, error) {
 	cfg := pc.ui.config
 	seen := map[string]bool{}
 	var out []string
+	var discoveryErr error
 
 	add := func(addr string) {
 		if addr == "" || seen[addr] {
@@ -122,13 +126,14 @@ func (pc *peerCollector) peerAddresses() []string {
 		addrs, err := pc.resolver().LookupHost(ctx, host)
 		if err != nil {
 			dlog.Debugf("Monitoring peer discovery for [%s] failed: %v", host, err)
+			discoveryErr = err
 		}
 		sort.Strings(addrs)
 		for _, a := range preferredPeerAddresses(addrs) {
 			add(net.JoinHostPort(a, port))
 		}
 	}
-	return out
+	return out, discoveryErr
 }
 
 // A dual-stack headless Service exposes two addresses for every pod. A healthy
@@ -191,7 +196,7 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 		return pc.cached
 	}
 
-	peers := pc.peerAddresses()
+	peers, discoveryErr := pc.peerAddresses()
 	results := make([]peerMetrics, len(peers))
 	var wg sync.WaitGroup
 	for i, addr := range peers {
@@ -205,8 +210,8 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 
 	fleet := &FleetMetrics{Totals: map[string]any{}}
 	// This instance's own numbers are counted without being fetched over the
-	// network: it is one of the instances, and asking itself would be a request
-	// that can fail for reasons the answer already rules out.
+	// network. Discovery may still hand back one of its own addresses; that
+	// answer is recognised by instance ID below and folded in as an alias.
 	//
 	// Held as a copy, because the caller puts this result back into the very map
 	// it passed in. Keeping the original would make the fleet contain the map
@@ -238,6 +243,12 @@ func (pc *peerCollector) Fleet(own map[string]any) *FleetMetrics {
 			byInstance[id] = len(fleet.Instances)
 		}
 		fleet.Instances = append(fleet.Instances, r)
+	}
+	// An unresolvable discovery name hides every other instance; report it
+	// instead of presenting this instance alone as the fleet.
+	if discoveryErr != nil {
+		fleet.Degraded = true
+		fleet.DiscoveryError = pc.ui.config.PeerDiscoveryDNS + ": " + discoveryErr.Error()
 	}
 	fleet.Totals = sumMetrics(fleet.Instances)
 
@@ -318,10 +329,6 @@ func sumMetrics(instances []peerMetrics) map[string]any {
 		totals["cache_hit_ratio"] = float64(0)
 	}
 
-	if dnssec, present := sumDNSSEC(instances); present {
-		totals["dnssec"] = dnssec
-	}
-
 	// Queries per second add up: each instance measures its own share of a rate
 	// they are serving between them.
 	var qps float64
@@ -367,51 +374,6 @@ func sumMetrics(instances []peerMetrics) map[string]any {
 	return totals
 }
 
-// sumDNSSEC adds verdict counters across the peers. They are counters, not
-// rates, so summing them is meaningful; the verified share is rebuilt by the
-// page from those sums. A mode disagreement is reported instead of choosing
-// whichever pod happened to answer the browser's request.
-func sumDNSSEC(instances []peerMetrics) (map[string]any, bool) {
-	totals := map[string]any{
-		"secure":        float64(0),
-		"bogus":         float64(0),
-		"insecure":      float64(0),
-		"indeterminate": float64(0),
-	}
-	modes := map[string]bool{}
-	present := false
-	for _, inst := range instances {
-		if !inst.Reachable {
-			continue
-		}
-		dnssec, ok := inst.Metrics["dnssec"].(map[string]any)
-		if !ok {
-			continue
-		}
-		present = true
-		for _, verdict := range []string{"secure", "bogus", "insecure", "indeterminate"} {
-			if n, ok := toFloat(dnssec[verdict]); ok {
-				current, _ := toFloat(totals[verdict])
-				totals[verdict] = current + n
-			}
-		}
-		if mode, ok := dnssec["mode"].(string); ok && mode != "" {
-			modes[mode] = true
-		}
-	}
-	if !present {
-		return nil, false
-	}
-	if len(modes) == 1 {
-		for mode := range modes {
-			totals["mode"] = mode
-		}
-	} else {
-		totals["mode"] = "mixed"
-	}
-	return totals, true
-}
-
 // browserFleetMetrics creates the only schema sent to browsers when peers are
 // configured. Its top-level fields are fleet aggregates, and the envelope
 // contains health metadata only; per-instance metrics never leave the peer
@@ -436,10 +398,20 @@ func browserFleetMetrics(fleet *FleetMetrics, recentLimit int) map[string]any {
 	metrics["sources"] = aggregateFleetSources(fleet.Instances)
 	metrics["recent_queries"] = aggregateFleetRecentQueries(fleet.Instances, recentLimit)
 	metrics["generated_at"] = time.Now().UTC()
+	var unreachable []string
+	if fleet.DiscoveryError != "" {
+		unreachable = append(unreachable, fleet.DiscoveryError)
+	}
+	for _, inst := range fleet.Instances {
+		if !inst.Reachable {
+			unreachable = append(unreachable, inst.Address+": "+inst.Error)
+		}
+	}
 	metrics["fleet"] = map[string]any{
 		"mode":         "aggregate",
 		"totals":       fleet.Totals,
 		"degraded":     fleet.Degraded,
+		"errors":       unreachable,
 		"collected_at": time.Now().UTC(),
 	}
 	return metrics
