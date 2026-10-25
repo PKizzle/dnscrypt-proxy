@@ -46,6 +46,11 @@ type Config struct {
 	EphemeralKeys            bool               `toml:"dnscrypt_ephemeral_keys"`
 	LBStrategy               string             `toml:"lb_strategy"`
 	LBEstimator              bool               `toml:"lb_estimator"`
+	LBFailbackDelay          int                `toml:"lb_failback_delay"`
+	LBFailbackTolerance      int                `toml:"lb_failback_tolerance"`
+	LBServfailFailover       int                `toml:"lb_servfail_failover"`
+	LBSustainedServfails     int                `toml:"lb_servfail_sustained_count"`
+	LBSustainedWindow        int                `toml:"lb_servfail_sustained_window"`
 	BlockIPv6                bool               `toml:"block_ipv6"`
 	BlockUnqualified         bool               `toml:"block_unqualified"`
 	BlockUndelegated         bool               `toml:"block_undelegated"`
@@ -165,6 +170,11 @@ func newConfig() Config {
 		OfflineMode:              false,
 		RefusedCodeInResponses:   false,
 		LBEstimator:              true,
+		LBFailbackDelay:          int(firstStrategyFailbackDelay / time.Second),
+		LBFailbackTolerance:      firstStrategyFailbackTolerance,
+		LBServfailFailover:       firstStrategyServfailDemotion,
+		LBSustainedServfails:     firstStrategyAttributedServfailDemotion,
+		LBSustainedWindow:        int(firstStrategyAttributedServfailDuration / time.Second),
 		BlockedQueryResponse:     "hinfo",
 		BrokenImplementations: BrokenImplementationsConfig{
 			FragmentsBlocked: []string{
@@ -399,7 +409,9 @@ func ConfigLoad(proxy *Proxy, flags *ConfigFlags) error {
 	}
 
 	// Configure load balancing
-	configureLoadBalancing(proxy, &config)
+	if err := configureLoadBalancing(proxy, &config); err != nil {
+		return err
+	}
 
 	// Configure plugins
 	configurePlugins(proxy, &config)

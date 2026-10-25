@@ -1,4 +1,9 @@
 # Unreleased
+  - New `lb_failback_delay`, `lb_failback_tolerance`, `lb_servfail_failover`,
+`lb_servfail_sustained_count` and `lb_servfail_sustained_window` settings tune
+when the `first` load-balancing strategy fails a resolver over on SERVFAIL
+responses and when it makes a failed-over resolver preferred again. The
+defaults keep the existing behavior.
   - Under the `first` load-balancing strategy, a resolver that was failed over
 is re-measured every five minutes with probe queries alongside the resolver
 that replaced it, and becomes the preferred resolver again once it answers

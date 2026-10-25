@@ -28,15 +28,19 @@ import (
 const (
 	RTTEwmaDecay = 10.0
 
+	// The firstStrategy* constants are the defaults of firstStrategyPolicy,
+	// which lb_failback_delay, lb_failback_tolerance, lb_servfail_failover,
+	// lb_servfail_sustained_count and lb_servfail_sustained_window override.
+
 	// firstStrategyFailbackDelay is how long a server demoted by a failure
 	// under the `first` strategy waits before it may take the head again.
 	firstStrategyFailbackDelay = 5 * time.Minute
 
-	// firstStrategyFailbackTolerance is how much slower than the head a
-	// demoted server may probe and still regain the head. Single probes
-	// jitter by a few milliseconds, and the demoted server held the head
-	// before it failed.
-	firstStrategyFailbackTolerance = 1.1
+	// firstStrategyFailbackTolerance is how much slower than the head, in
+	// percent, a demoted server may probe and still regain the head. Single
+	// probes jitter by a few milliseconds, and the demoted server held the
+	// head before it failed.
+	firstStrategyFailbackTolerance = 10
 
 	// firstStrategyServfailDemotion is how many SERVFAILs in a row, with no
 	// successful answer between them, demote a server under the `first`
@@ -55,6 +59,28 @@ const (
 	firstStrategyAttributedServfailDemotion = 16
 	firstStrategyAttributedServfailDuration = 30 * time.Second
 )
+
+// firstStrategyPolicy holds the thresholds of failover and failback under the
+// `first` strategy.
+type firstStrategyPolicy struct {
+	failbackDelay time.Duration
+	// failbackTolerance is the factor by which a demoted server's probe may
+	// exceed the head's.
+	failbackTolerance       float64
+	servfailFailover        int
+	servfailSustainedCount  int
+	servfailSustainedWindow time.Duration
+}
+
+func defaultFirstStrategyPolicy() firstStrategyPolicy {
+	return firstStrategyPolicy{
+		failbackDelay:           firstStrategyFailbackDelay,
+		failbackTolerance:       1 + firstStrategyFailbackTolerance/100.0,
+		servfailFailover:        firstStrategyServfailDemotion,
+		servfailSustainedCount:  firstStrategyAttributedServfailDemotion,
+		servfailSustainedWindow: firstStrategyAttributedServfailDuration,
+	}
+}
 
 type RegisteredServer struct {
 	name        string
@@ -236,6 +262,7 @@ type ServersInfo struct {
 	registeredRelays    []RegisteredServer
 	lbStrategy          LBStrategy
 	lbEstimator         bool
+	firstPolicy         firstStrategyPolicy
 	odohRefreshMu       sync.Mutex
 	odohRefreshInFlight map[string]bool
 	odohLastFailureAt   map[string]time.Time
@@ -284,6 +311,7 @@ func NewServersInfo() ServersInfo {
 	return ServersInfo{
 		lbStrategy:          DefaultLBStrategy,
 		lbEstimator:         true,
+		firstPolicy:         defaultFirstStrategyPolicy(),
 		registeredServers:   make([]RegisteredServer, 0),
 		registeredRelays:    make([]RegisteredServer, 0),
 		odohRefreshInFlight: make(map[string]bool),
@@ -574,7 +602,7 @@ func (serversInfo *ServersInfo) sortByRtt() {
 }
 
 // failBackFirstStrategy re-evaluates a server that a failure moved off the
-// head under the `first` strategy, once firstStrategyFailbackDelay has passed
+// head under the `first` strategy, once the failback delay has passed
 // since it was demoted or last re-evaluated. The server gets no traffic while
 // it is demoted, so its estimate says nothing about how it answers now: a
 // background round probes it and the head instead. Nothing is probed while no
@@ -589,7 +617,7 @@ func (serversInfo *ServersInfo) failBackFirstStrategy(now time.Time) {
 	head.failoverLocked().demotedAt = time.Time{}
 	for _, server := range serversInfo.inner[1:] {
 		failover := server.failoverLocked()
-		if failover.demotedAt.IsZero() || now.Sub(failover.demotedAt) < firstStrategyFailbackDelay {
+		if failover.demotedAt.IsZero() || now.Sub(failover.demotedAt) < serversInfo.firstPolicy.failbackDelay {
 			continue
 		}
 		serversInfo.probing = true
@@ -599,9 +627,9 @@ func (serversInfo *ServersInfo) failBackFirstStrategy(now time.Time) {
 }
 
 // probeFailback probes the demoted server and then the head, and gives the
-// demoted server the head back if it answered within
-// firstStrategyFailbackTolerance of the head's time. Otherwise it stays
-// demoted and is re-evaluated after another firstStrategyFailbackDelay. No
+// demoted server the head back if it answered within the failback tolerance
+// of the head's time. Otherwise it stays demoted and is re-evaluated after
+// another failback delay. No
 // other server changes place, so a server that never failed is never promoted.
 func (serversInfo *ServersInfo) probeFailback(demoted, head *ServerInfo, startedAt time.Time) {
 	demotedRtt, headRtt := serversInfo.bestProbeRtt(demoted), math.Inf(1)
@@ -618,7 +646,7 @@ func (serversInfo *ServersInfo) probeFailback(demoted, head *ServerInfo, started
 		failover.demotedAt = startedAt
 		return
 	}
-	if math.IsInf(demotedRtt, 1) || demotedRtt > headRtt*firstStrategyFailbackTolerance {
+	if math.IsInf(demotedRtt, 1) || demotedRtt > headRtt*serversInfo.firstPolicy.failbackTolerance {
 		dlog.Debugf("[%s] probed at %.0fms against %.0fms for [%s]; keeping it demoted", demoted.Name,
 			demotedRtt, headRtt, head.Name)
 		failover.demotedAt = startedAt
@@ -1661,7 +1689,7 @@ func (serverInfo *ServerInfo) noticeFailureReason(proxy *Proxy, reason string) {
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst && reason == failureReasonServfail {
 		// A SERVFAIL reported without its response: the name is unknown and
 		// the server is answerable for it.
-		if !serverInfo.failoverLocked().recordServfail(time.Now(), "", false) {
+		if !serverInfo.failoverLocked().recordServfail(proxy.serversInfo.firstPolicy, time.Now(), "", false) {
 			return
 		}
 	}
@@ -1681,7 +1709,7 @@ func (serverInfo *ServerInfo) noticeServfail(proxy *Proxy, qName string, blamesZ
 	defer proxy.serversInfo.Unlock()
 	serverInfo.countFailureLocked(proxy, reason)
 	if _, isFirst := proxy.serversInfo.lbStrategy.(LBStrategyFirst); isFirst {
-		if !serverInfo.failoverLocked().recordServfail(time.Now(), qName, blamesZone) {
+		if !serverInfo.failoverLocked().recordServfail(proxy.serversInfo.firstPolicy, time.Now(), qName, blamesZone) {
 			return
 		}
 	} else if blamesZone {
@@ -1693,7 +1721,7 @@ func (serverInfo *ServerInfo) noticeServfail(proxy *Proxy, qName string, blamesZ
 // recordServfail notes a SERVFAIL for qName and reports whether the run it
 // belongs to has become evidence that the server is failing: enough SERVFAILs
 // the server did not blame on the zone, or a sustained run of any kind.
-func (failover *failoverState) recordServfail(now time.Time, qName string, blamesZone bool) bool {
+func (failover *failoverState) recordServfail(policy firstStrategyPolicy, now time.Time, qName string, blamesZone bool) bool {
 	failover.lastResponseTS = now
 	if failover.consecutiveServfails == 0 {
 		failover.servfailRunStartedAt = now
@@ -1707,11 +1735,11 @@ func (failover *failoverState) recordServfail(now time.Time, qName string, blame
 	if !blamesZone {
 		failover.consecutiveServerServfails++
 	}
-	if failover.consecutiveServerServfails >= firstStrategyServfailDemotion {
+	if failover.consecutiveServerServfails >= policy.servfailFailover {
 		return true
 	}
-	return failover.consecutiveServfails >= firstStrategyAttributedServfailDemotion &&
-		now.Sub(failover.servfailRunStartedAt) >= firstStrategyAttributedServfailDuration
+	return failover.consecutiveServfails >= policy.servfailSustainedCount &&
+		now.Sub(failover.servfailRunStartedAt) >= policy.servfailSustainedWindow
 }
 
 // countFailureLocked adds the failure to the per-server, per-reason counters.

@@ -193,6 +193,34 @@ keepalive = 30
 
 # lb_estimator = true
 
+## The following settings only apply to the 'first' strategy.
+
+## How long, in seconds, a server that was failed over waits before it is
+## re-measured with probe queries, and between re-measurements while it
+## stays slower than its replacement. Minimum is 10.
+
+# lb_failback_delay = 300
+
+## How much slower than the current server, in percent, a server that was
+## failed over may be measured and still become the preferred server again.
+## Between 0 and 100.
+
+# lb_failback_tolerance = 10
+
+## How many SERVFAIL responses in a row, for distinct names, fail a server
+## over. SERVFAILs the server attributes to the queried zone through an
+## extended DNS error are not counted. Minimum is 1.
+
+# lb_servfail_failover = 3
+
+## A server that answers nothing but SERVFAIL, however it attributes them,
+## for at least `lb_servfail_sustained_count` distinct names over at least
+## `lb_servfail_sustained_window` seconds is also failed over.
+## The count must be at least 1, and the window must not be negative.
+
+# lb_servfail_sustained_count = 16
+# lb_servfail_sustained_window = 30
+
 ## Dynamically reduce query timeout as the number of concurrent connections
 ## approaches max_clients to prevent overload. Value must be between 0.0 and 1.0.
 ## 0.0 = no reduction, 1.0 = maximum reduction.
