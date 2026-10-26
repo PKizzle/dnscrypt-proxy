@@ -16,6 +16,16 @@ A flexible DNS proxy, with support for modern encrypted DNS protocols such as [D
 * [DNS stamps](https://dnscrypt.info/stamps)
 * [FAQ](https://dnscrypt.info/faq)
 
+## PKizzle fork releases
+
+This fork tags releases as `vX.Y.Z.N`: upstream version `X.Y.Z` plus fork build `N`. Each tag publishes signed binaries on the [fork's releases page](https://github.com/PKizzle/dnscrypt-proxy/releases) and a container image `ghcr.io/pkizzle/dnscrypt-proxy:vX.Y.Z.N` (an OCI + Nydus dual index for linux/amd64 and linux/arm64).
+
+The binaries are signed with the fork's own key, not upstream's:
+
+```sh
+minisign -Vm dnscrypt-proxy-linux_arm64-v2.1.20.1.tar.gz -P RWQC9outpWlwPCY/lb1cMJpABu4Y3qXUkCGcx6MHh7GnYUqLZgJpDtq+
+```
+
 ## [Download the latest release](https://github.com/dnscrypt/dnscrypt-proxy/releases/latest)
 
 Available as source code and pre-built binaries for most operating systems and architectures (see below).
