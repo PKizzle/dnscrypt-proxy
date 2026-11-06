@@ -26,7 +26,7 @@ require (
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/oneregex/revera/go v0.0.0-20261014081440-64b07f96fe82
 	github.com/powerman/check v1.14.0
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.49.0
