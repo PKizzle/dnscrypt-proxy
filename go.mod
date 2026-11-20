@@ -20,16 +20,16 @@ require (
 	github.com/jedisct1/go-ipcrypt v0.1.2
 	github.com/jedisct1/go-minisign v0.0.0-20260527172527-a09352b57a22
 	github.com/jedisct1/go-sieve-cache v0.1.9
-	github.com/jedisct1/xsecretbox v0.0.0-20241212092125-3afc4917ac41
+	github.com/jedisct1/xsecretbox v1.0.6
 	github.com/k-sone/critbitgo v1.4.0
 	github.com/kardianos/service v1.3.0
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/oneregex/revera/go v0.0.0-20261014081440-64b07f96fe82
 	github.com/powerman/check v1.14.0
 	github.com/quic-go/quic-go v0.64.1
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 	golang.org/x/net v0.62.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/sys v0.50.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
@@ -37,7 +37,7 @@ require (
 	github.com/hashicorp/go-syslog v1.0.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )
 
 // crypto/rsa refuses public exponents above 2^31-1 (golang/go#3161), so a
